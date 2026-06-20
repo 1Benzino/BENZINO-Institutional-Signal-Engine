@@ -250,7 +250,14 @@ def get_user_scan_preferences() -> dict[str, dict]:
 
 
 def should_run_full_universe(now: datetime | None = None) -> bool:
-    """Optional broad research scan, disabled by default to keep cron under 5 min."""
+    """Return True when a broad research scan should run.
+
+    Scheduled 5-minute cron runs stay fast and use user watchlists. Manual
+    GitHub workflow runs can pass FORCE_FULL_SCAN=true to scan the complete
+    MASTER_WATCHLIST without changing normal production cadence.
+    """
+    if FORCE_FULL_SCAN:
+        return True
     if FULL_UNIVERSE_SCAN_EVERY_HOURS <= 0:
         return False
     now = now or datetime.now(timezone.utc)
@@ -288,7 +295,7 @@ def build_scan_plan(now: datetime | None = None) -> tuple[dict[str, str], list[s
     if should_run_full_universe(now):
         assets = dict(MASTER_WATCHLIST)
         requested_tfs = set(SCAN_TIMEFRAMES)
-        mode = "FULL_UNIVERSE"
+        mode = "FORCED_FULL_UNIVERSE" if FORCE_FULL_SCAN else "FULL_UNIVERSE"
     elif not assets:
         if SCAN_MASTER_WATCHLIST_FALLBACK:
             assets = dict(MASTER_WATCHLIST)
@@ -326,9 +333,12 @@ if not SCAN_TIMEFRAMES:
 
 # Fast-mode optimisation. By default the scanner only scans assets/timeframes
 # selected by active Streamlit users. This keeps the 5-minute cron realistic.
+# Set FORCE_FULL_SCAN=true for a manual GitHub Actions run that scans the full
+# master universe. Scheduled cron runs should keep this false.
 # Set SCAN_MASTER_WATCHLIST_FALLBACK=true to scan the full universe when no user
 # watchlists exist yet. Set FULL_UNIVERSE_SCAN_EVERY_HOURS to a positive number
 # if you also want an occasional broad research sweep.
+FORCE_FULL_SCAN = os.environ.get("FORCE_FULL_SCAN", "false").strip().lower() in {"1", "true", "yes", "y"}
 SCAN_MASTER_WATCHLIST_FALLBACK = os.environ.get("SCAN_MASTER_WATCHLIST_FALLBACK", "false").strip().lower() in {"1", "true", "yes", "y"}
 FULL_UNIVERSE_SCAN_EVERY_HOURS = int(os.environ.get("FULL_UNIVERSE_SCAN_EVERY_HOURS", "0"))
 DEFAULT_USER_TIMEFRAME = os.environ.get("DEFAULT_USER_TIMEFRAME", "1h").strip().lower()
@@ -1677,6 +1687,8 @@ def run_scan() -> None:
         print(f"  Runtime optimiser: skipped TFs this run: {', '.join(skipped) if skipped else 'None'}")
     if scan_mode == "NO_USERS_HEARTBEAT":
         print("  No active user watchlists found yet — running tiny heartbeat scan only.")
+    if scan_mode == "FORCED_FULL_UNIVERSE":
+        print("  Manual full scan requested — scanning MASTER_WATCHLIST instead of only user watchlists.")
     print(f"{'='*70}\n")
 
     _TF_CACHE.clear()

@@ -4,15 +4,48 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
+    inputs:
+      full_scan:
+        description: "Run full master watchlist scan instead of user-watchlist fast scan"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      scan_timeframes:
+        description: "Timeframes to scan when full_scan=true"
+        required: true
+        default: "15m,1h,4h,1d"
+        type: choice
+        options:
+          - "15m"
+          - "1h"
+          - "15m,1h"
+          - "15m,1h,4h,1d"
 
 concurrency:
   group: benzino-institutional-scanner
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
+env:
+  DATABASE_URL: ${{ secrets.DATABASE_URL }}
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  DEFAULT_USER_TIMEFRAME: "1h"
+  FULL_UNIVERSE_SCAN_EVERY_HOURS: "0"
+  SCAN_MASTER_WATCHLIST_FALLBACK: "false"
+  FORCE_FULL_SCAN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.full_scan || 'false' }}
+  SCAN_ALL_TIMEFRAMES_EVERY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.full_scan || 'false' }}
+  SCAN_TIMEFRAMES: ${{ github.event.inputs.scan_timeframes || '15m,1h,4h,1d' }}
+
 jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 35
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -22,24 +55,11 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
-          cache-dependency-path: "requirements_scanner.txt"
 
-      - name: Install scanner dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements_scanner.txt
 
-      - name: Run BENZINO scanner
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          SCAN_OWNER: benzino_system
-          SCAN_TIMEFRAMES: "15m,1h,4h,1d"
-          DEFAULT_USER_TIMEFRAME: "1h"
-          FULL_UNIVERSE_SCAN_EVERY_HOURS: "0"
-          SLOW_TIMEFRAME_WINDOW_MINUTES: "5"
-          SCAN_MASTER_WATCHLIST_FALLBACK: "false"
-          SCAN_ALL_TIMEFRAMES_EVERY_RUN: "false"
-          MIN_ALERT_EDGE_SCORE: "35"
-          MIN_ALERT_CONFIDENCE_DIST: "12"
+      - name: Run scanner
         run: python scanner.py
