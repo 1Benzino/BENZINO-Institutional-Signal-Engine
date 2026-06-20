@@ -24,7 +24,7 @@ INSTITUTIONAL BEHAVIOUR:
     previous open trade in that slot has closed via TP, SL, or expiry.
 
 ENV VARS (GitHub Actions secrets):
-  DATABASE_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS, SCAN_OWNER,
+  DATABASE_URL, TELEGRAM_BOT_TOKEN, SCAN_OWNER,
   ACCOUNT_SIZE, RISK_PER_TRADE, LEVERAGE,
   MIN_ALERT_EDGE_SCORE, MIN_ALERT_CONFIDENCE_DIST
 """
@@ -1430,19 +1430,20 @@ def build_trade_plan(price: float, atr: float, signal: str) -> dict:
 def compute_edge_score(signal: str, confidence: float, ml_prob: float, rr: float) -> float:
     """Composite edge score.
 
-    `confidence` is now system agreement across all systems, not directional
-    confidence among only the non-neutral voters. This means 1/5 agreement is
-    20%, 3/5 is 60%, and 5/5 is 100%. Do not invert it for SELL signals.
-    ML probability remains directional and is converted separately.
+    `confidence` now means system agreement across all active systems, not
+    confidence among only the non-neutral voters. Therefore a 1/5 C setup is
+    about 20%, while a 5/5 A+ setup is 100%. The ML component remains
+    directional: BUY uses ML probability, SELL uses inverse ML probability.
     """
-    agreement_conf = safe_number(confidence, 0.0)
+    agreement_component = safe_number(confidence, 0.0)
     if signal == "BUY":
-        dir_ml = ml_prob * 100
+        ml_component = safe_number(ml_prob, 0.5) * 100
     elif signal == "SELL":
-        dir_ml = (1 - ml_prob) * 100
+        ml_component = (1 - safe_number(ml_prob, 0.5)) * 100
     else:
-        dir_ml = max(0, 50 - abs(ml_prob - 0.5) * 100)
-    return float(round(agreement_conf * 0.40 + dir_ml * 0.35 + rr * 10 * 0.25, 2))
+        ml_component = max(0, 50 - abs(safe_number(ml_prob, 0.5) - 0.5) * 100)
+    rr_component = min(max(safe_number(rr, 0.0), 0.0) * 10, 35)
+    return float(round(agreement_component * 0.45 + ml_component * 0.30 + rr_component * 0.25, 2))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1483,11 +1484,12 @@ def scan_asset(asset: str, ticker: str, timeframe: str = "15m") -> ScanResult | 
         atr = safe_number(df_entry["ATR"].iloc[-1], 0.0) if "ATR" in df_entry.columns else 0.0
         rsi = safe_number(df_entry["RSI"].iloc[-1], 50.0) if "RSI" in df_entry.columns else 50.0
         plan = build_trade_plan(price, atr, signal)
-        total_systems = max(1, int(confluence.get("total_systems", 5) or 5))
-        agree_count = max(0, int(confluence.get("agree_count", 0) or 0))
-        # Confidence now means total system agreement, so neutral systems reduce it.
-        # Example: 1/5 = 20%, 3/5 = 60%, 5/5 = 100%.
-        confidence = safe_number(np.clip((agree_count / total_systems) * 100, 0, 100), 0.0)
+        # Confidence is system agreement across ALL active systems.
+        # Example: 1/5 agreement = 20%, 3/5 = 60%, 5/5 = 100%.
+        confidence = safe_number(
+            np.clip((safe_number(confluence.get("agree_count"), 0.0) / max(1, safe_number(confluence.get("total_systems"), 5.0))) * 100, 0, 100),
+            0.0,
+        )
         grade, grade_reason = grade_signal(confluence, plan["rr"])
         edge_score = compute_edge_score(signal, confidence, confluence["ml_prob"], plan["rr"])
         candle_close = str(df_entry["Date"].iloc[-1])
