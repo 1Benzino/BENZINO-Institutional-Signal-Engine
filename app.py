@@ -50,7 +50,7 @@ except Exception:  # pragma: no cover
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "v4.6-polished-ui-ai"
+APP_VERSION = "v4.7-agreement-ui-fix"
 DEFAULT_TIMEZONE = "Africa/Nairobi"
 ADMIN_USERNAMES = set()  # Admin is now assigned by database role: first created profile only.
 VALID_GRADES = {"A+", "A", "B", "C"}
@@ -946,14 +946,21 @@ def time_ago(value) -> str:
 
 
 def decayed_confidence_value(confidence, created_at, timeframe: str = "1h") -> float:
-    base = float(pd.to_numeric(confidence, errors="coerce") if confidence is not None else 50)
+    """Return urgency-adjusted system agreement.
+
+    This must never increase the original agreement. The previous version
+    decayed toward 50%, which accidentally lifted low-agreement signals
+    such as 40% to 41%+. Here, age only reduces urgency.
+    """
+    base = float(pd.to_numeric(confidence, errors="coerce") if confidence is not None else 0)
+    base = max(0.0, min(100.0, base))
     ts = to_nairobi(created_at)
     if ts is None:
         return base
     age_hours = max(0.0, (pd.Timestamp.now(tz=NAIROBI_TZ) - ts).total_seconds() / 3600)
     half_life = {"15m": 3, "1h": 8, "4h": 24, "1d": 96}.get(str(timeframe).lower(), 8)
     decay = 0.5 ** (age_hours / half_life)
-    return float(50 + (base - 50) * decay)
+    return float(max(0.0, min(base, base * decay)))
 
 
 def parse_jsonish(value) -> dict:
@@ -975,13 +982,84 @@ def format_votes(votes: dict) -> str:
     for name, payload in votes.items():
         if not isinstance(payload, dict):
             continue
+        display = strategy_display_name(name)
         direction = payload.get("direction", "NEUTRAL")
         strength = payload.get("strength", 0)
         try: strength = float(strength)
         except Exception: strength = 0
         tone = "strong" if strength >= .65 else "moderate" if strength >= .35 else "weak"
-        parts.append(f"**{name}** voted **{direction}** with {tone} strength ({strength:.2f}).")
+        parts.append(f"**{display}** voted **{direction}** with {tone} strength ({strength:.2f}).")
     return " ".join(parts) if parts else "No valid strategy votes were stored."
+
+
+STRATEGY_NAME_MAP = {
+    "RSI2": "RSI-2 Mean Reversion",
+    "TSMOM": "Time-Series Momentum",
+    "Donchian": "Donchian Channel Breakout",
+    "MLEnsemble": "Machine Learning Ensemble",
+    "MTFConfirmation": "Multi-Timeframe Confirmation",
+}
+
+STRATEGY_DESCRIPTION_MAP = {
+    "RSI2": "Short-term mean-reversion vote. It looks for stretched RSI-2 readings, ideally with the broader trend filter rather than blindly fading price.",
+    "TSMOM": "Time-Series Momentum vote. It checks whether the asset's own recent return profile supports continuation in the same direction.",
+    "Donchian": "Breakout vote. It checks whether price is pushing through a recent high/low channel with enough directional structure to avoid weak breakouts.",
+    "MLEnsemble": "Machine-learning vote. It combines logistic regression, random forest, and gradient boosting probabilities into one model-driven directional bias.",
+    "MTFConfirmation": "Multi-timeframe vote. It checks whether the entry timeframe agrees with the higher-timeframe context instead of trading against the larger structure.",
+}
+
+
+def strategy_display_name(name: str) -> str:
+    return STRATEGY_NAME_MAP.get(str(name), str(name))
+
+
+def strategy_description(name: str) -> str:
+    return STRATEGY_DESCRIPTION_MAP.get(str(name), "Strategy vote stored by the scanner.")
+
+
+def mini_markdown_to_html(text: str) -> str:
+    escaped = html.escape(str(text or ""))
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+    return escaped.replace("\n", "<br>")
+
+
+def render_strategy_confluence(votes: dict) -> None:
+    if not votes:
+        return
+    rows = []
+    for name, payload in votes.items():
+        if not isinstance(payload, dict):
+            continue
+        display = strategy_display_name(name)
+        desc = strategy_description(name)
+        direction = html.escape(str(payload.get("direction", "NEUTRAL")))
+        try:
+            strength = float(payload.get("strength") or 0)
+        except Exception:
+            strength = 0.0
+        rows.append(
+            "<tr>"
+            f"<td title='{html.escape(desc)}'><strong>{html.escape(display)}</strong></td>"
+            f"<td>{direction}</td>"
+            f"<td>{strength:.2f}</td>"
+            "</tr>"
+        )
+    if not rows:
+        return
+    st.markdown(
+        """
+        <div class='strategy-table-wrap'>
+          <table class='strategy-table'>
+            <thead><tr><th>Strategy system</th><th>Vote</th><th>Strength</th></tr></thead>
+            <tbody>
+        """ + "".join(rows) + """
+            </tbody>
+          </table>
+        </div>
+        <div class='muted' style='font-size:13px;margin-top:6px;'>Hover over a strategy name to see what it measures.</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def rich_signal_explanation(row: pd.Series) -> str:
@@ -1009,9 +1087,9 @@ def rich_signal_explanation(row: pd.Series) -> str:
     return (
         f"**{asset} · {tf} · {time_ago(row.get('created_at'))}**  \n\n"
         f"The engine {decision}. The final grade is **{grade}** and current status is **{status}**. "
-        f"System agreement was **{conf:.1f}%**, and after age decay it currently reads about **{dconf:.1f}%**. "
-        f"Agreement measures how many strategy systems supported the final direction; age decay lowers urgency as the signal gets older. "
-        f"The setup carries an edge score of **{edge:.1f}**, RR of **{rr:.2f}R**, and MTF alignment of **{mtf_score:.0f}%**. This means a C-grade setup should now look low-agreement rather than falsely showing 100% confidence.\n\n"
+        f"Raw confidence was **{conf:.1f}%**, but after age decay it currently reads about **{dconf:.1f}%**. "
+        f"That decay matters because older signals should lose urgency even if the original setup was clean. "
+        f"The setup carries an edge score of **{edge:.1f}**, RR of **{rr:.2f}R**, and MTF alignment of **{mtf_score:.0f}%**.\n\n"
         f"**Strategy reasoning:** {format_votes(votes)}\n\n"
         f"**Multi-timeframe context:** {mtf_line or 'No detailed MTF context was stored.'}\n\n"
         f"**Final interpretation:** {reason}"
@@ -1042,11 +1120,9 @@ def rich_closed_trade_explanation(row: pd.Series) -> str:
 
 
 def render_ai_card(title: str, body: str) -> None:
-    # The section title lives outside the card. The card contains only the explanation.
-    st.subheader(title)
-    st.markdown("<div class='ai-card'>", unsafe_allow_html=True)
-    st.markdown(body)
-    st.markdown("</div>", unsafe_allow_html=True)
+    # Keep the title outside the card; the explanatory narrative itself sits inside.
+    st.markdown(f"<h3 style='margin:18px 0 8px;color:#E8EDF2'>{html.escape(title)}</h3>", unsafe_allow_html=True)
+    st.markdown(f"<div class='ai-card'>{mini_markdown_to_html(body)}</div>", unsafe_allow_html=True)
 
 def load_runtime_health() -> tuple[pd.DataFrame, dict]:
     """Load scanner runtime stats for the System Health panel."""
@@ -1130,16 +1206,21 @@ def apply_theme() -> None:
     .sidebar-brand { color:#00D4A3; font-weight:950; font-size:34px; letter-spacing:1.5px; }
     .sidebar-subtitle { color:#8BAAB8; font-size:15px; font-weight:750; margin-top:8px; }
     .side-divider { height:1px; background:#1E3050; margin:18px 0 22px; }
-    .metric-card { background:#0F2235; border:1px solid #1E3050; border-radius:18px; padding:18px; min-height:112px; box-shadow:0 0 0 1px rgba(0,212,163,0.02); }
+    .metric-card { background:#0F2235; border:1px solid #1E3050; border-radius:18px; padding:18px; min-height:112px; box-shadow:0 0 0 1px rgba(0,212,163,0.02); overflow:hidden; }
     .compact-card { background:#0F2235; border:1px solid #1E3050; border-radius:16px; padding:14px 16px; margin:10px 0; }
     .metric-label { color:#8BAAB8; font-size:13px; font-weight:800; text-transform:uppercase; letter-spacing:.5px; }
-    .metric-value { color:#E8EDF2; font-size:28px; font-weight:950; margin-top:4px; word-break:break-word; }
+    .metric-value { color:#E8EDF2; font-size:clamp(22px, 2.1vw, 30px); font-weight:950; margin-top:4px; line-height:1.15; overflow-wrap:anywhere; }
     .soft-card { background:#0F2235; border:1px solid #1E3050; border-radius:18px; padding:20px; margin:16px 0; line-height:1.55; }
-    .ai-card { background:linear-gradient(180deg,#10283D 0%,#0F2235 100%); border:1px solid #244363; border-radius:18px; padding:22px; margin:16px 0; line-height:1.65; }
+    .ai-card { background:linear-gradient(180deg,#10283D 0%,#0F2235 100%); border:1px solid #244363; border-radius:18px; padding:22px; margin:16px 0 24px; line-height:1.65; font-size:16px; }
     .green { color:#00D4A3; }
     .red { color:#FF5D5D; }
     .muted { color:#8BAAB8; }
     .section-gap { height:22px; }
+    .strategy-table-wrap { background:#0F2235; border:1px solid #1E3050; border-radius:16px; overflow:hidden; margin-top:10px; }
+    table.strategy-table { width:100%; border-collapse:collapse; font-size:15px; }
+    table.strategy-table th { text-align:left; color:#8BAAB8; background:#111A2A; padding:12px 14px; font-weight:850; }
+    table.strategy-table td { padding:12px 14px; border-top:1px solid #22344A; color:#E8EDF2; }
+    table.strategy-table td[title] { cursor:help; }
     .stTabs [data-baseweb="tab-list"] { gap: 8px; border-bottom: 1px solid #1E3050; }
     .stTabs [data-baseweb="tab"] { background:#0F2235; border:1px solid #1E3050; border-radius:12px 12px 0 0; color:#8BAAB8; padding:10px 16px; }
     .stTabs [aria-selected="true"] { color:#00D4A3 !important; border-bottom-color:#00D4A3 !important; }
@@ -1305,7 +1386,7 @@ def render_asset_deep_dive(username: str, settings: dict) -> None:
 
     c1, c2, c3, c4 = st.columns(4)
     with c1: metric_card("Latest signal", str(latest.get("signal", "")), f"{latest.get('timeframe', '')} · Grade {latest.get('grade', '')}")
-    with c2: metric_card("System agreement", f"{float(latest.get('confidence') or 0):.1f}%", f"Decayed {decayed_confidence_value(latest.get('confidence'), latest.get('created_at'), latest.get('timeframe')):.1f}%")
+    with c2: metric_card("System agreement", f"{float(latest.get('confidence') or 0):.1f}%", f"Urgency-adjusted {decayed_confidence_value(latest.get('confidence'), latest.get('created_at'), latest.get('timeframe')):.1f}%")
     with c3: metric_card("RR", f"{float(latest.get('rr') or 0):.2f}R", str(latest.get("status", "")))
     with c4: metric_card("Generated", time_ago(latest.get("created_at")), fmt_nairobi(latest.get("created_at")))
 
@@ -1329,12 +1410,8 @@ def render_asset_deep_dive(username: str, settings: dict) -> None:
 
     votes = parse_jsonish(row.get("strategy_votes"))
     if votes:
-        vote_rows = []
-        for name, payload in votes.items():
-            if isinstance(payload, dict):
-                vote_rows.append({"System": name, "Direction": payload.get("direction"), "Strength": payload.get("strength")})
         st.subheader("Strategy confluence")
-        st.dataframe(pd.DataFrame(vote_rows), width="stretch", hide_index=True)
+        render_strategy_confluence(votes)
 
     st.subheader("History for selected asset")
     hist = adf.copy()
