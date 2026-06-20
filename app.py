@@ -50,7 +50,7 @@ except Exception:  # pragma: no cover
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "v4.6-polished-ui-ai"
+APP_VERSION = "v4.7-agreement-confidence"
 DEFAULT_TIMEZONE = "Africa/Nairobi"
 ADMIN_USERNAMES = set()  # Admin is now assigned by database role: first created profile only.
 VALID_GRADES = {"A+", "A", "B", "C"}
@@ -997,6 +997,9 @@ def rich_signal_explanation(row: pd.Series) -> str:
     dconf = decayed_confidence_value(conf, row.get("created_at"), tf)
     mtf_score = float(pd.to_numeric(row.get("mtf_score"), errors="coerce") or 0)
     votes = parse_jsonish(row.get("strategy_votes"))
+    directional_votes = [v for v in votes.values() if isinstance(v, dict) and str(v.get("direction", "NEUTRAL")).upper() in {"BULLISH", "BEARISH"}]
+    total_votes = max(1, len(votes) or 5)
+    active_votes = len(directional_votes)
     mtf = parse_jsonish(row.get("mtf_context"))
     mtf_line = ""
     if mtf:
@@ -1009,8 +1012,9 @@ def rich_signal_explanation(row: pd.Series) -> str:
     return (
         f"**{asset} · {tf} · {time_ago(row.get('created_at'))}**  \n\n"
         f"The engine {decision}. The final grade is **{grade}** and current status is **{status}**. "
-        f"Raw confidence was **{conf:.1f}%**, but after age decay it currently reads about **{dconf:.1f}%**. "
-        f"That decay matters because older signals should lose urgency even if the original setup was clean. "
+        f"System agreement was **{conf:.1f}%**, based on **{active_votes}/{total_votes}** directional strategy vote(s). "
+        f"This is different from conviction: a single strategy can be very strong, but if the other systems are neutral, agreement stays low. "
+        f"After age decay it currently reads about **{dconf:.1f}%**, because older signals should lose urgency even when the original setup was clean. "
         f"The setup carries an edge score of **{edge:.1f}**, RR of **{rr:.2f}R**, and MTF alignment of **{mtf_score:.0f}%**.\n\n"
         f"**Strategy reasoning:** {format_votes(votes)}\n\n"
         f"**Multi-timeframe context:** {mtf_line or 'No detailed MTF context was stored.'}\n\n"
@@ -1042,7 +1046,9 @@ def rich_closed_trade_explanation(row: pd.Series) -> str:
 
 
 def render_ai_card(title: str, body: str) -> None:
-    st.markdown(f"<div class='ai-card'><h3 style='margin-top:0'>{html.escape(title)}</h3>", unsafe_allow_html=True)
+    # Keep the section title outside the card; the card itself contains the explanation.
+    st.subheader(title)
+    st.markdown("<div class='ai-card'>", unsafe_allow_html=True)
     st.markdown(body)
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1303,7 +1309,7 @@ def render_asset_deep_dive(username: str, settings: dict) -> None:
 
     c1, c2, c3, c4 = st.columns(4)
     with c1: metric_card("Latest signal", str(latest.get("signal", "")), f"{latest.get('timeframe', '')} · Grade {latest.get('grade', '')}")
-    with c2: metric_card("Confidence", f"{float(latest.get('confidence') or 0):.1f}%", f"Decayed {decayed_confidence_value(latest.get('confidence'), latest.get('created_at'), latest.get('timeframe')):.1f}%")
+    with c2: metric_card("System agreement", f"{float(latest.get('confidence') or 0):.1f}%", f"Age-adjusted {decayed_confidence_value(latest.get('confidence'), latest.get('created_at'), latest.get('timeframe')):.1f}%")
     with c3: metric_card("RR", f"{float(latest.get('rr') or 0):.2f}R", str(latest.get("status", "")))
     with c4: metric_card("Generated", time_ago(latest.get("created_at")), fmt_nairobi(latest.get("created_at")))
 

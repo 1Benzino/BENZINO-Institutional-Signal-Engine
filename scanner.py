@@ -1428,14 +1428,21 @@ def build_trade_plan(price: float, atr: float, signal: str) -> dict:
 
 
 def compute_edge_score(signal: str, confidence: float, ml_prob: float, rr: float) -> float:
+    """Composite edge score.
+
+    `confidence` is now system agreement across all systems, not directional
+    confidence among only the non-neutral voters. This means 1/5 agreement is
+    20%, 3/5 is 60%, and 5/5 is 100%. Do not invert it for SELL signals.
+    ML probability remains directional and is converted separately.
+    """
+    agreement_conf = safe_number(confidence, 0.0)
     if signal == "BUY":
-        dir_conf, dir_ml = confidence, ml_prob * 100
+        dir_ml = ml_prob * 100
     elif signal == "SELL":
-        dir_conf, dir_ml = 100 - confidence, (1 - ml_prob) * 100
+        dir_ml = (1 - ml_prob) * 100
     else:
-        dir_conf = max(0, 50 - abs(confidence - 50))
         dir_ml = max(0, 50 - abs(ml_prob - 0.5) * 100)
-    return float(round(dir_conf * 0.40 + dir_ml * 0.35 + rr * 10 * 0.25, 2))
+    return float(round(agreement_conf * 0.40 + dir_ml * 0.35 + rr * 10 * 0.25, 2))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1476,7 +1483,11 @@ def scan_asset(asset: str, ticker: str, timeframe: str = "15m") -> ScanResult | 
         atr = safe_number(df_entry["ATR"].iloc[-1], 0.0) if "ATR" in df_entry.columns else 0.0
         rsi = safe_number(df_entry["RSI"].iloc[-1], 50.0) if "RSI" in df_entry.columns else 50.0
         plan = build_trade_plan(price, atr, signal)
-        confidence = safe_number(np.clip(50 + safe_number(confluence.get("avg_strength")) * 50 * (1 if dominant == "BULLISH" else -1 if dominant == "BEARISH" else 0), 0, 100), 50.0)
+        total_systems = max(1, int(confluence.get("total_systems", 5) or 5))
+        agree_count = max(0, int(confluence.get("agree_count", 0) or 0))
+        # Confidence now means total system agreement, so neutral systems reduce it.
+        # Example: 1/5 = 20%, 3/5 = 60%, 5/5 = 100%.
+        confidence = safe_number(np.clip((agree_count / total_systems) * 100, 0, 100), 0.0)
         grade, grade_reason = grade_signal(confluence, plan["rr"])
         edge_score = compute_edge_score(signal, confidence, confluence["ml_prob"], plan["rr"])
         candle_close = str(df_entry["Date"].iloc[-1])
@@ -1494,7 +1505,7 @@ def scan_asset(asset: str, ticker: str, timeframe: str = "15m") -> ScanResult | 
             mtf_score=mtf_score, mtf_context=mtf_context, strategy_votes=confluence["votes"],
         )
         tag = "✅" if grade != "NO TRADE" else "👻"
-        print(f"  [{asset} {timeframe}] {tag} {signal} | Grade {grade} | Conf {confidence:.1f}% | Edge {edge_score:.1f} | RR {plan['rr']:.2f} | MTF {mtf_score:.0f}% | {confluence['agree_count']}/{confluence['total_systems']} agree")
+        print(f"  [{asset} {timeframe}] {tag} {signal} | Grade {grade} | Agreement {confidence:.1f}% | Edge {edge_score:.1f} | RR {plan['rr']:.2f} | MTF {mtf_score:.0f}% | {confluence['agree_count']}/{confluence['total_systems']} agree")
         return result
     except Exception as e:
         print(f"  [{asset} {timeframe}] ERROR: {e}")
@@ -1535,7 +1546,7 @@ def build_telegram_message(sig: ScanResult) -> str:
 
 <b>Asset:</b> {clean(sig.asset)}
 <b>Timeframe:</b> {clean(sig.timeframe)} signal / MTF confirmation
-<b>Confidence:</b> {sig.confidence:.1f}%
+<b>System Agreement:</b> {sig.confidence:.1f}%
 <b>Edge Score:</b> {sig.edge_score:.1f}
 <b>ML Prob:</b> {sig.ml_prob:.3f}
 
