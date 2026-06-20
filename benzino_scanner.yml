@@ -1,0 +1,47 @@
+name: BENZINO Institutional Scanner
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: benzino-institutional-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install scanner dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_scanner.txt
+
+      - name: Run BENZINO scanner
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
+          SCAN_OWNER: benzino_system
+          ACCOUNT_SIZE: "10000"
+          RISK_PER_TRADE: "0.01"
+          LEVERAGE: "100"
+          SCAN_TIMEFRAMES: "15m,1h,4h,1d"
+          DEFAULT_USER_TIMEFRAME: "1h"
+          FULL_UNIVERSE_SCAN_EVERY_HOURS: "1"
+          SLOW_TIMEFRAME_WINDOW_MINUTES: "5"
+          SCAN_MASTER_WATCHLIST_FALLBACK: "false"
+          SCAN_ALL_TIMEFRAMES_EVERY_RUN: "false"
+          MIN_ALERT_EDGE_SCORE: "35"
+          MIN_ALERT_CONFIDENCE_DIST: "12"
+        run: python scanner.py
