@@ -26,9 +26,6 @@ import html
 import uuid
 import hashlib
 import secrets
-import smtplib
-import ssl
-from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
@@ -49,7 +46,7 @@ except Exception:  # pragma: no cover
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "v4.4-dynamic-user-balances"
+APP_VERSION = "v4.5-reset-cron-ready"
 DEFAULT_TIMEZONE = "Africa/Nairobi"
 ADMIN_USERNAMES = set()  # Admin is now assigned by database role: first created profile only.
 VALID_GRADES = {"A+", "A", "B", "C"}
@@ -432,75 +429,48 @@ def validate_login(username: str, password: str) -> bool:
     return hash_password(password, str(df.iloc[0]["salt"])) == str(df.iloc[0]["password_hash"])
 
 
-def smtp_configured() -> bool:
-    return bool(get_secret_value("SMTP_HOST") and get_secret_value("SMTP_USERNAME") and get_secret_value("SMTP_PASSWORD"))
+def reset_password_with_saved_email(username_or_email: str, saved_email: str, new_password: str, confirm_password: str) -> tuple[bool, str]:
+    """Reset the local Benzino password without SMTP.
 
-
-def send_reset_email(to_email: str, username: str, temporary_password: str) -> tuple[bool, str]:
-    """Send a temporary password using SMTP secrets.
-
-    Required Streamlit/GitHub secrets:
-      SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, SMTP_FROM_EMAIL
-    Optional:
-      SMTP_USE_SSL=true/false
+    This app currently uses its own users table for login, not Supabase Auth.
+    To avoid SMTP dependency, the reset flow verifies the username/email record
+    and lets the user set a new password directly.
     """
-    to_email = normalize_email(to_email)
-    if not to_email:
-        return False, "No email address is saved for this user."
-
-    host = get_secret_value("SMTP_HOST")
-    port = int(get_secret_value("SMTP_PORT", "587") or 587)
-    user = get_secret_value("SMTP_USERNAME")
-    password = get_secret_value("SMTP_PASSWORD")
-    from_email = get_secret_value("SMTP_FROM_EMAIL", user)
-    use_ssl = get_secret_value("SMTP_USE_SSL", "false").lower() in {"1", "true", "yes", "y"}
-    if not host or not user or not password:
-        return False, "SMTP is not configured yet. Add SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD and SMTP_FROM_EMAIL to secrets."
-
-    msg = EmailMessage()
-    msg["Subject"] = "Benzino password reset"
-    msg["From"] = from_email
-    msg["To"] = to_email
-    msg.set_content(
-        f"Hello {username},\n\n"
-        f"Your Benzino temporary password is: {temporary_password}\n\n"
-        "Log in with this password, then change it from Settings.\n\n"
-        "If you did not request this reset, contact the admin immediately.\n"
-    )
-    try:
-        if use_ssl:
-            with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=20) as server:
-                server.login(user, password)
-                server.send_message(msg)
-        else:
-            with smtplib.SMTP(host, port, timeout=20) as server:
-                server.starttls(context=ssl.create_default_context())
-                server.login(user, password)
-                server.send_message(msg)
-        return True, "Reset password sent to the saved email address."
-    except Exception as exc:
-        return False, f"Email send failed: {exc}"
-
-
-def reset_password_by_email(username_or_email: str) -> tuple[bool, str]:
     lookup = str(username_or_email or "").strip().lower()
+    saved_email = normalize_email(saved_email)
+
     if not lookup:
         return False, "Enter your username or saved email address."
-    df = read_df("SELECT username, email FROM users WHERE username = %s OR email = %s", (normalize_username(lookup), normalize_email(lookup)))
+    if not saved_email:
+        return False, "Enter the email saved on your profile."
+    if len(new_password or "") < 4:
+        return False, "Use at least 4 characters for the new password."
+    if new_password != confirm_password:
+        return False, "The two new passwords do not match."
+
+    df = read_df(
+        """
+        SELECT username, email
+        FROM users
+        WHERE username = %s OR email = %s
+        LIMIT 1
+        """,
+        (normalize_username(lookup), normalize_email(lookup)),
+    )
     if df.empty:
         return False, "No matching user was found."
+
     username = str(df.iloc[0]["username"])
-    email = normalize_email(df.iloc[0].get("email", ""))
-    if not email:
+    stored_email = normalize_email(df.iloc[0].get("email", ""))
+    if not stored_email:
         return False, "This profile has no saved email address. Ask the admin to update it."
-    temporary_password = secrets.token_urlsafe(8)
+    if stored_email != saved_email:
+        return False, "The email does not match the email saved on this profile."
+
     salt = generate_salt()
-    pw_hash = hash_password(temporary_password, salt)
+    pw_hash = hash_password(new_password, salt)
     execute("UPDATE users SET password_hash = %s, salt = %s WHERE username = %s", (pw_hash, salt, username))
-    ok, msg = send_reset_email(email, username, temporary_password)
-    if not ok:
-        return False, msg
-    return True, msg
+    return True, "Password reset. You can now log in with the new password."
 
 
 def change_user_password(username: str, current_password: str, new_password: str) -> tuple[bool, str]:
@@ -598,7 +568,7 @@ def render_auth_gate() -> None:
                     st.error("Invalid username or password.")
         with tab_create:
             new_user = st.text_input("Choose username", key="create_user")
-            new_email = st.text_input("Email for password reset", key="create_email")
+            new_email = st.text_input("Email for password recovery", key="create_email")
             new_pass = st.text_input("Choose PIN / password", type="password", key="create_pass")
             if st.button("Create account", type="primary", width="stretch"):
                 ok, msg = create_user(new_user, new_pass, new_email)
@@ -610,9 +580,12 @@ def render_auth_gate() -> None:
                     st.error(msg)
         with tab_reset:
             lookup = st.text_input("Username or saved email", key="reset_lookup")
-            st.caption("A temporary password will be sent to the email saved on the profile.")
-            if st.button("Send reset password", type="primary", width="stretch"):
-                ok, msg = reset_password_by_email(lookup)
+            saved_email = st.text_input("Saved profile email", key="reset_saved_email")
+            new_password = st.text_input("New password", type="password", key="reset_new_password")
+            confirm_password = st.text_input("Confirm new password", type="password", key="reset_confirm_password")
+            st.caption("No SMTP setup is required. This resets the Benzino app password after matching your saved profile email.")
+            if st.button("Reset password", type="primary", width="stretch"):
+                ok, msg = reset_password_with_saved_email(lookup, saved_email, new_password, confirm_password)
                 if ok:
                     st.success(msg)
                 else:
@@ -1324,7 +1297,7 @@ def render_settings(username: str, settings: dict) -> None:
         st.caption("Admin policy: the first created profile is the only admin. All later profiles are standard users.")
 
         with st.expander("Profile email and password", expanded=False):
-            email_value = st.text_input("Email for password reset", value=current_email, key="profile_email")
+            email_value = st.text_input("Email for password recovery", value=current_email, key="profile_email")
             if st.button("Save email", type="secondary"):
                 ok, msg = update_user_email(username, email_value)
                 if ok: st.success(msg)
