@@ -1,0 +1,1789 @@
+"""
+scanner.py — Benzino Institutional-Grade Autonomous Signal Engine
+═══════════════════════════════════════════════════════════════════════════════
+Runs standalone (no Streamlit) on a 5-minute GitHub Actions cron.
+
+STRATEGY ENGINE — four independent, literature-backed systems vote on direction:
+  1. Time-Series Momentum      Moskowitz, Ooi & Pedersen (2012) — AQR / JFE
+  2. Donchian/Turtle Breakout  Richard Dennis Turtles, ADX-confirmed
+  3. RSI-2 Mean Reversion      Larry Connors — trend-filtered, not pure contrarian
+  4. ML Ensemble               LR(20%) + RF(35%) + GB(45%)
+
+Signals are graded A+/A/B/C/NO TRADE by strategy CONFLUENCE, not a single metric.
+
+INSTITUTIONAL BEHAVIOUR:
+  - Runs every 5 minutes regardless of who is logged into the Streamlit app.
+  - Every grade (A+, A, B, C) is auto-journaled. NO TRADE signals are shadow-
+    tracked (saved, never alerted) so the research panel can study what was
+    filtered out.
+  - A separate FTMO-style prop-firm ledger runs concurrently and only ever
+    counts A+ and A trades toward its equity, daily-loss, and max-loss limits.
+  - Telegram alerts fire at most once per (asset, timeframe, signal, candle
+    close) — true duplicate elimination, not a rolling time window.
+  - A new alert for a given (asset, timeframe) slot is blocked until the
+    previous open trade in that slot has closed via TP, SL, or expiry.
+
+ENV VARS (GitHub Actions secrets):
+  DATABASE_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS, SCAN_OWNER,
+  ACCOUNT_SIZE, RISK_PER_TRADE, LEVERAGE,
+  MIN_ALERT_EDGE_SCORE, MIN_ALERT_CONFIDENCE_DIST
+"""
+
+from __future__ import annotations
+
+import os
+import html
+import uuid
+import time
+import statistics
+import json
+import warnings
+import traceback
+import math
+from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import requests
+
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+except ImportError:
+    psycopg2 = None
+    RealDictCursor = None
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+MASTER_WATCHLIST = {
+    "XAUUSD": "GC=F", "XAGUSD": "SI=F", "OIL": "CL=F", "BRENT": "BZ=F",
+    "NATGAS": "NG=F", "COPPER": "HG=F",
+    "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "JPY=X",
+    "USDCHF": "CHF=X", "USDCAD": "CAD=X", "AUDUSD": "AUDUSD=X", "NZDUSD": "NZDUSD=X",
+    "GBPJPY": "GBPJPY=X", "EURJPY": "EURJPY=X", "AUDJPY": "AUDJPY=X",
+    "NZDJPY": "NZDJPY=X", "CADJPY": "CADJPY=X", "CHFJPY": "CHFJPY=X",
+    "EURGBP": "EURGBP=X", "EURAUD": "EURAUD=X", "EURNZD": "EURNZD=X",
+    "EURCAD": "EURCAD=X", "EURCHF": "EURCHF=X", "GBPAUD": "GBPAUD=X",
+    "GBPNZD": "GBPNZD=X", "GBPCAD": "GBPCAD=X", "GBPCHF": "GBPCHF=X",
+    "AUDCAD": "AUDCAD=X", "AUDNZD": "AUDNZD=X", "AUDCHF": "AUDCHF=X",
+    "NZDCAD": "NZDCAD=X", "NZDCHF": "NZDCHF=X",
+    "BTCUSD": "BTC-USD", "ETHUSD": "ETH-USD",
+    "SP500": "^GSPC", "NAS100": "^NDX", "DOW30": "^DJI",
+    "NVDA": "NVDA", "MU": "MU",
+}
+
+
+def load_user_watchlist(username: str) -> dict[str, str]:
+    """
+    Load one user's enabled watchlist from Supabase.
+
+    Returns:
+        {"XAUUSD": "GC=F", "BTCUSD": "BTC-USD"}
+
+    If the user has no saved watchlist yet, this returns an empty dict.
+    The scanner still scans MASTER_WATCHLIST; this helper is for user-specific
+    routing, dashboards, and future per-user Telegram delivery.
+    """
+    username = str(username or "").strip()
+    if not username:
+        return {}
+
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT asset, ticker
+                FROM user_watchlists
+                WHERE scan_owner = %s
+                  AND enabled = TRUE
+                ORDER BY asset
+                """,
+                (username,),
+            )
+            rows = cur.fetchall()
+        conn.close()
+
+        watchlist = {}
+        for row in rows:
+            asset = str(row.get("asset", "")).strip().upper()
+            ticker = str(row.get("ticker", "")).strip()
+            if asset and ticker and asset in MASTER_WATCHLIST:
+                watchlist[asset] = ticker
+
+        return watchlist
+
+    except Exception as exc:
+        print(f"[WARN] Could not load watchlist for {username}: {exc}")
+        return {}
+
+
+def get_all_user_watchlists() -> dict[str, dict[str, str]]:
+    """
+    Load every enabled user watchlist from Supabase.
+
+    Returns:
+        {
+            "ben": {"XAUUSD": "GC=F", "BTCUSD": "BTC-USD"},
+            "brother": {"EURUSD": "EURUSD=X"}
+        }
+
+    The scanner scans MASTER_WATCHLIST once, then these watchlists can be used
+    to decide which users should see each signal.
+    """
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT scan_owner, asset, ticker
+                FROM user_watchlists
+                WHERE enabled = TRUE
+                ORDER BY scan_owner, asset
+                """
+            )
+            rows = cur.fetchall()
+        conn.close()
+
+        watchlists: dict[str, dict[str, str]] = {}
+        for row in rows:
+            username = str(row.get("scan_owner", "")).strip()
+            asset = str(row.get("asset", "")).strip().upper()
+            ticker = str(row.get("ticker", "")).strip()
+
+            if not username or not asset or not ticker:
+                continue
+            if asset not in MASTER_WATCHLIST:
+                continue
+
+            watchlists.setdefault(username, {})
+            watchlists[username][asset] = ticker
+
+        return watchlists
+
+    except Exception as exc:
+        print(f"[WARN] Could not load user watchlists: {exc}")
+        return {}
+
+
+def _normalize_timeframe(value: str | None) -> str:
+    tf = str(value or DEFAULT_USER_TIMEFRAME).strip().lower()
+    aliases = {"15": "15m", "15min": "15m", "60m": "1h", "1hr": "1h", "hourly": "1h", "4hr": "4h", "daily": "1d", "day": "1d"}
+    tf = aliases.get(tf, tf)
+    return tf if tf in TIMEFRAME_CONFIGS else DEFAULT_USER_TIMEFRAME
+
+
+def _extract_timeframes_from_settings(settings: dict) -> list[str]:
+    """Read a user's preferred scanner timeframe(s) from settings_json.
+
+    Supports several key names so the scanner remains compatible as the app UI evolves.
+    """
+    if not isinstance(settings, dict):
+        return [DEFAULT_USER_TIMEFRAME]
+    raw_multi = (
+        settings.get("selected_timeframes")
+        or settings.get("scanner_timeframes")
+        or settings.get("signal_timeframes")
+        or settings.get("enabled_timeframes")
+    )
+    if isinstance(raw_multi, list):
+        out = [_normalize_timeframe(x) for x in raw_multi]
+        return sorted(set(out), key=["15m", "1h", "4h", "1d"].index)
+    raw = (
+        settings.get("preferred_timeframe")
+        or settings.get("signal_timeframe")
+        or settings.get("timeframe")
+        or settings.get("prop_timeframe")
+        or DEFAULT_USER_TIMEFRAME
+    )
+    return [_normalize_timeframe(raw)]
+
+
+def get_user_scan_preferences() -> dict[str, dict]:
+    """Load user settings needed by the fast scanner.
+
+    Returns:
+        {
+          "ben": {"timeframes": ["1h"], "tracking_started_at": "..."},
+          "brother": {"timeframes": ["15m"]}
+        }
+    """
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT username, settings_json FROM user_settings ORDER BY username")
+            rows = cur.fetchall()
+        conn.close()
+    except Exception as exc:
+        print(f"[WARN] Could not load user scan preferences: {exc}")
+        return {}
+
+    prefs: dict[str, dict] = {}
+    for row in rows:
+        username = str(row.get("username", "")).strip()
+        if not username:
+            continue
+        try:
+            settings = json.loads(row.get("settings_json") or "{}")
+            if not isinstance(settings, dict):
+                settings = {}
+        except Exception:
+            settings = {}
+        prefs[username] = {
+            "timeframes": _extract_timeframes_from_settings(settings),
+            "tracking_started_at": settings.get("tracking_started_at", ""),
+        }
+    return prefs
+
+
+def should_run_full_universe(now: datetime | None = None) -> bool:
+    """Optional broad research scan, disabled by default to keep cron under 5 min."""
+    if FULL_UNIVERSE_SCAN_EVERY_HOURS <= 0:
+        return False
+    now = now or datetime.now(timezone.utc)
+    return now.minute < max(5, SLOW_TIMEFRAME_WINDOW_MINUTES) and (now.hour % FULL_UNIVERSE_SCAN_EVERY_HOURS == 0)
+
+
+def build_scan_plan(now: datetime | None = None) -> tuple[dict[str, str], list[str], str]:
+    """Build the smallest useful scan universe from active user watchlists.
+
+    The scanner scans each unique asset/timeframe once, regardless of how many
+    users follow it. User-specific dashboard filtering still happens in app.py.
+    """
+    now = now or datetime.now(timezone.utc)
+    user_watchlists = get_all_user_watchlists()
+    user_prefs = get_user_scan_preferences()
+
+    assets: dict[str, str] = {}
+    requested_tfs: set[str] = set()
+
+    for username, watchlist in user_watchlists.items():
+        if not watchlist:
+            continue
+        for asset, ticker in watchlist.items():
+            if asset in MASTER_WATCHLIST:
+                assets[asset] = ticker or MASTER_WATCHLIST[asset]
+        pref = user_prefs.get(username, {})
+        for tf in pref.get("timeframes", [DEFAULT_USER_TIMEFRAME]):
+            if tf in TIMEFRAME_CONFIGS:
+                requested_tfs.add(tf)
+
+    if not requested_tfs:
+        requested_tfs.add(DEFAULT_USER_TIMEFRAME)
+
+    mode = "USER_FAST"
+    if should_run_full_universe(now):
+        assets = dict(MASTER_WATCHLIST)
+        requested_tfs = set(SCAN_TIMEFRAMES)
+        mode = "FULL_UNIVERSE"
+    elif not assets:
+        if SCAN_MASTER_WATCHLIST_FALLBACK:
+            assets = dict(MASTER_WATCHLIST)
+            requested_tfs = {DEFAULT_USER_TIMEFRAME}
+            mode = "MASTER_FALLBACK"
+        else:
+            # No users/watchlists yet. Do a tiny heartbeat scan so runtime logging
+            # works, but do not burn 28 minutes scanning the whole universe.
+            fallback_assets = {"XAUUSD": MASTER_WATCHLIST["XAUUSD"]}
+            assets = fallback_assets
+            requested_tfs = {DEFAULT_USER_TIMEFRAME}
+            mode = "NO_USERS_HEARTBEAT"
+
+    ordered_tfs = [tf for tf in ["15m", "1h", "4h", "1d"] if tf in requested_tfs]
+    active_tfs = active_timeframes_for_run(now, ordered_tfs)
+    return assets, active_tfs, mode
+
+
+# Backward-compatible alias for any older helper that still imports WATCHLIST.
+# New scanner loops should use MASTER_WATCHLIST directly.
+WATCHLIST = MASTER_WATCHLIST
+
+# Multi-timeframe scan universe. Yahoo Finance does not reliably expose native 4h candles,
+# so 4h is built by resampling 60m data. The scanner creates a separate signal row for
+# each asset + timeframe + signal + candle_close.
+TIMEFRAME_CONFIGS = {
+    "15m": {"interval": "15m", "period": "60d",  "expiry_bars": 48},
+    "1h":  {"interval": "60m", "period": "730d", "expiry_bars": 72},
+    "4h":  {"interval": "60m", "period": "730d", "resample": "4h", "expiry_bars": 42},
+    "1d":  {"interval": "1d",  "period": "5y",   "expiry_bars": 20},
+}
+SCAN_TIMEFRAMES = [tf.strip().lower() for tf in os.environ.get("SCAN_TIMEFRAMES", "15m,1h,4h,1d").split(",") if tf.strip().lower() in TIMEFRAME_CONFIGS]
+if not SCAN_TIMEFRAMES:
+    SCAN_TIMEFRAMES = ["15m", "1h", "4h", "1d"]
+
+# Fast-mode optimisation. By default the scanner only scans assets/timeframes
+# selected by active Streamlit users. This keeps the 5-minute cron realistic.
+# Set SCAN_MASTER_WATCHLIST_FALLBACK=true to scan the full universe when no user
+# watchlists exist yet. Set FULL_UNIVERSE_SCAN_EVERY_HOURS to a positive number
+# if you also want an occasional broad research sweep.
+SCAN_MASTER_WATCHLIST_FALLBACK = os.environ.get("SCAN_MASTER_WATCHLIST_FALLBACK", "false").strip().lower() in {"1", "true", "yes", "y"}
+FULL_UNIVERSE_SCAN_EVERY_HOURS = int(os.environ.get("FULL_UNIVERSE_SCAN_EVERY_HOURS", "0"))
+DEFAULT_USER_TIMEFRAME = os.environ.get("DEFAULT_USER_TIMEFRAME", "1h").strip().lower()
+if DEFAULT_USER_TIMEFRAME not in TIMEFRAME_CONFIGS:
+    DEFAULT_USER_TIMEFRAME = "1h"
+
+# Runtime optimisation:
+# - 15m and 1h are scanned every run.
+# - 4h and 1d are scanned only near their candle windows unless explicitly forced.
+# Set SCAN_ALL_TIMEFRAMES_EVERY_RUN=true if you want the old slower behaviour.
+SCAN_ALL_TIMEFRAMES_EVERY_RUN = os.environ.get("SCAN_ALL_TIMEFRAMES_EVERY_RUN", "false").strip().lower() in {"1", "true", "yes", "y"}
+SLOW_TIMEFRAME_WINDOW_MINUTES = int(os.environ.get("SLOW_TIMEFRAME_WINDOW_MINUTES", "15"))
+MTF_CONFIRMATION_TIMEFRAMES = ["15m", "1h", "4h"]
+_TF_CACHE: dict[tuple[str, str], pd.DataFrame | None] = {}
+
+
+def active_timeframes_for_run(now: datetime | None = None, requested_timeframes: list[str] | None = None) -> list[str]:
+    """Return the timeframes this scanner run should actively generate.
+
+    requested_timeframes comes from user settings. The 5-minute cron should not
+    scan higher timeframes unless a fresh candle window is due, because 4h/1d
+    data does not change every five minutes.
+    """
+    configured = [tf for tf in (requested_timeframes or SCAN_TIMEFRAMES) if tf in TIMEFRAME_CONFIGS]
+    if not configured:
+        configured = [DEFAULT_USER_TIMEFRAME]
+
+    if SCAN_ALL_TIMEFRAMES_EVERY_RUN:
+        return configured
+
+    now = now or datetime.now(timezone.utc)
+    minute_window = max(5, int(SLOW_TIMEFRAME_WINDOW_MINUTES))
+    active: list[str] = []
+
+    for tf in configured:
+        if tf == "15m":
+            active.append(tf)
+        elif tf == "1h":
+            # Scan 1h only near the top of the hour unless it is the only selected timeframe.
+            if now.minute < minute_window or configured == ["1h"]:
+                active.append(tf)
+        elif tf == "4h":
+            if now.hour % 4 == 0 and now.minute < minute_window:
+                active.append(tf)
+        elif tf == "1d":
+            if now.hour == 0 and now.minute < minute_window:
+                active.append(tf)
+
+    # If none are due, run the fastest selected timeframe as a heartbeat so the
+    # scanner still evaluates nearby trades and logs runtime health.
+    if not active:
+        priority = ["15m", "1h", "4h", "1d"]
+        active.append(next((tf for tf in priority if tf in configured), configured[0]))
+    return active
+
+# Legacy aliases retained for older helper code and Telegram text.
+ENTRY_INTERVAL, ENTRY_PERIOD = "15m", "60d"
+REGIME_INTERVAL, REGIME_PERIOD = "60m", "730d"
+
+LOOKAHEAD = 8   # bars-ahead label for ML training
+
+ACCOUNT_SIZE   = float(os.environ.get("ACCOUNT_SIZE",   "10000"))
+RISK_PER_TRADE = float(os.environ.get("RISK_PER_TRADE", "0.01"))
+LEVERAGE       = float(os.environ.get("LEVERAGE",       "100"))
+SCAN_OWNER     = str(os.environ.get("SCAN_OWNER",       "benzino_system"))
+
+MIN_ALERT_EDGE_SCORE      = float(os.environ.get("MIN_ALERT_EDGE_SCORE",      "35"))
+MIN_ALERT_CONFIDENCE_DIST = float(os.environ.get("MIN_ALERT_CONFIDENCE_DIST", "12"))
+
+ATR_SL_MULT = 1.5
+ATR_TP_MULT = 3.0
+EXPIRY_BARS = 48          # auto-expire an open trade after 48 entry-timeframe bars (~12h on 15m)
+
+# FTMO-style challenge rules — mirrors app.py's Challenge Mode panel
+CHALLENGE_PROFIT_TARGET    = 0.10
+CHALLENGE_MAX_DAILY_LOSS   = 0.05
+CHALLENGE_MAX_TOTAL_LOSS   = 0.10
+CHALLENGE_MIN_TRADING_DAYS = 4
+
+GRADE_RANK = {"A+": 4, "A": 3, "B": 2, "C": 1, "NO TRADE": 0}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  RESULT DATACLASS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class ScanResult:
+    asset        : str
+    ticker       : str
+    timeframe    : str
+    signal       : str
+    grade        : str
+    confidence   : float
+    edge_score   : float
+    ml_prob      : float
+    entry        : float
+    sl           : float
+    tp           : float
+    rr           : float
+    regime       : str
+    rsi          : float
+    atr          : float
+    trend_1h     : str
+    trend_15m    : str
+    reason       : str
+    candle_close : str
+    mtf_score    : float = 0.0
+    mtf_context  : dict = field(default_factory=dict)
+    strategy_votes: dict = field(default_factory=dict)
+    signal_id    : str = field(default_factory=lambda: uuid.uuid4().hex)
+    created_at   : str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    alert_sent   : bool = False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DATABASE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _clean_db_url(url: str) -> str:
+    url = str(url or "").strip()
+    if not url:
+        return ""
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    try:
+        parts = urlsplit(url)
+        allowed = {"sslmode", "connect_timeout", "application_name", "target_session_attrs", "keepalives"}
+        cleaned = urlencode([(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k in allowed])
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, cleaned, parts.fragment))
+    except Exception:
+        return url
+
+
+def db_connect():
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if not url:
+        raise RuntimeError("DATABASE_URL is not set.")
+    if psycopg2 is None:
+        raise RuntimeError("psycopg2 is not installed — add psycopg2-binary to requirements_scanner.txt.")
+    return psycopg2.connect(_clean_db_url(url), cursor_factory=RealDictCursor)
+
+
+def init_tables() -> None:
+    ddl = """
+    CREATE TABLE IF NOT EXISTS scanner_signals (
+        signal_id      TEXT PRIMARY KEY,
+        created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        scan_owner     TEXT,
+        asset          TEXT,
+        ticker         TEXT,
+        timeframe      TEXT,
+        signal         TEXT,
+        grade          TEXT,
+        confidence     NUMERIC,
+        edge_score     NUMERIC,
+        ml_prob        NUMERIC,
+        entry          NUMERIC,
+        sl             NUMERIC,
+        tp             NUMERIC,
+        rr             NUMERIC,
+        regime         TEXT,
+        rsi            NUMERIC,
+        atr            NUMERIC,
+        trend_1h       TEXT,
+        trend_15m      TEXT,
+        reason         TEXT,
+        candle_close   TIMESTAMPTZ,
+        strategy_votes JSONB,
+        mtf_score      NUMERIC,
+        mtf_context    JSONB,
+        alert_sent     BOOLEAN DEFAULT FALSE,
+        status         TEXT DEFAULT 'SHADOW',
+        bars_open      INTEGER DEFAULT 0,
+        exit_price     NUMERIC,
+        exit_reason    TEXT,
+        exit_at        TIMESTAMPTZ,
+        r_multiple     NUMERIC
+    );
+    CREATE INDEX IF NOT EXISTS idx_scanner_asset_tf_signal_candle
+        ON scanner_signals (asset, timeframe, signal, candle_close);
+    CREATE INDEX IF NOT EXISTS idx_scanner_open_slot
+        ON scanner_signals (asset, timeframe, status);
+
+    CREATE TABLE IF NOT EXISTS user_watchlists (
+        id BIGSERIAL PRIMARY KEY,
+        scan_owner TEXT NOT NULL,
+        asset TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        enabled BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(scan_owner, asset)
+    );
+
+    CREATE TABLE IF NOT EXISTS user_telegram_settings (
+        scan_owner TEXT PRIMARY KEY,
+        telegram_chat_id TEXT,
+        watchlist_alerts BOOLEAN DEFAULT TRUE,
+        all_signals_alerts BOOLEAN DEFAULT FALSE,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS scanner_runtime_log (
+        run_id TEXT PRIMARY KEY,
+        started_at TIMESTAMPTZ,
+        finished_at TIMESTAMPTZ,
+        total_seconds NUMERIC,
+        assets_scanned INTEGER,
+        signals_saved INTEGER,
+        shadow_saved INTEGER,
+        open_trades INTEGER,
+        alerted INTEGER,
+        timeframes_scanned TEXT,
+        fastest_asset_seconds NUMERIC,
+        slowest_asset_seconds NUMERIC,
+        avg_asset_seconds NUMERIC,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS prop_firm_state (
+        scan_owner          TEXT PRIMARY KEY,
+        starting_balance    NUMERIC,
+        current_equity      NUMERIC,
+        daily_pnl           NUMERIC DEFAULT 0,
+        daily_reset_date    DATE,
+        trading_days        INTEGER DEFAULT 0,
+        status              TEXT DEFAULT 'ACTIVE',
+        updated_at           TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS prop_firm_trades (
+        trade_id    TEXT PRIMARY KEY,
+        signal_id   TEXT REFERENCES scanner_signals(signal_id),
+        scan_owner  TEXT,
+        asset       TEXT,
+        grade       TEXT,
+        r_multiple  NUMERIC,
+        pnl_cash    NUMERIC,
+        closed_at   TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_prop_firm_trades_signal_id
+        ON prop_firm_trades (signal_id);
+    """
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(ddl)
+                cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS mtf_score NUMERIC")
+                cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS mtf_context JSONB")
+                cur.execute("ALTER TABLE scanner_runtime_log ADD COLUMN IF NOT EXISTS open_trades INTEGER DEFAULT 0")
+                cur.execute("ALTER TABLE scanner_runtime_log ADD COLUMN IF NOT EXISTS alerted INTEGER DEFAULT 0")
+                # Migration/fix: a journaled A+/A/B/C BUY/SELL setup must be OPEN even when Telegram is disabled.
+                # Older runs incorrectly left graded setups as SHADOW when no alert was sent.
+                cur.execute(
+                    """
+                    UPDATE scanner_signals
+                    SET status = 'OPEN'
+                    WHERE UPPER(TRIM(COALESCE(grade, ''))) IN ('A+', 'A', 'B', 'C')
+                      AND UPPER(TRIM(COALESCE(signal, ''))) IN ('BUY', 'SELL')
+                      AND UPPER(TRIM(COALESCE(status, 'SHADOW'))) = 'SHADOW'
+                      AND exit_at IS NULL
+                    """
+                )
+        conn.close()
+        print("[DB] Tables ready. Graded BUY/SELL setups are auto-opened; NO TRADE remains SHADOW.")
+    except Exception as e:
+        print(f"[DB] init_tables failed: {e}")
+
+
+def safe_number(value, default: float = 0.0) -> float:
+    """Return a finite float. Converts NaN/inf/None to default."""
+    try:
+        x = float(value)
+        if math.isnan(x) or math.isinf(x):
+            return float(default)
+        return x
+    except Exception:
+        return float(default)
+
+
+def sanitize_for_json(value):
+    """Recursively convert NaN/inf/numpy values into JSONB-safe values."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {str(k): sanitize_for_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [sanitize_for_json(v) for v in value]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        x = float(value)
+        if math.isnan(x) or math.isinf(x):
+            return None
+        return x
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    return value
+
+
+def save_signal(sig: ScanResult) -> bool:
+    sql = """
+    INSERT INTO scanner_signals
+        (signal_id, created_at, scan_owner, asset, ticker, timeframe, signal, grade,
+         confidence, edge_score, ml_prob, entry, sl, tp, rr, regime, rsi, atr,
+         trend_1h, trend_15m, reason, candle_close, strategy_votes, mtf_score, mtf_context, alert_sent, status)
+    VALUES
+        (%s,%s,%s,%s,%s,%s,%s,%s, %s,%s,%s,%s,%s,%s,%s,%s,%s,%s, %s,%s,%s,%s,%s,%s,%s,%s,%s)
+    ON CONFLICT (signal_id) DO NOTHING;
+    """
+    import json
+    grade_norm = str(sig.grade or "").strip().upper()
+    signal_norm = str(sig.signal or "").strip().upper()
+    status = "OPEN" if (grade_norm in ("A+", "A", "B", "C") and signal_norm in ("BUY", "SELL")) else "SHADOW"
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (
+                    sig.signal_id, sig.created_at, SCAN_OWNER, sig.asset, sig.ticker,
+                    sig.timeframe, sig.signal, sig.grade,
+                    round(safe_number(sig.confidence), 4), round(safe_number(sig.edge_score), 4), round(safe_number(sig.ml_prob, 0.5), 6),
+                    round(safe_number(sig.entry), 8), round(safe_number(sig.sl), 8), round(safe_number(sig.tp), 8), round(safe_number(sig.rr), 4),
+                    sig.regime, round(safe_number(sig.rsi, 50.0), 2), round(safe_number(sig.atr), 8),
+                    sig.trend_1h, sig.trend_15m, sig.reason, sig.candle_close,
+                    json.dumps(sanitize_for_json(sig.strategy_votes), allow_nan=False), round(safe_number(sig.mtf_score), 4),
+                    json.dumps(sanitize_for_json(sig.mtf_context or {}), allow_nan=False), sig.alert_sent, status,
+                ))
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"[DB] save_signal failed for {sig.asset}: {e}")
+        return False
+
+
+def force_open_graded_setups() -> int:
+    """Safety migration: every A+/A/B/C BUY/SELL row must be OPEN unless already closed."""
+    sql = """
+    UPDATE scanner_signals
+    SET status = 'OPEN'
+    WHERE UPPER(TRIM(COALESCE(grade, ''))) IN ('A+', 'A', 'B', 'C')
+      AND UPPER(TRIM(COALESCE(signal, ''))) IN ('BUY', 'SELL')
+      AND UPPER(TRIM(COALESCE(status, 'SHADOW'))) = 'SHADOW'
+      AND exit_at IS NULL
+    RETURNING signal_id;
+    """
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+        conn.close()
+        count = len(rows or [])
+        if count:
+            print(f"[DB] Auto-open migration fixed {count} graded shadow row(s).")
+        return count
+    except Exception as e:
+        print(f"[DB] force_open_graded_setups failed: {e}")
+        return 0
+
+
+def mark_alert_sent(signal_id: str) -> None:
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE scanner_signals SET alert_sent = TRUE WHERE signal_id = %s",
+                    (signal_id,))
+        conn.close()
+    except Exception as e:
+        print(f"[DB] mark_alert_sent failed: {e}")
+
+
+def duplicate_alert_exists(asset: str, timeframe: str, signal: str, candle_close: str) -> bool:
+    """
+    True duplicate definition: same asset + timeframe + signal + candle close
+    has already been alerted. This is exact-match, not a rolling time window.
+    """
+    sql = """
+    SELECT 1 FROM scanner_signals
+    WHERE asset = %s AND timeframe = %s AND signal = %s
+      AND candle_close = %s AND alert_sent = TRUE
+    LIMIT 1;
+    """
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute(sql, (asset, timeframe, signal, candle_close))
+            row = cur.fetchone()
+        conn.close()
+        return row is not None
+    except Exception as e:
+        print(f"[DB] duplicate_alert_exists check failed: {e}")
+        return False
+
+
+
+
+def duplicate_setup_exists(asset: str, timeframe: str, signal: str, candle_close: str) -> bool:
+    """
+    True setup duplicate definition: same asset + timeframe + signal + candle close
+    already exists in Supabase. This is independent of Telegram.
+
+    This prevents the 5-minute scanner from opening/saving the same 15-minute
+    candle setup multiple times when Telegram is disabled or optional.
+    """
+    sql = """
+    SELECT 1 FROM scanner_signals
+    WHERE asset = %s AND timeframe = %s AND signal = %s
+      AND candle_close = %s
+    LIMIT 1;
+    """
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute(sql, (asset, timeframe, signal, candle_close))
+            row = cur.fetchone()
+        conn.close()
+        return row is not None
+    except Exception as e:
+        print(f"[DB] duplicate_setup_exists check failed: {e}")
+        return False
+
+
+def open_trade_for_slot(asset: str, timeframe: str) -> dict | None:
+    """
+    A new alert cannot fire for (asset, timeframe) while a previous trade in
+    that exact slot is still OPEN. Returns the open row, or None if the slot
+    is free.
+    """
+    sql = """
+    SELECT * FROM scanner_signals
+    WHERE asset = %s AND timeframe = %s AND status = 'OPEN'
+    ORDER BY created_at DESC LIMIT 1;
+    """
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute(sql, (asset, timeframe))
+            row = cur.fetchone()
+        conn.close()
+        return dict(row) if row else None
+    except Exception as e:
+        print(f"[DB] open_trade_for_slot check failed: {e}")
+        return None  # fail open — better to risk a rare dup than to block all alerts
+
+
+def close_trade(signal_id: str, exit_price: float, exit_reason: str, r_multiple: float) -> None:
+    sql = """
+    UPDATE scanner_signals
+    SET status = %s, exit_price = %s, exit_reason = %s, exit_at = NOW(), r_multiple = %s
+    WHERE signal_id = %s;
+    """
+    status = {"TP": "CLOSED_TP", "SL": "CLOSED_SL", "EXPIRY": "EXPIRED"}.get(exit_reason, "CLOSED")
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (status, exit_price, exit_reason, r_multiple, signal_id))
+        conn.close()
+    except Exception as e:
+        print(f"[DB] close_trade failed: {e}")
+
+
+def bump_bars_open(signal_id: str, bars: int) -> None:
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE scanner_signals SET bars_open = %s WHERE signal_id = %s", (bars, signal_id))
+        conn.close()
+    except Exception:
+        pass
+
+
+def fetch_open_trades(assets: set[str] | None = None, timeframes: set[str] | None = None) -> list[dict]:
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            sql = "SELECT * FROM scanner_signals WHERE status = 'OPEN'"
+            params: list = []
+            if assets:
+                sql += " AND asset = ANY(%s)"
+                params.append(list(assets))
+            if timeframes:
+                sql += " AND timeframe = ANY(%s)"
+                params.append(list(timeframes))
+            sql += " ORDER BY created_at ASC"
+            cur.execute(sql, tuple(params))
+            rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        print(f"[DB] fetch_open_trades failed: {e}")
+        return []
+
+
+# ── Prop firm ledger — A+/A trades only ───────────────────────────────────────
+
+def load_prop_firm_state() -> dict:
+    sql_select = "SELECT * FROM prop_firm_state WHERE scan_owner = %s"
+    sql_insert = """
+    INSERT INTO prop_firm_state (scan_owner, starting_balance, current_equity, daily_reset_date)
+    VALUES (%s, %s, %s, %s) RETURNING *;
+    """
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute(sql_select, (SCAN_OWNER,))
+            row = cur.fetchone()
+            if row is None:
+                cur.execute(sql_insert, (SCAN_OWNER, ACCOUNT_SIZE, ACCOUNT_SIZE,
+                                         datetime.now(timezone.utc).date()))
+                conn.commit()
+                row = cur.fetchone()
+        conn.close()
+        return dict(row)
+    except Exception as e:
+        print(f"[DB] load_prop_firm_state failed: {e}")
+        return {
+            "scan_owner": SCAN_OWNER, "starting_balance": ACCOUNT_SIZE,
+            "current_equity": ACCOUNT_SIZE, "daily_pnl": 0,
+            "daily_reset_date": datetime.now(timezone.utc).date(),
+            "trading_days": 0, "status": "ACTIVE",
+        }
+
+
+def prop_firm_trade_already_recorded(signal_id: str) -> bool:
+    """Return True when this closed signal has already been applied to the prop ledger."""
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM prop_firm_trades WHERE signal_id = %s LIMIT 1", (signal_id,))
+            row = cur.fetchone()
+        conn.close()
+        return row is not None
+    except Exception as e:
+        print(f"[DB] prop_firm_trade_already_recorded failed: {e}")
+        return False
+
+
+def update_prop_firm(signal_id: str, asset: str, grade: str, r_multiple: float) -> None:
+    """Apply closed A+/A trades to the prop-firm ledger exactly once.
+
+    Normal account performance is computed in app.py from scanner_signals.
+    The prop-firm ledger is stricter: only A+ and A closed trades are posted.
+    This function is called immediately when an OPEN trade closes via TP, SL,
+    or expiry, so prop equity updates as soon as the scanner resolves the trade.
+    """
+    if grade not in ("A+", "A"):
+        return
+
+    # Idempotency guard: never double-count a closed trade if the scanner is rerun
+    # or if a previous run closed the signal but crashed later.
+    if prop_firm_trade_already_recorded(signal_id):
+        print(f"[PropFirm] {asset} {grade} already posted to ledger — skipping duplicate.")
+        return
+
+    force_open_graded_setups()
+    state = load_prop_firm_state()
+    if state.get("status") != "ACTIVE":
+        print(f"[PropFirm] Challenge already {state.get('status')} — ignoring new trade.")
+        return
+
+    starting = float(state["starting_balance"])
+    risk_cash = starting * RISK_PER_TRADE
+    pnl_cash = float(r_multiple) * risk_cash
+
+    today = datetime.now(timezone.utc).date()
+    daily_pnl = float(state.get("daily_pnl") or 0)
+    reset_date = state.get("daily_reset_date")
+    if reset_date != today:
+        daily_pnl = 0.0
+
+    new_equity = float(state["current_equity"]) + pnl_cash
+    daily_pnl += pnl_cash
+
+    # Count the first posted trade of a new day as a trading day. If this is the
+    # first ever trade and reset_date is today, keep at least one trading day.
+    trading_days = int(state.get("trading_days") or 0)
+    if reset_date != today or trading_days == 0:
+        trading_days += 1
+
+    status = "ACTIVE"
+    if new_equity <= starting * (1 - CHALLENGE_MAX_TOTAL_LOSS):
+        status = "FAILED"
+    elif daily_pnl <= -starting * CHALLENGE_MAX_DAILY_LOSS:
+        status = "FAILED"
+    elif (new_equity >= starting * (1 + CHALLENGE_PROFIT_TARGET)
+          and trading_days >= CHALLENGE_MIN_TRADING_DAYS):
+        status = "PASSED"
+
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE prop_firm_state
+                    SET current_equity = %s, daily_pnl = %s, daily_reset_date = %s,
+                        trading_days = %s, status = %s, updated_at = NOW()
+                    WHERE scan_owner = %s
+                """, (new_equity, daily_pnl, today, trading_days, status, SCAN_OWNER))
+                cur.execute("""
+                    INSERT INTO prop_firm_trades (trade_id, signal_id, scan_owner, asset, grade, r_multiple, pnl_cash)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (signal_id) DO NOTHING
+                """, (uuid.uuid4().hex, signal_id, SCAN_OWNER, asset, grade, r_multiple, pnl_cash))
+        conn.close()
+        print(f"[PropFirm] {asset} {grade} closed {r_multiple:+.2f}R (${pnl_cash:+,.2f}) "
+              f"→ equity ${new_equity:,.2f} · status {status} · trading days {trading_days}")
+    except Exception as e:
+        print(f"[DB] update_prop_firm failed: {e}")
+
+
+
+def log_runtime(run_id: str, started_at: datetime, finished_at: datetime, total_seconds: float,
+                assets_scanned: int, signals_saved: int, shadow_saved: int, open_trades: int,
+                alerted: int, timeframes_scanned: list[str], asset_seconds: list[float]) -> None:
+    """Persist scanner runtime statistics for the Streamlit System Health panel."""
+    fastest = min(asset_seconds) if asset_seconds else 0.0
+    slowest = max(asset_seconds) if asset_seconds else 0.0
+    avg = float(np.mean(asset_seconds)) if asset_seconds else 0.0
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO scanner_runtime_log
+                        (run_id, started_at, finished_at, total_seconds, assets_scanned,
+                         signals_saved, shadow_saved, open_trades, alerted, timeframes_scanned,
+                         fastest_asset_seconds, slowest_asset_seconds, avg_asset_seconds)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (run_id) DO NOTHING
+                    """,
+                    (
+                        run_id, started_at.isoformat(), finished_at.isoformat(), float(total_seconds),
+                        int(assets_scanned), int(signals_saved), int(shadow_saved), int(open_trades),
+                        int(alerted), ",".join(timeframes_scanned), float(fastest), float(slowest), float(avg),
+                    ),
+                )
+        conn.close()
+        print(f"[Runtime] Logged run {run_id[:8]}: {total_seconds:.1f}s · TFs {','.join(timeframes_scanned)}")
+    except Exception as e:
+        print(f"[Runtime] Failed to log scanner runtime: {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DATA DOWNLOAD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def download(ticker: str, interval: str, period: str) -> pd.DataFrame | None:
+    try:
+        df = yf.download(ticker, interval=interval, period=period, auto_adjust=True, progress=False)
+        if df is None or df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.reset_index()
+        df.columns = [str(c) for c in df.columns]
+        date_col = df.columns[0]
+        df[date_col] = pd.to_datetime(df[date_col], utc=True).dt.tz_localize(None)
+        df = df.rename(columns={date_col: "Date"})
+        return df if len(df) >= 50 else None
+    except Exception as e:
+        print(f"[data] {ticker} ({interval}): {e}")
+        return None
+
+
+def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame | None:
+    """Resample Date/Open/High/Low/Close/Volume data into a higher timeframe."""
+    try:
+        if df is None or df.empty:
+            return None
+        work = df.copy()
+        work["Date"] = pd.to_datetime(work["Date"], utc=True, errors="coerce")
+        work = work.dropna(subset=["Date"]).set_index("Date").sort_index()
+        agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+        if "Volume" in work.columns:
+            agg["Volume"] = "sum"
+        out = work.resample(rule).agg(agg).dropna(subset=["Open", "High", "Low", "Close"]).reset_index()
+        out["Date"] = pd.to_datetime(out["Date"], utc=True).dt.tz_localize(None)
+        return out if len(out) >= 50 else None
+    except Exception as exc:
+        print(f"[data] resample {rule} failed: {exc}")
+        return None
+
+
+def get_timeframe_df(ticker: str, timeframe: str) -> pd.DataFrame | None:
+    """Download/cache the requested scanner timeframe, including synthetic 4h candles."""
+    timeframe = str(timeframe or "15m").lower()
+    if timeframe not in TIMEFRAME_CONFIGS:
+        timeframe = "15m"
+    key = (ticker, timeframe)
+    if key in _TF_CACHE:
+        cached = _TF_CACHE[key]
+        return cached.copy() if cached is not None else None
+    cfg = TIMEFRAME_CONFIGS[timeframe]
+    base = download(ticker, cfg["interval"], cfg["period"])
+    if base is not None and cfg.get("resample"):
+        base = resample_ohlcv(base, cfg["resample"])
+    _TF_CACHE[key] = base.copy() if base is not None else None
+    return base.copy() if base is not None else None
+
+
+def trend_direction_from_df(df: pd.DataFrame | None) -> tuple[str, float]:
+    """Return BULLISH/BEARISH/NEUTRAL plus a 0-1 trend strength estimate."""
+    if df is None or df.empty:
+        return "NEUTRAL", 0.0
+    try:
+        work = add_indicators(df)
+        l = work.iloc[-1]
+        price = float(l.get("Close", np.nan))
+        ema20 = float(l.get("ema20", np.nan))
+        ema50 = float(l.get("ema50", np.nan))
+        ema200 = float(l.get("ema200", np.nan))
+        adx = float(l.get("ADX", 0) or 0)
+        if any(np.isnan(x) for x in [price, ema20, ema50, ema200]):
+            return "NEUTRAL", 0.0
+        if price > ema20 > ema50 and price > ema200:
+            return "BULLISH", float(np.clip((adx if not np.isnan(adx) else 20) / 40, 0.25, 1.0))
+        if price < ema20 < ema50 and price < ema200:
+            return "BEARISH", float(np.clip((adx if not np.isnan(adx) else 20) / 40, 0.25, 1.0))
+        if price > ema50:
+            return "BULLISH", 0.35
+        if price < ema50:
+            return "BEARISH", 0.35
+        return "NEUTRAL", 0.0
+    except Exception:
+        return "NEUTRAL", 0.0
+
+
+def mtf_confirmation(ticker: str, dominant_direction: str) -> tuple[dict, float, str, float]:
+    """Score 15m/1h/4h alignment as a fifth strategy vote."""
+    dominant_direction = str(dominant_direction or "NEUTRAL").upper()
+    context = {}
+    aligned = 0
+    checked = 0
+    for tf in MTF_CONFIRMATION_TIMEFRAMES:
+        df_tf = get_timeframe_df(ticker, tf)
+        direction, strength = trend_direction_from_df(df_tf)
+        context[tf] = {"direction": direction, "strength": round(float(strength), 3)}
+        if direction in ("BULLISH", "BEARISH"):
+            checked += 1
+            if direction == dominant_direction:
+                aligned += 1
+    score = float(aligned / checked * 100) if checked else 0.0
+    if dominant_direction in ("BULLISH", "BEARISH") and score >= 67:
+        vote_dir = dominant_direction
+    elif dominant_direction in ("BULLISH", "BEARISH") and score <= 33 and checked:
+        vote_dir = "BEARISH" if dominant_direction == "BULLISH" else "BULLISH"
+    else:
+        vote_dir = "NEUTRAL"
+    vote_strength = float(np.clip(score / 100, 0, 1)) if vote_dir == dominant_direction else 0.0
+    context["score"] = round(score, 2)
+    context["aligned"] = aligned
+    context["checked"] = checked
+    return context, score, vote_dir, vote_strength
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  INDICATORS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    c = df["Close"]
+
+    df["ema9"]   = c.ewm(span=9,   adjust=False).mean()
+    df["ema20"]  = c.ewm(span=20,  adjust=False).mean()
+    df["ema50"]  = c.ewm(span=50,  adjust=False).mean()
+    df["ema200"] = c.ewm(span=200, adjust=False).mean()
+
+    delta = c.diff()
+    gain  = delta.clip(lower=0).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    df["RSI"] = 100 - (100 / (1 + gain / (loss + 1e-9)))
+
+    # 2-period RSI for Connors mean reversion
+    g2 = delta.clip(lower=0).rolling(2).mean()
+    l2 = (-delta.clip(upper=0)).rolling(2).mean()
+    df["RSI2"] = 100 - (100 / (1 + g2 / (l2 + 1e-9)))
+
+    macd_line = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
+    df["MACD"] = macd_line
+    df["MACD_sig"] = macd_line.ewm(span=9, adjust=False).mean()
+    df["MACD_hist"] = macd_line - df["MACD_sig"]
+
+    lo14 = df["Low"].rolling(14).min()
+    hi14 = df["High"].rolling(14).max()
+    df["stoch_k"] = 100 * (c - lo14) / (hi14 - lo14 + 1e-9)
+    df["stoch_d"] = df["stoch_k"].rolling(3).mean()
+
+    sma20 = c.rolling(20).mean()
+    std20 = c.rolling(20).std()
+    df["bb_upper"] = sma20 + 2 * std20
+    df["bb_lower"] = sma20 - 2 * std20
+    df["bb_pct"] = (c - df["bb_lower"]) / (df["bb_upper"] - df["bb_lower"] + 1e-9)
+
+    hl = df["High"] - df["Low"]
+    hc = (df["High"] - c.shift()).abs()
+    lc = (df["Low"] - c.shift()).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    df["ATR"] = tr.rolling(14).mean()
+
+    # Wilder's ADX — trend-strength confirmation for the Donchian breakout
+    up_move   = df["High"].diff()
+    down_move = -df["Low"].diff()
+    plus_dm  = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    atr14 = tr.rolling(14).mean() + 1e-9
+    plus_di  = 100 * pd.Series(plus_dm, index=df.index).rolling(14).mean() / atr14
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).rolling(14).mean() / atr14
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9)
+    df["ADX"] = dx.rolling(14).mean()
+
+    df["returns"] = c.pct_change()
+    df["vol20"] = df["returns"].rolling(20).std()
+    df["momentum"] = c - c.shift(10)
+    df["roc10"] = c.pct_change(10) * 100
+
+    # Donchian channels — 20-bar Turtle entry channel
+    df["donchian_high20"] = df["High"].rolling(20).max()
+    df["donchian_low20"]  = df["Low"].rolling(20).min()
+
+    df["higher_high"] = (df["High"] > df["High"].rolling(5).max().shift(1)).astype(int)
+    df["higher_low"]  = (df["Low"]  > df["Low"].rolling(5).min().shift(1)).astype(int)
+    df["ema_bull"]    = (df["ema20"] > df["ema50"]).astype(int)
+    df["above_200"]   = (c > df["ema200"]).astype(int)
+
+    if "Volume" in df.columns and df["Volume"].sum() > 0:
+        df["vol_sma"] = df["Volume"].rolling(20).mean()
+        df["vol_ratio"] = df["Volume"] / (df["vol_sma"] + 1e-9)
+    else:
+        df["vol_ratio"] = 1.0
+
+    return df
+
+
+def classify_regime(df: pd.DataFrame) -> tuple[str, float]:
+    l = df.iloc[-1]
+    def sf(k):
+        v = l.get(k, 0)
+        return float(v) if not (isinstance(v, float) and np.isnan(v)) else 0.0
+    price, ema20, ema50, ema200 = sf("Close"), sf("ema20"), sf("ema50"), sf("ema200")
+    vol = sf("vol20")
+    vol_mean = float(df["vol20"].mean()) if "vol20" in df.columns else vol
+    trend_pct = abs(ema20 - ema50) / (price + 1e-9) * 100
+    above_50, above_200 = price > ema50, price > ema200
+    high_vol = vol > vol_mean * 1.2
+    if above_50 and above_200 and trend_pct > 1.5: return "Strong Bull", 9.0
+    if above_50 and trend_pct > 0.5: return "Weak Bull", 6.5
+    if not above_50 and not above_200 and trend_pct > 1.5: return "Strong Bear", 8.5
+    if not above_50 and trend_pct > 0.5: return "Weak Bear", 5.5
+    if high_vol: return "Volatile Range", 3.0
+    return "Quiet Range", 2.0
+
+
+def trend_label(df: pd.DataFrame | None) -> str:
+    if df is None or df.empty:
+        return "Unavailable"
+    df = add_indicators(df)
+    l = df.iloc[-1]
+    def sf(k):
+        v = l.get(k, np.nan)
+        return float(v) if pd.notna(v) else np.nan
+    ema20, ema50, price = sf("ema20"), sf("ema50"), sf("Close")
+    if any(np.isnan(x) for x in [ema20, ema50, price]):
+        return "Unavailable"
+    if price > ema20 > ema50: return "Bullish (price > EMA20 > EMA50)"
+    if price < ema20 < ema50: return "Bearish (price < EMA20 < EMA50)"
+    return "Neutral-Bullish" if price > ema50 else "Neutral-Bearish"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STRATEGY 1 — TIME-SERIES MOMENTUM (Moskowitz, Ooi & Pedersen, 2012)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def strategy_tsmom(df: pd.DataFrame, lookback: int = 40) -> tuple[str, float]:
+    """
+    Time-series momentum: the sign of an asset's own past return predicts its
+    near-term continuation (Moskowitz, Ooi & Pedersen, 2012 — tested across 58
+    futures markets, 1985-2009). We scale conviction by the volatility-adjusted
+    magnitude of the move, mirroring the paper's risk-parity sizing approach.
+    """
+    if len(df) < lookback + 5:
+        return "NEUTRAL", 0.0
+    past_ret = df["Close"].iloc[-1] / df["Close"].iloc[-lookback] - 1
+    vol = df["returns"].rolling(lookback).std().iloc[-1]
+    if pd.isna(vol) or vol == 0:
+        return "NEUTRAL", 0.0
+    risk_adj_momentum = past_ret / vol
+    direction = "BULLISH" if past_ret > 0 else "BEARISH" if past_ret < 0 else "NEUTRAL"
+    strength = safe_number(np.clip(abs(risk_adj_momentum) / 3.0, 0, 1), 0.0)
+    return direction, strength
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STRATEGY 2 — DONCHIAN / TURTLE BREAKOUT (ADX-confirmed)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def strategy_donchian_breakout(df: pd.DataFrame) -> tuple[str, float]:
+    """
+    Classic Turtle Trading entry: close breaks the 20-bar Donchian high/low.
+    One of the few public systems with a verified multi-decade track record.
+    Modern markets fade raw breakouts more than in the 1980s, so we require
+    ADX > 20 (Wilder) to confirm a real trend is underway, not noise.
+    """
+    if len(df) < 25 or "donchian_high20" not in df.columns:
+        return "NEUTRAL", 0.0
+    l = df.iloc[-1]
+    close, hi20, lo20, adx = l["Close"], l["donchian_high20"], l["donchian_low20"], l.get("ADX", 0)
+    if pd.isna(adx):
+        adx = 0
+    breakout_up   = close >= hi20
+    breakout_down = close <= lo20
+    if breakout_up:
+        direction = "BULLISH"
+    elif breakout_down:
+        direction = "BEARISH"
+    else:
+        direction = "NEUTRAL"
+    adx_strength = safe_number(np.clip((safe_number(adx) - 15) / 25, 0, 1), 0.0)  # 0 at ADX 15, 1 at ADX 40+
+    strength = adx_strength if direction != "NEUTRAL" else 0.0
+    return direction, strength
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STRATEGY 3 — RSI-2 MEAN REVERSION (Larry Connors)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def strategy_rsi2_meanreversion(df: pd.DataFrame) -> tuple[str, float]:
+    """
+    Connors' RSI(2): buy oversold panic, sell overbought euphoria — but only
+    WITH the dominant trend (price vs 200-period EMA). This trend filter is
+    the part most copycat versions omit, and it's what separates Connors'
+    published, extensively-backtested results from pure contrarian gambling.
+    """
+    if len(df) < 205 or "RSI2" not in df.columns:
+        return "NEUTRAL", 0.0
+    l = df.iloc[-1]
+    rsi2, price, ema200 = l["RSI2"], l["Close"], l["ema200"]
+    if pd.isna(rsi2) or pd.isna(ema200):
+        return "NEUTRAL", 0.0
+    above_trend = price > ema200
+    if above_trend and rsi2 < 10:
+        return "BULLISH", safe_number(np.clip((10 - rsi2) / 10, 0, 1), 0.0)
+    if (not above_trend) and rsi2 > 90:
+        return "BEARISH", safe_number(np.clip((rsi2 - 90) / 10, 0, 1), 0.0)
+    return "NEUTRAL", 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STRATEGY 4 — ML ENSEMBLE (LR + RF + GB)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+FEATURES = [
+    "ema_bull", "above_200", "RSI", "MACD", "MACD_hist", "stoch_k", "stoch_d",
+    "bb_pct", "momentum", "returns", "vol20", "roc10", "higher_high", "higher_low",
+    "vol_ratio", "ATR", "ADX",
+]
+
+def train_ensemble(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["target"] = (df["Close"].shift(-LOOKAHEAD) > df["Close"]).astype(int)
+    feats = [f for f in FEATURES if f in df.columns]
+    combined = df[feats + ["target"]].replace([np.inf, -np.inf], np.nan).dropna()
+
+    if len(combined) < 120 or not feats:
+        df["signal_prob"] = 0.5
+        return df
+
+    X, y = combined[feats], combined["target"]
+    models = {
+        "lr": Pipeline([("imp", SimpleImputer()), ("sc", StandardScaler()),
+                        ("m", LogisticRegression(C=0.5, max_iter=1000, random_state=42))]),
+        "rf": Pipeline([("imp", SimpleImputer()),
+                        ("m", RandomForestClassifier(n_estimators=150, max_depth=5,
+                                                     min_samples_leaf=10, random_state=42))]),
+        "gb": Pipeline([("imp", SimpleImputer()),
+                        ("m", GradientBoostingClassifier(n_estimators=120, learning_rate=0.05,
+                                                          max_depth=4, min_samples_leaf=10, random_state=42))]),
+    }
+    weights = {"lr": 0.20, "rf": 0.35, "gb": 0.45}
+    proba = {}
+    for name, model in models.items():
+        try:
+            model.fit(X, y)
+            proba[name] = pd.Series(model.predict_proba(X)[:, 1], index=combined.index)
+        except Exception:
+            proba[name] = pd.Series(0.5, index=combined.index)
+    ens = sum(weights[n] * proba[n] for n in proba)
+    df["signal_prob"] = pd.Series(0.5, index=df.index)
+    df.loc[combined.index, "signal_prob"] = ens
+    df["signal_prob"] = df["signal_prob"].fillna(0.5)
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STRATEGY CONFLUENCE — combines all four votes into a grade
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def strategy_confluence(df: pd.DataFrame, mtf_vote: tuple[str, float] | None = None) -> dict:
+    """Run four core strategies plus optional multi-timeframe confirmation."""
+    ml_prob = float(df["signal_prob"].iloc[-1]) if "signal_prob" in df.columns else 0.5
+    ml_dir = "BULLISH" if ml_prob > 0.55 else "BEARISH" if ml_prob < 0.45 else "NEUTRAL"
+    ml_strength = safe_number(np.clip(abs(ml_prob - 0.5) * 2, 0, 1), 0.0)
+
+    tsmom_dir, tsmom_str = strategy_tsmom(df)
+    donch_dir, donch_str = strategy_donchian_breakout(df)
+    rsi2_dir,  rsi2_str  = strategy_rsi2_meanreversion(df)
+
+    votes = {
+        "TSMOM"      : {"direction": tsmom_dir, "strength": round(tsmom_str, 3)},
+        "Donchian"   : {"direction": donch_dir, "strength": round(donch_str, 3)},
+        "RSI2"       : {"direction": rsi2_dir,  "strength": round(rsi2_str, 3)},
+        "MLEnsemble" : {"direction": ml_dir,    "strength": round(ml_strength, 3)},
+    }
+    if mtf_vote is not None:
+        mtf_dir, mtf_strength = mtf_vote
+        votes["MTFConfirmation"] = {"direction": mtf_dir, "strength": round(float(mtf_strength), 3)}
+
+    bull_votes = [v for v in votes.values() if v["direction"] == "BULLISH"]
+    bear_votes = [v for v in votes.values() if v["direction"] == "BEARISH"]
+    n_bull, n_bear = len(bull_votes), len(bear_votes)
+    if n_bull > n_bear:
+        dominant = "BULLISH"
+        agree_count = n_bull
+        avg_strength = safe_number(np.mean([safe_number(v.get("strength")) for v in bull_votes]), 0.0) if bull_votes else 0.0
+    elif n_bear > n_bull:
+        dominant = "BEARISH"
+        agree_count = n_bear
+        avg_strength = safe_number(np.mean([safe_number(v.get("strength")) for v in bear_votes]), 0.0) if bear_votes else 0.0
+    else:
+        dominant = "SPLIT"
+        agree_count = max(n_bull, n_bear)
+        avg_strength = 0.0
+
+    return {
+        "votes": votes,
+        "dominant": dominant,
+        "agree_count": agree_count,
+        "total_systems": len(votes),
+        "avg_strength": round(avg_strength, 3),
+        "ml_prob": ml_prob,
+    }
+
+
+def grade_signal(confluence: dict, rr: float) -> tuple[str, str]:
+    """Grade by confluence across all active systems, including MTF when present."""
+    dominant = confluence["dominant"]
+    agree = int(confluence["agree_count"])
+    total = int(confluence.get("total_systems", 5) or 5)
+    strength = float(confluence["avg_strength"])
+    if dominant == "SPLIT":
+        return "NO TRADE", "Systems split — no directional confluence."
+    if rr < 1.2:
+        return "NO TRADE", f"RR too thin ({rr:.2f}R) regardless of confluence."
+    if agree >= max(4, total - 1) and rr >= 2.5 and strength >= 0.50:
+        return "A+", f"{agree}/{total} systems agree {dominant.lower()}, strong conviction ({strength:.2f}), RR {rr:.1f}R."
+    if agree >= 3 and rr >= 2.0 and strength >= 0.35:
+        return "A", f"{agree}/{total} systems agree {dominant.lower()}, RR {rr:.1f}R."
+    if agree >= 2 and rr >= 1.5:
+        return "B", f"{agree}/{total} systems agree {dominant.lower()}, moderate RR {rr:.1f}R."
+    if agree >= 1 and rr >= 1.2:
+        return "C", f"Only {agree}/{total} systems agree {dominant.lower()} — weak edge."
+    return "NO TRADE", "Confluence and risk/reward both too weak."
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TRADE PLAN & EDGE SCORE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_trade_plan(price: float, atr: float, signal: str) -> dict:
+    atr = safe_number(atr)
+    price = safe_number(price)
+    if atr <= 0 or signal == "HOLD":
+        return {"sl": price, "tp": price, "size": 0, "rr": 0}
+    sl = price - atr * ATR_SL_MULT if signal == "BUY" else price + atr * ATR_SL_MULT
+    tp = price + atr * ATR_TP_MULT if signal == "BUY" else price - atr * ATR_TP_MULT
+    dist = abs(price - sl)
+    size = (ACCOUNT_SIZE * RISK_PER_TRADE) / dist if dist > 0 else 0
+    rr = abs(tp - price) / dist if dist > 0 else 0
+    return {"sl": sl, "tp": tp, "size": size, "rr": rr}
+
+
+def compute_edge_score(signal: str, confidence: float, ml_prob: float, rr: float) -> float:
+    if signal == "BUY":
+        dir_conf, dir_ml = confidence, ml_prob * 100
+    elif signal == "SELL":
+        dir_conf, dir_ml = 100 - confidence, (1 - ml_prob) * 100
+    else:
+        dir_conf = max(0, 50 - abs(confidence - 50))
+        dir_ml = max(0, 50 - abs(ml_prob - 0.5) * 100)
+    return float(round(dir_conf * 0.40 + dir_ml * 0.35 + rr * 10 * 0.25, 2))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SCAN ONE ASSET
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def scan_asset(asset: str, ticker: str, timeframe: str = "15m") -> ScanResult | None:
+    try:
+        timeframe = str(timeframe or "15m").lower()
+        if timeframe not in TIMEFRAME_CONFIGS:
+            timeframe = "15m"
+
+        df_regime = get_timeframe_df(ticker, "1h")
+        if df_regime is None:
+            print(f"  [{asset} {timeframe}] No 1H regime data.")
+            return None
+        df_regime = add_indicators(df_regime)
+        regime, _ = classify_regime(df_regime)
+        t1h = trend_label(df_regime)
+
+        df_15m_for_label = get_timeframe_df(ticker, "15m")
+        t15m = trend_label(df_15m_for_label) if df_15m_for_label is not None else "Unavailable"
+
+        df_entry = get_timeframe_df(ticker, timeframe)
+        if df_entry is None:
+            print(f"  [{asset} {timeframe}] No entry data.")
+            return None
+        df_entry = add_indicators(df_entry)
+        df_entry = train_ensemble(df_entry)
+
+        prelim = strategy_confluence(df_entry)
+        mtf_context, mtf_score, mtf_dir, mtf_strength = mtf_confirmation(ticker, prelim["dominant"])
+        confluence = strategy_confluence(df_entry, mtf_vote=(mtf_dir, mtf_strength))
+
+        dominant = confluence["dominant"]
+        signal = "BUY" if dominant == "BULLISH" else "SELL" if dominant == "BEARISH" else "HOLD"
+        price = safe_number(df_entry["Close"].iloc[-1])
+        atr = safe_number(df_entry["ATR"].iloc[-1], 0.0) if "ATR" in df_entry.columns else 0.0
+        rsi = safe_number(df_entry["RSI"].iloc[-1], 50.0) if "RSI" in df_entry.columns else 50.0
+        plan = build_trade_plan(price, atr, signal)
+        confidence = safe_number(np.clip(50 + safe_number(confluence.get("avg_strength")) * 50 * (1 if dominant == "BULLISH" else -1 if dominant == "BEARISH" else 0), 0, 100), 50.0)
+        grade, grade_reason = grade_signal(confluence, plan["rr"])
+        edge_score = compute_edge_score(signal, confidence, confluence["ml_prob"], plan["rr"])
+        candle_close = str(df_entry["Date"].iloc[-1])
+
+        vote_summary = ", ".join(f"{name}:{v['direction'][:4]}({v['strength']:.2f})" for name, v in confluence["votes"].items())
+        mtf_summary = "/".join(f"{tf}:{payload.get('direction','NEUT')[:4]}" for tf, payload in mtf_context.items() if isinstance(payload, dict))
+        reason = f"{grade_reason} | {vote_summary} | MTF score {mtf_score:.0f}% ({mtf_summary}) | Regime: {regime} | RSI {rsi:.1f}"
+
+        result = ScanResult(
+            asset=asset, ticker=ticker, timeframe=timeframe, signal=signal, grade=grade,
+            confidence=confidence, edge_score=edge_score, ml_prob=confluence["ml_prob"],
+            entry=price, sl=plan["sl"], tp=plan["tp"], rr=plan["rr"], regime=regime,
+            rsi=safe_number(rsi, 50.0), atr=safe_number(atr),
+            trend_1h=t1h, trend_15m=t15m, reason=reason, candle_close=candle_close,
+            mtf_score=mtf_score, mtf_context=mtf_context, strategy_votes=confluence["votes"],
+        )
+        tag = "✅" if grade != "NO TRADE" else "👻"
+        print(f"  [{asset} {timeframe}] {tag} {signal} | Grade {grade} | Conf {confidence:.1f}% | Edge {edge_score:.1f} | RR {plan['rr']:.2f} | MTF {mtf_score:.0f}% | {confluence['agree_count']}/{confluence['total_systems']} agree")
+        return result
+    except Exception as e:
+        print(f"  [{asset} {timeframe}] ERROR: {e}")
+        traceback.print_exc()
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TELEGRAM
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_telegram_message(sig: ScanResult) -> str:
+    def clean(v): return html.escape(str(v if v is not None else ""))
+    def fmt(x):
+        try:
+            x = float(x)
+            if abs(x) >= 1000: return f"{x:,.2f}"
+            if abs(x) >= 10:   return f"{x:,.4f}"
+            return f"{x:,.6f}"
+        except Exception:
+            return str(x)
+
+    emoji = "🟢" if sig.signal == "BUY" else "🔴" if sig.signal == "SELL" else "⚪"
+    grade_emoji = {"A+": "🏆", "A": "⭐", "B": "🔹", "C": "▫️"}.get(sig.grade, "")
+    short_id = sig.signal_id[:8].upper()
+
+    try:
+        signal_time = pd.to_datetime(sig.created_at).tz_convert("UTC").strftime("%d %b %Y • %H:%M UTC")
+    except Exception:
+        signal_time = clean(sig.created_at)
+
+    votes_lines = "\n".join(
+        f"  {name}: {v['direction']} ({v['strength']:.2f})" for name, v in sig.strategy_votes.items()
+    )
+
+    return f"""
+{emoji} <b>BENZINO {clean(sig.signal)} SIGNAL</b> {grade_emoji} Grade {clean(sig.grade)}
+
+<b>Asset:</b> {clean(sig.asset)}
+<b>Timeframe:</b> {clean(sig.timeframe)} signal / MTF confirmation
+<b>Confidence:</b> {sig.confidence:.1f}%
+<b>Edge Score:</b> {sig.edge_score:.1f}
+<b>ML Prob:</b> {sig.ml_prob:.3f}
+
+<b>Trade Plan</b>
+Entry: <code>{fmt(sig.entry)}</code>
+SL: <code>{fmt(sig.sl)}</code>
+TP: <code>{fmt(sig.tp)}</code>
+RR: <code>{sig.rr:.2f}R</code>
+
+<b>Strategy Confluence</b>
+{votes_lines}
+
+<b>Market Context</b>
+1H Trend: {clean(sig.trend_1h)}
+15M Trend: {clean(sig.trend_15m)}
+Regime: {clean(sig.regime)}
+RSI: {sig.rsi:.1f}
+
+<b>Reason</b>
+{clean(sig.reason)}
+
+➖➖➖➖➖➖➖➖➖➖
+🆔 <code>{short_id}</code> | 🕒 {signal_time}
+""".strip()
+
+
+def send_telegram(message: str) -> tuple[bool, str]:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    ids   = os.environ.get("TELEGRAM_CHAT_IDS", "").strip()
+    if not token or not ids:
+        return False, "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_IDS not set."
+    chat_ids = [c.strip() for c in ids.split(",") if c.strip()]
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    sent, errors = 0, []
+    for chat_id in chat_ids:
+        try:
+            resp = requests.post(url, json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}, timeout=10)
+            if resp.status_code == 200: sent += 1
+            else: errors.append(f"{chat_id}: HTTP {resp.status_code}")
+        except Exception as e:
+            errors.append(f"{chat_id}: {e}")
+    return (True, f"Sent to {sent} recipient(s).") if sent else (False, "; ".join(errors))
+
+
+def telegram_configured() -> bool:
+    """Return True only when Telegram credentials exist.
+
+    Telegram is optional. Missing credentials must never affect whether a
+    qualified A+/A/B/C BUY/SELL setup is opened, journaled, evaluated, or
+    shown in the dashboard.
+    """
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    ids = os.environ.get("TELEGRAM_CHAT_IDS", "").strip()
+    return bool(token and ids)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  EVALUATE OPEN TRADES — TP / SL / EXPIRY + prop-firm ledger update
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def evaluate_open_trades(assets: set[str] | None = None, timeframes: set[str] | None = None) -> None:
+    open_trades = fetch_open_trades(assets=assets, timeframes=timeframes)
+    if not open_trades:
+        print("[Evaluate] No open trades.")
+        return
+
+    print(f"[Evaluate] Checking {len(open_trades)} open trade(s)...")
+    for t in open_trades:
+        asset, ticker, timeframe = t["asset"], t["ticker"], t["timeframe"]
+        signal, entry, sl, tp = t["signal"], float(t["entry"]), float(t["sl"]), float(t["tp"])
+        signal_id = t["signal_id"]
+        grade = t["grade"]
+
+        df = get_timeframe_df(ticker, timeframe)
+        if df is None:
+            continue
+
+        created = pd.to_datetime(t["created_at"], utc=True)
+        df["Date"] = pd.to_datetime(df["Date"], utc=True)
+        new_bars = df[df["Date"] > created]
+        if new_bars.empty:
+            continue
+
+        bars_open = int(t.get("bars_open") or 0)
+        closed = False
+
+        for _, bar in new_bars.iterrows():
+            bars_open += 1
+            high, low = float(bar["High"]), float(bar["Low"])
+
+            if signal == "BUY":
+                hit_sl, hit_tp = low <= sl, high >= tp
+            else:
+                hit_sl, hit_tp = high >= sl, low <= tp
+
+            if hit_sl and hit_tp:
+                # Conservative: ambiguous same-candle hit treated as SL
+                r_mult = -1.0
+                close_trade(signal_id, sl, "SL", r_mult)
+                update_prop_firm(signal_id, asset, grade, r_mult)
+                print(f"  [{asset}] AMBIGUOUS same-candle TP+SL → conservatively marked SL.")
+                closed = True
+                break
+            if hit_sl:
+                r_mult = -1.0
+                close_trade(signal_id, sl, "SL", r_mult)
+                update_prop_firm(signal_id, asset, grade, r_mult)
+                print(f"  [{asset}] Closed: SL hit ({r_mult:+.2f}R)")
+                closed = True
+                break
+            if hit_tp:
+                r_mult = abs(tp - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
+                close_trade(signal_id, tp, "TP", r_mult)
+                update_prop_firm(signal_id, asset, grade, r_mult)
+                print(f"  [{asset}] Closed: TP hit ({r_mult:+.2f}R)")
+                closed = True
+                break
+
+        if closed:
+            continue
+
+        expiry_bars = int(TIMEFRAME_CONFIGS.get(str(timeframe).lower(), {}).get("expiry_bars", EXPIRY_BARS))
+        if bars_open >= expiry_bars:
+            last_price = float(df["Close"].iloc[-1])
+            risk_dist = abs(entry - sl)
+            r_mult = ((last_price - entry) / risk_dist if signal == "BUY"
+                      else (entry - last_price) / risk_dist) if risk_dist > 0 else 0
+            close_trade(signal_id, last_price, "EXPIRY", r_mult)
+            update_prop_firm(signal_id, asset, grade, r_mult)
+            print(f"  [{asset}] Closed: EXPIRED after {bars_open} bars ({r_mult:+.2f}R)")
+        else:
+            bump_bars_open(signal_id, bars_open)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN SCAN LOOP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_scan() -> None:
+    run_id = uuid.uuid4().hex
+    started = datetime.now(timezone.utc)
+    scan_assets, active_tfs, scan_mode = build_scan_plan(started)
+    print(f"\n{'='*70}")
+    print(f"  BENZINO INSTITUTIONAL SCANNER — {started.strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"  Mode: {scan_mode} | Assets: {len(scan_assets)} | Active TFs: {', '.join(active_tfs)} | Configured TFs: {', '.join(SCAN_TIMEFRAMES)}")
+    print(f"  Account: ${ACCOUNT_SIZE:,.0f} | Risk: {RISK_PER_TRADE*100:.2f}% | Leverage: 1:{LEVERAGE:g}")
+    if set(active_tfs) != set(SCAN_TIMEFRAMES):
+        skipped = [tf for tf in SCAN_TIMEFRAMES if tf not in active_tfs]
+        print(f"  Runtime optimiser: skipped TFs this run: {', '.join(skipped) if skipped else 'None'}")
+    if scan_mode == "NO_USERS_HEARTBEAT":
+        print("  No active user watchlists found yet — running tiny heartbeat scan only.")
+    print(f"{'='*70}\n")
+
+    _TF_CACHE.clear()
+    init_tables()
+    force_open_graded_setups()
+
+    # 1. Resolve outcomes for everything already open BEFORE scanning for new setups.
+    evaluate_open_trades(assets=set(scan_assets.keys()), timeframes=set(active_tfs))
+
+    journaled, alerted, shadowed = 0, 0, 0
+    assets_scanned = 0
+    asset_seconds: list[float] = []
+
+    for asset, ticker in scan_assets.items():
+        asset_start = time.perf_counter()
+        asset_attempted = False
+        print(f"Scanning {asset} ({ticker}) across {len(active_tfs)} active timeframe(s)...")
+        for tf in active_tfs:
+            asset_attempted = True
+            result = scan_asset(asset, ticker, timeframe=tf)
+            if result is None:
+                continue
+            if duplicate_setup_exists(asset, result.timeframe, result.signal, result.candle_close):
+                # Existing rows may have been created by an older build. Fix their
+                # status before skipping so graded BUY/SELL rows cannot remain SHADOW.
+                force_open_graded_setups()
+                print(f"  [{asset} {tf}] Setup already stored for this candle — skipping duplicate.")
+                continue
+
+            grade_norm = str(result.grade or "").strip().upper()
+            signal_norm = str(result.signal or "").strip().upper()
+
+            if grade_norm == "NO TRADE" or signal_norm == "HOLD":
+                save_signal(result)
+                shadowed += 1
+                print(f"  [{asset} {tf}] Stored as SHADOW research row. Telegram not used for NO TRADE.")
+                continue
+
+            # Critical rule: journaling/opening is independent of Telegram.
+            # A+/A/B/C BUY/SELL setups are saved as OPEN inside save_signal().
+            saved = save_signal(result)
+            journaled += 1
+            if saved:
+                print(f"  [{asset} {tf}] Stored as OPEN journal trade. Telegram is optional only.")
+
+            if not telegram_configured():
+                print(f"  [{asset} {tf}] Telegram not configured — optional alert skipped.")
+                continue
+
+            can_alert = True
+            block_reason = ""
+            if duplicate_alert_exists(asset, result.timeframe, result.signal, result.candle_close):
+                can_alert, block_reason = False, "duplicate candle/signal already alerted"
+
+            # Telegram duplicate/open-slot checks only control notifications.
+            # They must never close, shadow, or prevent an already-open journal row.
+            if can_alert:
+                open_slot = open_trade_for_slot(asset, result.timeframe)
+                if open_slot is not None and open_slot.get("signal_id") != result.signal_id:
+                    can_alert = False
+                    block_reason = f"slot still open (signal {open_slot['signal_id'][:8]})"
+
+            if can_alert:
+                message = build_telegram_message(result)
+                ok, info = send_telegram(message)
+                if ok:
+                    result.alert_sent = True
+                    alerted += 1
+                    mark_alert_sent(result.signal_id)
+                    print(f"  [{asset} {tf}] 📲 {info}")
+                else:
+                    print(f"  [{asset} {tf}] Telegram optional alert failed: {info}")
+            else:
+                print(f"  [{asset} {tf}] Telegram alert suppressed — {block_reason}")
+
+        if asset_attempted:
+            assets_scanned += 1
+            asset_seconds.append(time.perf_counter() - asset_start)
+
+    force_open_graded_setups()
+    state = load_prop_firm_state()
+    finished = datetime.now(timezone.utc)
+    elapsed = (finished - started).total_seconds()
+    print(f"\n{'='*70}")
+    print(f"  Scan complete in {elapsed:.1f}s")
+    open_count = len(fetch_open_trades(assets=set(scan_assets.keys()), timeframes=set(active_tfs)))
+    print(f"  Journaled (A+/A/B/C): {journaled} | Open trades: {open_count} | Alerted: {alerted} | Shadowed (NO TRADE): {shadowed}")
+    print(f"  Runtime: fastest asset {min(asset_seconds) if asset_seconds else 0:.1f}s | slowest {max(asset_seconds) if asset_seconds else 0:.1f}s | avg {float(np.mean(asset_seconds)) if asset_seconds else 0:.1f}s")
+    print(f"  Prop firm: equity ${float(state['current_equity']):,.2f} "
+          f"({(float(state['current_equity'])/float(state['starting_balance'])-1)*100:+.2f}%) "
+          f"| status {state['status']} | trading days {state['trading_days']}")
+    print(f"{'='*70}\n")
+
+    log_runtime(
+        run_id=run_id,
+        started_at=started,
+        finished_at=finished,
+        total_seconds=elapsed,
+        assets_scanned=assets_scanned,
+        signals_saved=journaled,
+        shadow_saved=shadowed,
+        open_trades=open_count,
+        alerted=alerted,
+        timeframes_scanned=active_tfs,
+        asset_seconds=asset_seconds,
+    )
+
+
+if __name__ == "__main__":
+    run_scan()
