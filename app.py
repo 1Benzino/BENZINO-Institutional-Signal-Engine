@@ -26,7 +26,11 @@ import html
 import uuid
 import hashlib
 import secrets
+import smtplib
+import ssl
+from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import numpy as np
@@ -46,7 +50,7 @@ except Exception:  # pragma: no cover
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "v4.5-reset-cron-ready"
+APP_VERSION = "v4.6-polished-ui-ai"
 DEFAULT_TIMEZONE = "Africa/Nairobi"
 ADMIN_USERNAMES = set()  # Admin is now assigned by database role: first created profile only.
 VALID_GRADES = {"A+", "A", "B", "C"}
@@ -429,48 +433,75 @@ def validate_login(username: str, password: str) -> bool:
     return hash_password(password, str(df.iloc[0]["salt"])) == str(df.iloc[0]["password_hash"])
 
 
-def reset_password_with_saved_email(username_or_email: str, saved_email: str, new_password: str, confirm_password: str) -> tuple[bool, str]:
-    """Reset the local Benzino password without SMTP.
+def smtp_configured() -> bool:
+    return bool(get_secret_value("SMTP_HOST") and get_secret_value("SMTP_USERNAME") and get_secret_value("SMTP_PASSWORD"))
 
-    This app currently uses its own users table for login, not Supabase Auth.
-    To avoid SMTP dependency, the reset flow verifies the username/email record
-    and lets the user set a new password directly.
+
+def send_reset_email(to_email: str, username: str, temporary_password: str) -> tuple[bool, str]:
+    """Send a temporary password using SMTP secrets.
+
+    Required Streamlit/GitHub secrets:
+      SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, SMTP_FROM_EMAIL
+    Optional:
+      SMTP_USE_SSL=true/false
     """
-    lookup = str(username_or_email or "").strip().lower()
-    saved_email = normalize_email(saved_email)
+    to_email = normalize_email(to_email)
+    if not to_email:
+        return False, "No email address is saved for this user."
 
+    host = get_secret_value("SMTP_HOST")
+    port = int(get_secret_value("SMTP_PORT", "587") or 587)
+    user = get_secret_value("SMTP_USERNAME")
+    password = get_secret_value("SMTP_PASSWORD")
+    from_email = get_secret_value("SMTP_FROM_EMAIL", user)
+    use_ssl = get_secret_value("SMTP_USE_SSL", "false").lower() in {"1", "true", "yes", "y"}
+    if not host or not user or not password:
+        return False, "SMTP is not configured yet. Add SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD and SMTP_FROM_EMAIL to secrets."
+
+    msg = EmailMessage()
+    msg["Subject"] = "Benzino password reset"
+    msg["From"] = from_email
+    msg["To"] = to_email
+    msg.set_content(
+        f"Hello {username},\n\n"
+        f"Your Benzino temporary password is: {temporary_password}\n\n"
+        "Log in with this password, then change it from Settings.\n\n"
+        "If you did not request this reset, contact the admin immediately.\n"
+    )
+    try:
+        if use_ssl:
+            with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=20) as server:
+                server.login(user, password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=20) as server:
+                server.starttls(context=ssl.create_default_context())
+                server.login(user, password)
+                server.send_message(msg)
+        return True, "Reset password sent to the saved email address."
+    except Exception as exc:
+        return False, f"Email send failed: {exc}"
+
+
+def reset_password_by_email(username_or_email: str) -> tuple[bool, str]:
+    lookup = str(username_or_email or "").strip().lower()
     if not lookup:
         return False, "Enter your username or saved email address."
-    if not saved_email:
-        return False, "Enter the email saved on your profile."
-    if len(new_password or "") < 4:
-        return False, "Use at least 4 characters for the new password."
-    if new_password != confirm_password:
-        return False, "The two new passwords do not match."
-
-    df = read_df(
-        """
-        SELECT username, email
-        FROM users
-        WHERE username = %s OR email = %s
-        LIMIT 1
-        """,
-        (normalize_username(lookup), normalize_email(lookup)),
-    )
+    df = read_df("SELECT username, email FROM users WHERE username = %s OR email = %s", (normalize_username(lookup), normalize_email(lookup)))
     if df.empty:
         return False, "No matching user was found."
-
     username = str(df.iloc[0]["username"])
-    stored_email = normalize_email(df.iloc[0].get("email", ""))
-    if not stored_email:
+    email = normalize_email(df.iloc[0].get("email", ""))
+    if not email:
         return False, "This profile has no saved email address. Ask the admin to update it."
-    if stored_email != saved_email:
-        return False, "The email does not match the email saved on this profile."
-
+    temporary_password = secrets.token_urlsafe(8)
     salt = generate_salt()
-    pw_hash = hash_password(new_password, salt)
+    pw_hash = hash_password(temporary_password, salt)
     execute("UPDATE users SET password_hash = %s, salt = %s WHERE username = %s", (pw_hash, salt, username))
-    return True, "Password reset. You can now log in with the new password."
+    ok, msg = send_reset_email(email, username, temporary_password)
+    if not ok:
+        return False, msg
+    return True, msg
 
 
 def change_user_password(username: str, current_password: str, new_password: str) -> tuple[bool, str]:
@@ -562,30 +593,29 @@ def render_auth_gate() -> None:
             password = st.text_input("PIN / password", type="password", key="login_pass")
             if st.button("Login", type="primary", width="stretch"):
                 if validate_login(username, password):
-                    st.session_state.auth_user = normalize_username(username)
+                    with st.spinner("Loading your Benzino dashboard…"):
+                        st.session_state.auth_user = normalize_username(username)
                     st.rerun()
                 else:
                     st.error("Invalid username or password.")
         with tab_create:
             new_user = st.text_input("Choose username", key="create_user")
-            new_email = st.text_input("Email for password recovery", key="create_email")
+            new_email = st.text_input("Email for password reset", key="create_email")
             new_pass = st.text_input("Choose PIN / password", type="password", key="create_pass")
             if st.button("Create account", type="primary", width="stretch"):
                 ok, msg = create_user(new_user, new_pass, new_email)
                 if ok:
-                    st.session_state.auth_user = normalize_username(new_user)
+                    with st.spinner("Creating profile and loading dashboard…"):
+                        st.session_state.auth_user = normalize_username(new_user)
                     st.success(msg)
                     st.rerun()
                 else:
                     st.error(msg)
         with tab_reset:
             lookup = st.text_input("Username or saved email", key="reset_lookup")
-            saved_email = st.text_input("Saved profile email", key="reset_saved_email")
-            new_password = st.text_input("New password", type="password", key="reset_new_password")
-            confirm_password = st.text_input("Confirm new password", type="password", key="reset_confirm_password")
-            st.caption("No SMTP setup is required. This resets the Benzino app password after matching your saved profile email.")
-            if st.button("Reset password", type="primary", width="stretch"):
-                ok, msg = reset_password_with_saved_email(lookup, saved_email, new_password, confirm_password)
+            st.caption("A temporary password will be sent to the email saved on the profile.")
+            if st.button("Send reset password", type="primary", width="stretch"):
+                ok, msg = reset_password_by_email(lookup)
                 if ok:
                     st.success(msg)
                 else:
@@ -637,7 +667,7 @@ def numeric_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 
 def session_name(ts) -> str:
     try:
-        hour = pd.to_datetime(ts, utc=True).hour
+        hour = pd.to_datetime(ts, utc=True).tz_convert(NAIROBI_TZ).hour
     except Exception:
         return "Unknown"
     if 0 <= hour < 7:
@@ -670,6 +700,7 @@ def load_signals_for_user(username: str, settings: dict, include_all_admin: bool
             df = df[df["asset"].astype(str).isin(watchlist_assets)]
     df = numeric_cols(df, ["confidence", "edge_score", "ml_prob", "entry", "sl", "tp", "rr", "rsi", "atr", "exit_price", "r_multiple", "bars_open", "mtf_score"])
     df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce", utc=True)
+    df["created_at_eat"] = df["created_at"].apply(fmt_nairobi)
     df["session"] = df["created_at"].apply(session_name)
     return df
 
@@ -875,6 +906,146 @@ def render_balance_curve(df: pd.DataFrame, settings: dict, title: str = "Balance
     st.plotly_chart(fig, width="stretch")
 
 
+
+NAIROBI_TZ = ZoneInfo("Africa/Nairobi")
+
+
+def to_nairobi(value):
+    try:
+        ts = pd.to_datetime(value, utc=True, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts.tz_convert(NAIROBI_TZ)
+    except Exception:
+        return None
+
+
+def fmt_nairobi(value, include_tz: bool = True) -> str:
+    ts = to_nairobi(value)
+    if ts is None:
+        return ""
+    suffix = " EAT" if include_tz else ""
+    return ts.strftime(f"%Y-%m-%d %H:%M{suffix}")
+
+
+def time_ago(value) -> str:
+    ts = to_nairobi(value)
+    if ts is None:
+        return "Unknown age"
+    now = pd.Timestamp.now(tz=NAIROBI_TZ)
+    mins = max(0, int((now - ts).total_seconds() // 60))
+    if mins < 1:
+        return "Generated just now"
+    if mins < 60:
+        return f"Generated {mins} min ago"
+    hours = mins // 60
+    if hours < 24:
+        return f"Generated {hours} hr ago"
+    days = hours // 24
+    return f"Generated {days} day(s) ago"
+
+
+def decayed_confidence_value(confidence, created_at, timeframe: str = "1h") -> float:
+    base = float(pd.to_numeric(confidence, errors="coerce") if confidence is not None else 50)
+    ts = to_nairobi(created_at)
+    if ts is None:
+        return base
+    age_hours = max(0.0, (pd.Timestamp.now(tz=NAIROBI_TZ) - ts).total_seconds() / 3600)
+    half_life = {"15m": 3, "1h": 8, "4h": 24, "1d": 96}.get(str(timeframe).lower(), 8)
+    decay = 0.5 ** (age_hours / half_life)
+    return float(50 + (base - 50) * decay)
+
+
+def parse_jsonish(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            out = json.loads(value)
+            return out if isinstance(out, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def format_votes(votes: dict) -> str:
+    if not votes:
+        return "No strategy-vote payload was stored for this row."
+    parts = []
+    for name, payload in votes.items():
+        if not isinstance(payload, dict):
+            continue
+        direction = payload.get("direction", "NEUTRAL")
+        strength = payload.get("strength", 0)
+        try: strength = float(strength)
+        except Exception: strength = 0
+        tone = "strong" if strength >= .65 else "moderate" if strength >= .35 else "weak"
+        parts.append(f"**{name}** voted **{direction}** with {tone} strength ({strength:.2f}).")
+    return " ".join(parts) if parts else "No valid strategy votes were stored."
+
+
+def rich_signal_explanation(row: pd.Series) -> str:
+    asset = str(row.get("asset", ""))
+    tf = str(row.get("timeframe", ""))
+    signal = str(row.get("signal", ""))
+    grade = str(row.get("grade", ""))
+    status = str(row.get("status", ""))
+    reason = str(row.get("reason", ""))
+    rr = float(pd.to_numeric(row.get("rr"), errors="coerce") or 0)
+    edge = float(pd.to_numeric(row.get("edge_score"), errors="coerce") or 0)
+    conf = float(pd.to_numeric(row.get("confidence"), errors="coerce") or 50)
+    dconf = decayed_confidence_value(conf, row.get("created_at"), tf)
+    mtf_score = float(pd.to_numeric(row.get("mtf_score"), errors="coerce") or 0)
+    votes = parse_jsonish(row.get("strategy_votes"))
+    mtf = parse_jsonish(row.get("mtf_context"))
+    mtf_line = ""
+    if mtf:
+        bits = []
+        for k, v in mtf.items():
+            if isinstance(v, dict):
+                bits.append(f"{k}: {v.get('direction','NEUTRAL')} ({float(v.get('strength') or 0):.2f})")
+        mtf_line = " ".join(bits)
+    decision = "blocked as a research-only NO TRADE" if grade == "NO TRADE" or signal == "HOLD" else f"accepted as an active {signal} setup"
+    return (
+        f"**{asset} · {tf} · {time_ago(row.get('created_at'))}**  \n\n"
+        f"The engine {decision}. The final grade is **{grade}** and current status is **{status}**. "
+        f"Raw confidence was **{conf:.1f}%**, but after age decay it currently reads about **{dconf:.1f}%**. "
+        f"That decay matters because older signals should lose urgency even if the original setup was clean. "
+        f"The setup carries an edge score of **{edge:.1f}**, RR of **{rr:.2f}R**, and MTF alignment of **{mtf_score:.0f}%**.\n\n"
+        f"**Strategy reasoning:** {format_votes(votes)}\n\n"
+        f"**Multi-timeframe context:** {mtf_line or 'No detailed MTF context was stored.'}\n\n"
+        f"**Final interpretation:** {reason}"
+    )
+
+
+def rich_closed_trade_explanation(row: pd.Series) -> str:
+    asset = str(row.get("asset", ""))
+    tf = str(row.get("timeframe", ""))
+    signal = str(row.get("signal", ""))
+    grade = str(row.get("grade", ""))
+    outcome = outcome_label(row)
+    r_mult = float(pd.to_numeric(row.get("r_multiple"), errors="coerce") or 0)
+    exit_reason = str(row.get("exit_reason", ""))
+    reason = str(row.get("reason", ""))
+    if outcome == "WIN":
+        lesson = "The market rewarded the confluence. Coach should look for whether the winning pattern came from timeframe alignment, grade quality, session timing, or asset behaviour, then prioritise repeating that condition."
+    elif outcome == "LOSS":
+        lesson = "The setup failed after entry. This should be reviewed for timing risk, volatility expansion, weak MTF confirmation, or a strategy vote that was not strong enough. Losses are not ignored; they become filters for the next version of the playbook."
+    else:
+        lesson = "The trade closed without a clean TP/SL lesson. Treat it as a timing and expiry-management review rather than a pure win/loss signal."
+    return (
+        f"**{asset} · {tf} · {signal} · Grade {grade}**  \n\n"
+        f"This trade closed as **{outcome}** via **{exit_reason or 'recorded close'}** with **{r_mult:+.2f}R**. "
+        f"The original reason was: {reason}\n\n"
+        f"**What Explain AI learns:** {lesson}"
+    )
+
+
+def render_ai_card(title: str, body: str) -> None:
+    st.markdown(f"<div class='ai-card'><h3 style='margin-top:0'>{html.escape(title)}</h3>", unsafe_allow_html=True)
+    st.markdown(body)
+    st.markdown("</div>", unsafe_allow_html=True)
+
 def load_runtime_health() -> tuple[pd.DataFrame, dict]:
     """Load scanner runtime stats for the System Health panel."""
     df = read_df(
@@ -907,7 +1078,7 @@ def load_runtime_health() -> tuple[pd.DataFrame, dict]:
     summary["fastest_seconds"] = float(df["total_seconds"].min())
     summary["slowest_seconds"] = float(df["total_seconds"].max())
     summary["avg_seconds"] = float(df["total_seconds"].mean())
-    summary["last_started_at"] = str(df.iloc[0].get("started_at", ""))[:19]
+    summary["last_started_at"] = fmt_nairobi(df.iloc[0].get("started_at", ""))
     summary["last_timeframes"] = str(df.iloc[0].get("timeframes_scanned") or "")
     return df, summary
 
@@ -926,42 +1097,18 @@ def render_system_health_panel() -> None:
     with c3: metric_card("Slowest run", f"{summary['slowest_seconds']:.1f}s")
     with c4: metric_card("Average run", f"{summary['avg_seconds']:.1f}s", f"Last TFs: {summary['last_timeframes']}")
 
+    st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
+    st.markdown("**Recent scanner runs**")
     cols = ["started_at", "total_seconds", "assets_scanned", "signals_saved", "shadow_saved", "open_trades", "alerted", "timeframes_scanned", "fastest_asset_seconds", "slowest_asset_seconds", "avg_asset_seconds"]
     view = runtime_df[[c for c in cols if c in runtime_df.columns]].copy()
     if "started_at" in view.columns:
-        try:
-            view["started_at"] = pd.to_datetime(view["started_at"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d %H:%M UTC")
-        except Exception:
-            pass
+        view["started_at"] = view["started_at"].apply(fmt_nairobi)
     st.dataframe(view.head(30), width="stretch", hide_index=True)
 
 
 def explain_signal(row: pd.Series) -> str:
-    grade = str(row.get("grade", ""))
-    status = str(row.get("status", ""))
-    signal = str(row.get("signal", ""))
-    asset = str(row.get("asset", ""))
-    reason = str(row.get("reason", ""))
-    rr = row.get("rr", np.nan)
-    conf = row.get("confidence", np.nan)
-    edge = row.get("edge_score", np.nan)
+    return rich_signal_explanation(row)
 
-    if grade == "NO TRADE" or signal == "HOLD":
-        return (
-            f"{asset} was blocked as a NO TRADE idea. The scanner still saved it for research, "
-            f"but it should not affect live win rate or prop-firm performance. Main reason: {reason}"
-        )
-    if status == "OPEN":
-        return (
-            f"{asset} is an open {signal} journal trade. It qualified as grade {grade}, with "
-            f"confidence around {conf:.1f}% and edge score {edge:.1f}. The setup remains active until TP, SL, or expiry. "
-            f"Reason: {reason}"
-        )
-    if "TP" in status:
-        return f"{asset} closed at TP. This confirms the original {grade} setup behaved as expected. Reason at entry: {reason}"
-    if "SL" in status:
-        return f"{asset} closed at SL. This does not automatically mean the setup was bad; review whether the failed layer was timing, volatility, or regime. Entry reason: {reason}"
-    return f"{asset} is recorded as {status}. Entry reason: {reason}"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UI HELPERS
@@ -975,18 +1122,30 @@ def apply_theme() -> None:
     * { box-sizing: border-box; }
     .stApp { background:#07111F; color:#E8EDF2; }
     [data-testid="stSidebar"] { background:#081827; border-right:1px solid #1E3050; }
-    .metric-card { background:#0F2235; border:1px solid #1E3050; border-radius:18px; padding:18px; min-height:112px; }
-    .metric-label { color:#8BAAB8; font-size:13px; font-weight:700; }
-    .metric-value { color:#E8EDF2; font-size:28px; font-weight:950; margin-top:4px; }
-    .soft-card { background:#0F2235; border:1px solid #1E3050; border-radius:18px; padding:18px; margin:10px 0; }
+    [data-testid="stSidebar"] .block-container { padding-top:22px; padding-bottom:22px; }
+    .sidebar-logo { text-align:center; padding:10px 0 18px; }
+    .sidebar-dish { font-size:58px; line-height:1; margin-bottom:6px; }
+    .sidebar-brand { color:#00D4A3; font-weight:950; font-size:34px; letter-spacing:1.5px; }
+    .sidebar-subtitle { color:#8BAAB8; font-size:15px; font-weight:750; margin-top:8px; }
+    .side-divider { height:1px; background:#1E3050; margin:18px 0 22px; }
+    .metric-card { background:#0F2235; border:1px solid #1E3050; border-radius:18px; padding:18px; min-height:112px; box-shadow:0 0 0 1px rgba(0,212,163,0.02); }
+    .compact-card { background:#0F2235; border:1px solid #1E3050; border-radius:16px; padding:14px 16px; margin:10px 0; }
+    .metric-label { color:#8BAAB8; font-size:13px; font-weight:800; text-transform:uppercase; letter-spacing:.5px; }
+    .metric-value { color:#E8EDF2; font-size:28px; font-weight:950; margin-top:4px; word-break:break-word; }
+    .soft-card { background:#0F2235; border:1px solid #1E3050; border-radius:18px; padding:20px; margin:16px 0; line-height:1.55; }
+    .ai-card { background:linear-gradient(180deg,#10283D 0%,#0F2235 100%); border:1px solid #244363; border-radius:18px; padding:22px; margin:16px 0; line-height:1.65; }
     .green { color:#00D4A3; }
+    .red { color:#FF5D5D; }
     .muted { color:#8BAAB8; }
+    .section-gap { height:22px; }
     .stTabs [data-baseweb="tab-list"] { gap: 8px; border-bottom: 1px solid #1E3050; }
     .stTabs [data-baseweb="tab"] { background:#0F2235; border:1px solid #1E3050; border-radius:12px 12px 0 0; color:#8BAAB8; padding:10px 16px; }
     .stTabs [aria-selected="true"] { color:#00D4A3 !important; border-bottom-color:#00D4A3 !important; }
-    div[data-testid="stDataFrame"] { border:1px solid #1E3050; border-radius:12px; overflow:hidden; }
+    div[data-testid="stDataFrame"] { border:1px solid #1E3050; border-radius:14px; overflow:hidden; margin-top:12px; }
     button[kind="primary"] { background:#00A97F !important; border-color:#00D4A3 !important; }
-    input, textarea { border-radius:10px !important; }
+    input, textarea, div[data-baseweb="select"] > div { border-radius:12px !important; }
+    .danger-button button { background:#8B1E2D !important; border-color:#FF5D5D !important; color:#fff !important; }
+    .grey-note { background:#111A2A; border:1px solid #26364A; border-radius:14px; padding:12px 14px; color:#A9BBC9; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -1019,13 +1178,21 @@ def parse_account_size(value: str, fallback: float = 10000.0) -> float:
 
 def sidebar_controls(username: str, settings: dict) -> dict:
     with st.sidebar:
-        st.markdown("<div style='text-align:center;font-size:42px;'>📡</div>", unsafe_allow_html=True)
-        st.markdown("<div style='text-align:center;color:#00D4A3;font-weight:950;font-size:24px;'>BENZINO</div>", unsafe_allow_html=True)
+        st.markdown("""
+        <div class='sidebar-logo'>
+          <div class='sidebar-dish'>📡</div>
+          <div class='sidebar-brand'>BENZINO</div>
+          <div class='sidebar-subtitle'>Institutional Signal Engine</div>
+        </div>
+        <div class='side-divider'></div>
+        """, unsafe_allow_html=True)
 
         if st.button("Refresh dashboard", width="stretch", type="primary"):
-            st.cache_data.clear()
+            with st.spinner("Refreshing dashboard from Supabase…"):
+                st.cache_data.clear()
             st.rerun()
 
+        st.markdown("<div class='side-divider'></div>", unsafe_allow_html=True)
         current_account = float(settings.get("account_size", 10000) or 10000)
         account_text = st.text_input("Account size", value=f"{current_account:,.0f}")
         account = parse_account_size(account_text, current_account)
@@ -1036,32 +1203,49 @@ def sidebar_controls(username: str, settings: dict) -> dict:
             ["15m", "1h", "4h", "1d"],
             index=["15m", "1h", "4h", "1d"].index(str(settings.get("preferred_timeframe", "1h"))) if str(settings.get("preferred_timeframe", "1h")) in ["15m", "1h", "4h", "1d"] else 1,
         )
-        st.caption(f"Risk: ${account * risk_pct / 100:,.2f} · Leverage 1:{int(leverage)} · Preferred TF {preferred_tf}")
+        st.markdown(
+            f"""
+            <div class='compact-card'>
+              <div class='metric-label'>Account parameters</div>
+              <div style='font-weight:850;margin-top:6px;'>Risk: ${account * risk_pct / 100:,.2f}</div>
+              <div class='muted'>Leverage 1:{int(leverage)} · Preferred TF {preferred_tf}</div>
+            </div>
+            """, unsafe_allow_html=True
+        )
 
         new_settings = settings.copy()
-        # One timeframe control now drives both signal preference and dashboard view.
         new_settings.update({"account_size": account, "leverage": leverage, "risk_pct": risk_pct, "preferred_timeframe": preferred_tf, "view_timeframe": preferred_tf})
         if new_settings != settings:
             save_settings(username, new_settings)
             settings = new_settings
 
-        st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
-        st.caption(f"{APP_VERSION} · {username} · {user_role(username).title()}")
+        st.markdown("<div class='side-divider'></div>", unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <div class='compact-card'>
+              <div class='metric-label'>Version</div>
+              <div style='font-weight:850;margin-top:6px;'>{html.escape(APP_VERSION)}</div>
+              <div class='muted'>{html.escape(username)} · {html.escape(user_role(username).title())}</div>
+            </div>
+            """, unsafe_allow_html=True
+        )
         if st.button("Log out", width="stretch"):
             st.session_state.pop("auth_user", None)
             st.rerun()
     return settings
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PAGES
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def render_opportunity_board(username: str, settings: dict) -> None:
-    page_header("Opportunity Board", "Signal generation, grading, ranking, and active opportunity view from background scanner data.")
-    raw_df = enrich_position_sizing(load_signals_for_user(username, settings), settings)
-    df = apply_timeframe_view(raw_df, settings)
+    page_header("System Performance & Signal Board", "Live system performance plus the latest saved scanner signals from Supabase.")
+    with st.spinner("Loading latest saved Supabase data…"):
+        raw_df = enrich_position_sizing(load_signals_for_user(username, settings), settings)
+        df = apply_timeframe_view(raw_df, settings)
     if df.empty:
-        st.info("No scanner rows yet for your watchlist/timeframe since account activation. Try View performance timeframe = All, let GitHub Actions run, then refresh.")
+        st.info("No scanner rows yet for your watchlist/timeframe since account activation. Confirm your watchlist is saved, wait for the GitHub cron, then refresh dashboard.")
         return
 
     trade_df = df[df["grade"].astype(str).isin(VALID_GRADES)].copy()
@@ -1079,12 +1263,15 @@ def render_opportunity_board(username: str, settings: dict) -> None:
     st.subheader("System performance")
     render_performance_strip(df, settings, prop_mode=False)
 
-
-    st.subheader("Ranked latest signals")
+    st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
+    st.subheader("Latest scanner signals")
     ranked = df.sort_values(["created_at", "edge_score", "confidence"], ascending=[False, False, False]).copy()
-    ranked["created_at"] = ranked["created_at"].dt.strftime("%Y-%m-%d %H:%M UTC")
+    ranked["generated"] = ranked["created_at"].apply(time_ago)
+    ranked["created_at_eat"] = ranked["created_at"].apply(fmt_nairobi)
+    ranked["decayed_confidence"] = ranked.apply(lambda r: decayed_confidence_value(r.get("confidence"), r.get("created_at"), r.get("timeframe")), axis=1)
+    ranked["decayed_quality"] = np.where(ranked["decayed_confidence"] >= 70, "Fresh/strong", np.where(ranked["decayed_confidence"] >= 55, "Still valid", "Aging/weak"))
     cols = [
-        "created_at", "asset", "timeframe", "signal", "grade", "status", "confidence", "edge_score", "ml_prob",
+        "generated", "created_at_eat", "asset", "timeframe", "signal", "grade", "status", "confidence", "decayed_confidence", "decayed_quality", "edge_score", "ml_prob",
         "entry", "sl", "tp", "rr", "mtf_score", "risk_cash", "position_size", "margin_required", "regime"
     ]
     st.dataframe(ranked[[c for c in cols if c in ranked.columns]].head(100), width="stretch", hide_index=True)
@@ -1103,10 +1290,11 @@ def render_opportunity_board(username: str, settings: dict) -> None:
 
 def render_asset_deep_dive(username: str, settings: dict) -> None:
     page_header("Asset Deep Dive", "Explain the latest scanner evidence, trade plan, strategy votes, and historical outcome profile.")
-    raw_df = enrich_position_sizing(load_signals_for_user(username, settings), settings)
-    df = apply_timeframe_view(raw_df, settings)
+    with st.spinner("Loading asset evidence from Supabase…"):
+        raw_df = enrich_position_sizing(load_signals_for_user(username, settings), settings)
+        df = apply_timeframe_view(raw_df, settings)
     if df.empty:
-        st.info("No scanner data available yet for this timeframe. Try View performance timeframe = All.")
+        st.info("No scanner data available yet for this timeframe.")
         return
     assets = sorted(df["asset"].dropna().astype(str).unique())
     selected = st.selectbox("Select asset", assets)
@@ -1115,23 +1303,19 @@ def render_asset_deep_dive(username: str, settings: dict) -> None:
 
     c1, c2, c3, c4 = st.columns(4)
     with c1: metric_card("Latest signal", str(latest.get("signal", "")), f"{latest.get('timeframe', '')} · Grade {latest.get('grade', '')}")
-    with c2: metric_card("Confidence", f"{float(latest.get('confidence') or 0):.1f}%", f"Edge {float(latest.get('edge_score') or 0):.1f}")
+    with c2: metric_card("Confidence", f"{float(latest.get('confidence') or 0):.1f}%", f"Decayed {decayed_confidence_value(latest.get('confidence'), latest.get('created_at'), latest.get('timeframe')):.1f}%")
     with c3: metric_card("RR", f"{float(latest.get('rr') or 0):.2f}R", str(latest.get("status", "")))
-    with c4: metric_card("Margin", f"${float(latest.get('margin_required') or 0):,.2f}", f"Leverage 1:{int(settings.get('leverage', 100))}")
+    with c4: metric_card("Generated", time_ago(latest.get("created_at")), fmt_nairobi(latest.get("created_at")))
 
-    st.markdown("<div class='soft-card'>", unsafe_allow_html=True)
-    st.subheader("Explain AI")
-    st.write(explain_signal(latest))
-    st.caption(str(latest.get("reason", "")))
-    st.markdown("</div>", unsafe_allow_html=True)
+    explain_source = adf.head(5).copy()
+    options = explain_source.apply(lambda r: f"{r.get('asset')} · {r.get('timeframe')} · {r.get('signal')} · {r.get('grade')} · {time_ago(r.get('created_at'))} · {r.get('signal_id')}", axis=1).tolist()
+    choice = st.selectbox("Explain AI: last 5 generated signals", options)
+    sid = choice.split(" · ")[-1]
+    row = explain_source[explain_source["signal_id"].astype(str).eq(sid)].iloc[0]
+    render_ai_card("Explain AI — signal decision", rich_signal_explanation(row))
 
-    mtf_context = latest.get("mtf_context")
-    if isinstance(mtf_context, str):
-        try:
-            mtf_context = json.loads(mtf_context)
-        except Exception:
-            mtf_context = {}
-    if isinstance(mtf_context, dict) and mtf_context:
+    mtf_context = parse_jsonish(row.get("mtf_context"))
+    if mtf_context:
         st.subheader("Multi-timeframe confirmation")
         rows = []
         for tf, payload in mtf_context.items():
@@ -1139,15 +1323,10 @@ def render_asset_deep_dive(username: str, settings: dict) -> None:
                 rows.append({"Timeframe": tf, "Direction": payload.get("direction"), "Strength": payload.get("strength")})
         if rows:
             st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
-        st.caption(f"MTF score: {float(latest.get('mtf_score') or 0):.0f}%")
+        st.caption(f"MTF score: {float(row.get('mtf_score') or 0):.0f}%")
 
-    votes = latest.get("strategy_votes")
-    if isinstance(votes, str):
-        try:
-            votes = json.loads(votes)
-        except Exception:
-            votes = {}
-    if isinstance(votes, dict) and votes:
+    votes = parse_jsonish(row.get("strategy_votes"))
+    if votes:
         vote_rows = []
         for name, payload in votes.items():
             if isinstance(payload, dict):
@@ -1157,8 +1336,9 @@ def render_asset_deep_dive(username: str, settings: dict) -> None:
 
     st.subheader("History for selected asset")
     hist = adf.copy()
-    hist["created_at"] = hist["created_at"].dt.strftime("%Y-%m-%d %H:%M UTC")
-    st.dataframe(hist[["created_at", "timeframe", "signal", "grade", "status", "confidence", "edge_score", "mtf_score", "rr", "r_multiple", "exit_reason", "session"]].head(100), width="stretch", hide_index=True)
+    hist["created_at_eat"] = hist["created_at"].apply(fmt_nairobi)
+    cols = ["created_at_eat", "timeframe", "signal", "grade", "status", "confidence", "edge_score", "mtf_score", "rr", "r_multiple", "exit_reason", "session"]
+    st.dataframe(hist[[c for c in cols if c in hist.columns]].head(100), width="stretch", hide_index=True)
 
 
 def render_workflow(username: str, settings: dict) -> None:
@@ -1197,11 +1377,11 @@ def render_workflow(username: str, settings: dict) -> None:
 
         st.subheader("Open trades")
         open_view = add_trade_pnl_columns(open_trades, settings)
-        open_cols = ["created_at", "asset", "timeframe", "signal", "grade", "entry", "sl", "tp", "rr", "risk_cash", "potential_tp_cash", "potential_sl_cash", "bars_open", "session"]
+        open_cols = ["created_at_eat", "asset", "timeframe", "signal", "grade", "entry", "sl", "tp", "rr", "risk_cash", "potential_tp_cash", "potential_sl_cash", "bars_open", "session"]
         st.dataframe(open_view[[c for c in open_cols if c in open_view.columns]].head(200), width="stretch", hide_index=True)
         st.subheader("Closed trades")
         closed_view = add_trade_pnl_columns(closed_trades, settings)
-        closed_cols = ["created_at", "asset", "timeframe", "signal", "grade", "status", "outcome", "r_multiple", "pnl_cash", "balance_after", "exit_reason", "session"]
+        closed_cols = ["created_at_eat", "asset", "timeframe", "signal", "grade", "status", "outcome", "r_multiple", "pnl_cash", "balance_after", "exit_reason", "session"]
         st.dataframe(closed_view[[c for c in closed_cols if c in closed_view.columns]].head(200), width="stretch", hide_index=True)
         render_balance_curve(trades, settings, title="Normal journal balance curve")
 
@@ -1231,54 +1411,57 @@ def render_workflow(username: str, settings: dict) -> None:
             st.info("No A+/A trades yet for prop-firm mode.")
         else:
             prop_view = add_trade_pnl_columns(prop_source, settings)
-            cols = ["created_at", "asset", "timeframe", "signal", "grade", "status", "entry", "sl", "tp", "rr", "r_multiple", "pnl_cash", "balance_after", "exit_reason", "session"]
+            cols = ["created_at_eat", "asset", "timeframe", "signal", "grade", "status", "entry", "sl", "tp", "rr", "r_multiple", "pnl_cash", "balance_after", "exit_reason", "session"]
             st.dataframe(prop_view[[c for c in cols if c in prop_view.columns]].head(300), width="stretch", hide_index=True)
             render_balance_curve(prop_source, settings, title="Prop-firm eligible balance curve")
 
     with t3:
         st.write("These are blocked ideas. They are useful for research, but excluded from the actual journal win rate.")
-        st.dataframe(no_trades[["created_at", "asset", "timeframe", "signal", "grade", "confidence", "edge_score", "rr", "reason", "session"]].head(300), width="stretch", hide_index=True)
+        st.dataframe(no_trades[["created_at_eat", "asset", "timeframe", "signal", "grade", "confidence", "edge_score", "rr", "reason", "session"]].head(300), width="stretch", hide_index=True)
 
     with t4:
         st.subheader("Coach AI")
         if len(closed_trades) < 10:
-            st.info(f"Coach has {len(closed_trades)} closed trades. It will only declare a best asset/session after at least 10 closed trades.")
+            render_ai_card("Coach AI — building evidence", f"Coach has **{len(closed_trades)}** closed trades. It will avoid declaring a best asset/session until there is enough evidence. Keep collecting data, but watch open exposure and avoid changing the rules too early.")
         else:
-            resolved = closed_trades[closed_trades["outcome"].isin(["WIN", "LOSS"])]
+            resolved = closed_trades[closed_trades["outcome"].isin(["WIN", "LOSS"])].copy()
             notes = []
-            asset_perf = resolved.groupby("asset").agg(win_rate=("outcome", lambda x: (x == "WIN").mean()), trades=("signal_id", "count"), avg_r=("r_multiple", "mean")).reset_index()
-            asset_perf = asset_perf[asset_perf["trades"] >= 5].sort_values(["win_rate", "avg_r"], ascending=False)
-            if not asset_perf.empty:
-                best = asset_perf.iloc[0]
-                notes.append(f"Best supported asset so far is {best['asset']} with {best['trades']} closed trades and {best['win_rate']*100:.1f}% win rate.")
-            else:
-                notes.append("No asset has enough closed-trade evidence yet. Avoid declaring a best asset too early.")
-
-            session_perf = resolved.groupby("session").agg(win_rate=("outcome", lambda x: (x == "WIN").mean()), trades=("signal_id", "count"), avg_r=("r_multiple", "mean")).reset_index()
-            session_perf = session_perf[session_perf["trades"] >= 5].sort_values(["win_rate", "avg_r"], ascending=False)
-            if not session_perf.empty:
-                best = session_perf.iloc[0]
-                notes.append(f"Best supported session is {best['session']} with {best['trades']} closed trades and {best['win_rate']*100:.1f}% win rate.")
-            else:
-                notes.append("No session has enough closed-trade evidence yet.")
-
+            if not resolved.empty:
+                asset_perf = resolved.groupby("asset").agg(win_rate=("outcome", lambda x: (x == "WIN").mean()), trades=("signal_id", "count"), avg_r=("r_multiple", "mean")).reset_index()
+                asset_perf = asset_perf[asset_perf["trades"] >= 5].sort_values(["win_rate", "avg_r"], ascending=False)
+                if not asset_perf.empty:
+                    best = asset_perf.iloc[0]
+                    notes.append(f"Your strongest supported asset is **{best['asset']}**: {best['trades']} closed trades, {best['win_rate']*100:.1f}% win rate, average {best['avg_r']:+.2f}R. Treat this as the playbook to repeat, not just a lucky asset.")
+                weak = resolved.groupby("asset").agg(win_rate=("outcome", lambda x: (x == "WIN").mean()), trades=("signal_id", "count"), avg_r=("r_multiple", "mean")).reset_index()
+                weak = weak[weak["trades"] >= 5].sort_values(["win_rate", "avg_r"], ascending=True)
+                if not weak.empty:
+                    w = weak.iloc[0]
+                    notes.append(f"Your weakest supported area is **{w['asset']}**: {w['trades']} closed trades and {w['win_rate']*100:.1f}% win rate. Reduce size or demand stronger MTF confirmation here until the numbers improve.")
+                session_perf = resolved.groupby("session").agg(win_rate=("outcome", lambda x: (x == "WIN").mean()), trades=("signal_id", "count"), avg_r=("r_multiple", "mean")).reset_index()
+                session_perf = session_perf[session_perf["trades"] >= 5].sort_values(["win_rate", "avg_r"], ascending=False)
+                if not session_perf.empty:
+                    srow = session_perf.iloc[0]
+                    notes.append(f"Best supported session is **{srow['session']}** with {srow['trades']} closed trades and {srow['win_rate']*100:.1f}% win rate. Prioritise this session when similar grades appear.")
             if len(open_trades) >= 3:
-                notes.append("Overtrading warning: you currently have 3 or more open trades. Reduce new exposure until one closes.")
+                notes.append("Exposure warning: three or more trades are open. The coach would slow down new entries until at least one trade resolves, especially in prop-firm mode.")
             a_count = len(open_trades[open_trades["grade"].isin(["A+", "A"])])
             b_count = len(open_trades[open_trades["grade"].isin(["B", "C"])])
-            notes.append(f"Open quality mix: {a_count} A+/A trades and {b_count} B/C trades. Prop mode should only care about A+/A.")
-            for n in notes:
-                st.markdown(f"- {n}")
+            notes.append(f"Current open quality mix: **{a_count}** A+/A trade(s) and **{b_count}** B/C trade(s). Prop-firm focus should stay on A+/A only; B/C is research/journal learning fuel.")
+            body = "\n\n".join([f"- {n}" for n in notes])
+            render_ai_card("Coach AI — trade management guidance", body)
 
     with t5:
         st.subheader("Explain AI")
-        options = df.apply(lambda r: f"{r.get('asset')} · {r.get('timeframe')} · {r.get('signal')} · {r.get('grade')} · {str(r.get('created_at'))[:19]} · {r.get('signal_id')}", axis=1).tolist()
-        choice = st.selectbox("Choose scan/trade to explain", options)
-        sid = choice.split(" · ")[-1]
-        row = df[df["signal_id"].astype(str).eq(sid)].iloc[0]
-        st.markdown("<div class='soft-card'>", unsafe_allow_html=True)
-        st.write(explain_signal(row))
-        st.markdown("</div>", unsafe_allow_html=True)
+        closed_latest = closed_trades.sort_values("created_at", ascending=False).head(5).copy()
+        if closed_latest.empty:
+            st.info("No closed trades yet. Explain AI will focus on closed outcomes once TP, SL, or expiry appears.")
+        else:
+            options = closed_latest.apply(lambda r: f"{r.get('asset')} · {r.get('timeframe')} · {r.get('outcome')} · {r.get('grade')} · {fmt_nairobi(r.get('created_at'))} · {r.get('signal_id')}", axis=1).tolist()
+            choice = st.selectbox("Choose one of the last 5 closed trades", options)
+            sid = choice.split(" · ")[-1]
+            row = closed_latest[closed_latest["signal_id"].astype(str).eq(sid)].iloc[0]
+            render_ai_card("Explain AI — closed trade lesson", rich_closed_trade_explanation(row))
+
 
 
 def render_settings(username: str, settings: dict) -> None:
@@ -1291,13 +1474,13 @@ def render_settings(username: str, settings: dict) -> None:
         current_email = str(users.iloc[0].get("email") or "") if not users.empty else ""
         c1, c2, c3, c4 = st.columns(4)
         with c1: metric_card("Username", username, user_role(username).title())
-        with c2: metric_card("Created", str(created)[:19])
-        with c3: metric_card("Tracking since", str(settings.get("tracking_started_at", ""))[:19])
+        with c2: metric_card("Created", fmt_nairobi(created))
+        with c3: metric_card("Tracking since", fmt_nairobi(settings.get("tracking_started_at", "")))
         with c4: metric_card("Preferred TF", str(settings.get("preferred_timeframe", "1h")), "Used across dashboard")
-        st.caption("Admin policy: the first created profile is the only admin. All later profiles are standard users.")
+        st.markdown("<div class='compact-card'>Admin policy: the first created profile is the only admin. All later profiles are standard users.</div>", unsafe_allow_html=True)
 
         with st.expander("Profile email and password", expanded=False):
-            email_value = st.text_input("Email for password recovery", value=current_email, key="profile_email")
+            email_value = st.text_input("Email for password reset", value=current_email, key="profile_email")
             if st.button("Save email", type="secondary"):
                 ok, msg = update_user_email(username, email_value)
                 if ok: st.success(msg)
@@ -1337,26 +1520,23 @@ def render_settings(username: str, settings: dict) -> None:
             tg = read_df("SELECT * FROM user_telegram_settings WHERE scan_owner = %s", (username,))
             row = tg.iloc[0].to_dict() if not tg.empty else {}
             active = bool(row.get("alerts_enabled", False))
-            status_text = "Active" if active else "Inactive"
-            st.markdown(f"**Telegram alerts:** {status_text}")
+            st.markdown(f"**Telegram alerts:** {'Active' if active else 'Inactive'}")
             chat_id = st.text_input("Telegram chat ID", value=str(row.get("telegram_chat_id") or settings.get("telegram_chat_ids") or ""))
-            watchlist_alerts = st.checkbox("Watchlist alerts", value=bool(row.get("watchlist_alerts", True)))
-            all_alerts = st.checkbox("All-signal alerts", value=bool(row.get("all_signals_alerts", False)))
+            current_mode = "All signals" if bool(row.get("all_signals_alerts", False)) else "Watchlist only"
+            alert_mode = st.radio("Alert route", ["Watchlist only", "All signals"], index=0 if current_mode == "Watchlist only" else 1, horizontal=True)
+            watchlist_alerts = alert_mode == "Watchlist only"
+            all_alerts = alert_mode == "All signals"
 
-            col_a, col_b, col_c = st.columns(3)
+            col_a, col_b = st.columns(2)
             with col_a:
-                save_clicked = st.button("Save Telegram settings", type="primary")
+                activate_clicked = st.button("Activate Settings", type="primary", disabled=active or not bool(str(chat_id).strip()), width="stretch")
             with col_b:
-                activate_clicked = st.button("Activate alerts", disabled=active or not bool(str(chat_id).strip()))
-            with col_c:
-                deactivate_clicked = st.button("Deactivate alerts", disabled=not active)
+                st.markdown("<div class='danger-button'>", unsafe_allow_html=True)
+                deactivate_clicked = st.button("Deactivate alerts", disabled=not active, width="stretch")
+                st.markdown("</div>", unsafe_allow_html=True)
 
-            if save_clicked or activate_clicked or deactivate_clicked:
-                new_active = active
-                if activate_clicked:
-                    new_active = True
-                if deactivate_clicked:
-                    new_active = False
+            if activate_clicked or deactivate_clicked:
+                new_active = bool(activate_clicked)
                 execute(
                     """
                     INSERT INTO user_telegram_settings(scan_owner, telegram_chat_id, alerts_enabled, watchlist_alerts, all_signals_alerts, updated_at)
@@ -1377,8 +1557,9 @@ def render_settings(username: str, settings: dict) -> None:
                 if activate_clicked:
                     settings["telegram_alerts_activated_at"] = datetime.now(timezone.utc).isoformat()
                 save_settings(username, settings)
-                st.success("Telegram settings saved." if save_clicked else ("Telegram alerts activated." if new_active else "Telegram alerts deactivated."))
+                st.success("Telegram settings activated." if new_active else "Telegram alerts deactivated.")
                 st.rerun()
+            st.caption("Activate Settings saves the chat ID and alert route in one step. Only one route can be active at a time.")
         except Exception as exc:
             st.error(f"Telegram settings error: {exc}")
 
@@ -1421,8 +1602,8 @@ def main() -> None:
     settings = load_settings(username)
     settings = sidebar_controls(username, settings)
 
-    page_header("Navigation", "Move between the opportunity board, deep dive, workflow and settings.")
-    tab_board, tab_deep, tab_workflow, tab_settings = st.tabs(["Opportunity Board", "Asset Deep Dive", "Workflow", "Settings"])
+    page_header("Navigation", "Move between system performance, deep dive, workflow and settings.")
+    tab_board, tab_deep, tab_workflow, tab_settings = st.tabs(["System Performance", "Asset Deep Dive", "Workflow", "Settings"])
     with tab_board:
         render_opportunity_board(username, settings)
     with tab_deep:
