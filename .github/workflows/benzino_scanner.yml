@@ -2,19 +2,22 @@ name: BENZINO Institutional Scanner
 
 on:
   schedule:
-    # 15m + 1h scans every 5 minutes (offset from top of hour)
-    - cron: "2-59/5 * * * *"
+    # 15m scans every 15 minutes, after each candle close
+    - cron: "2,17,32,47 * * * *"
 
-    # 4h scans
+    # 1h scans once every hour, after the hourly candle has closed
+    - cron: "7 * * * *"
+
+    # 4h scans once every 4 hours, after the 4h candle has closed
     - cron: "17 */4 * * *"
 
-    # 1d scans
+    # 1d scans once daily, after the daily candle has closed
     - cron: "37 0 * * *"
 
   workflow_dispatch:
     inputs:
       full_scan:
-        description: "Run full master watchlist scan instead of user-watchlist fast scan"
+        description: "Run full master watchlist scan"
         required: true
         default: "false"
         type: choice
@@ -23,14 +26,15 @@ on:
           - "true"
 
       scan_timeframes:
-        description: "Timeframes to scan when full_scan=true"
+        description: "Timeframes to scan on manual runs"
         required: true
-        default: "15m,1h,4h,1d"
+        default: "15m"
         type: choice
         options:
           - "15m"
           - "1h"
-          - "15m,1h"
+          - "4h"
+          - "1d"
           - "15m,1h,4h,1d"
 
 concurrency:
@@ -46,7 +50,7 @@ env:
 
   DEFAULT_USER_TIMEFRAME: "1h"
   FULL_UNIVERSE_SCAN_EVERY_HOURS: "0"
-  SCAN_MASTER_WATCHLIST_FALLBACK: "false"
+  SCAN_MASTER_WATCHLIST_FALLBACK: "true"
 
   SCHEDULE_CRON: ${{ github.event.schedule || 'manual' }}
 
@@ -55,11 +59,12 @@ env:
 
   SCAN_TIMEFRAMES: >-
     ${{ github.event_name == 'schedule'
-        && (github.event.schedule == '2-59/5 * * * *' && '15m,1h'
+        && (github.event.schedule == '2,17,32,47 * * * *' && '15m'
+        || github.event.schedule == '7 * * * *' && '1h'
         || github.event.schedule == '17 */4 * * *' && '4h'
         || github.event.schedule == '37 0 * * *' && '1d')
         || github.event.inputs.scan_timeframes
-        || '15m,1h' }}
+        || '15m' }}
 
 jobs:
   scan:
