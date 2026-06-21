@@ -2,17 +2,9 @@ name: BENZINO Institutional Scanner
 
 on:
   schedule:
-    # 15m scans every 15 minutes, after each candle close
+    # Runs every 15 minutes, 24/7.
+    # GitHub cron is UTC. The scanner decides which timeframe(s) to scan per run.
     - cron: "2,17,32,47 * * * *"
-
-    # 1h scans once every hour, after the hourly candle has closed
-    - cron: "7 * * * *"
-
-    # 4h scans once every 4 hours, after the 4h candle has closed
-    - cron: "17 */4 * * *"
-
-    # 1d scans once daily, after the daily candle has closed
-    - cron: "37 0 * * *"
 
   workflow_dispatch:
     inputs:
@@ -52,19 +44,8 @@ env:
   FULL_UNIVERSE_SCAN_EVERY_HOURS: "0"
   SCAN_MASTER_WATCHLIST_FALLBACK: "true"
 
-  SCHEDULE_CRON: ${{ github.event.schedule || 'manual' }}
-
   FORCE_FULL_SCAN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.full_scan || 'false' }}
   SCAN_ALL_TIMEFRAMES_EVERY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.full_scan || 'false' }}
-
-  SCAN_TIMEFRAMES: >-
-    ${{ github.event_name == 'schedule'
-        && (github.event.schedule == '2,17,32,47 * * * *' && '15m'
-        || github.event.schedule == '7 * * * *' && '1h'
-        || github.event.schedule == '17 */4 * * *' && '4h'
-        || github.event.schedule == '37 0 * * *' && '1d')
-        || github.event.inputs.scan_timeframes
-        || '15m' }}
 
 jobs:
   scan:
@@ -75,12 +56,47 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Show trigger details
+      - name: Decide scan timeframes
+        shell: bash
         run: |
           echo "event_name=${{ github.event_name }}"
           echo "schedule=${{ github.event.schedule }}"
-          echo "scan_timeframes=${{ env.SCAN_TIMEFRAMES }}"
           date -u
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SCAN_TF="${{ github.event.inputs.scan_timeframes }}"
+            SCHEDULE_LABEL="manual"
+          else
+            # Scheduled runs happen every 15 minutes at UTC minutes 02, 17, 32, 47.
+            # 15m scans run every scheduled run.
+            # 1h scans are added at minute 17 once per hour.
+            # 4h scans are added at minute 17 every 4 UTC hours.
+            # 1d scans are added at 00:47 UTC once daily.
+            MINUTE="$(date -u +%M)"
+            HOUR="$(date -u +%H)"
+
+            SCAN_TF="15m"
+
+            if [ "$MINUTE" = "17" ]; then
+              SCAN_TF="${SCAN_TF},1h"
+
+              if [ $((10#$HOUR % 4)) -eq 0 ]; then
+                SCAN_TF="${SCAN_TF},4h"
+              fi
+            fi
+
+            if [ "$MINUTE" = "47" ] && [ "$HOUR" = "00" ]; then
+              SCAN_TF="${SCAN_TF},1d"
+            fi
+
+            SCHEDULE_LABEL="every_15m_dynamic"
+          fi
+
+          echo "SCAN_TIMEFRAMES=$SCAN_TF" >> "$GITHUB_ENV"
+          echo "SCHEDULE_CRON=$SCHEDULE_LABEL" >> "$GITHUB_ENV"
+
+          echo "Resolved SCAN_TIMEFRAMES=$SCAN_TF"
+          echo "Resolved SCHEDULE_CRON=$SCHEDULE_LABEL"
 
       - name: Set up Python
         uses: actions/setup-python@v6
