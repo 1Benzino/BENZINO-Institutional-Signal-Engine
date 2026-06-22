@@ -1909,16 +1909,17 @@ def render_system_health_panel() -> None:
                 selected_date_obj = pd.to_datetime(selected_date).date()
                 view_source = view_source[started_series.dt.tz_convert(NAIROBI_TZ).dt.date.eq(selected_date_obj)]
 
-    cols = ["started_at", "total_seconds", "assets_scanned", "signals_saved", "shadow_saved", "open_trades", "alerted", "timeframes_scanned", "fastest_asset_seconds", "slowest_asset_seconds", "avg_asset_seconds"]
+    cols = ["started_at", "timeframes_scanned", "total_seconds", "assets_scanned", "signals_saved", "open_trades", "alerted", "shadow_saved", "fastest_asset_seconds", "slowest_asset_seconds", "avg_asset_seconds"]
     view = view_source[[c for c in cols if c in view_source.columns]].copy()
     if "started_at" in view.columns:
         view["started_at"] = view["started_at"].apply(fmt_nairobi)
     render_benzino_aggrid(
         view.head(50),
         key="system_health_runs",
+        title="Scanner Run History",
         height=320,
         page_size=10,
-        pinned=["started_at"],
+        pinned=["started_at", "timeframes_scanned"],
         numeric_cols_right=["total_seconds", "assets_scanned", "signals_saved", "shadow_saved", "open_trades", "alerted"],
         enable_search=False,
     )
@@ -2533,15 +2534,16 @@ def apply_theme() -> None:
     }
     .stDownloadButton button[kind="primary"] * { color:#FFFFFF !important; }
 
-    /* Multiselect tags (e.g. Watchlist asset pills): Streamlit's default tag
-       colour is a reddish-orange with no Benzino styling applied. Force the
-       same green theme used everywhere else in the app, with white text.
+    /* Multiselect tags (e.g. Watchlist asset pills): give these a distinct
+       colour from the green "Save watchlist" action button so the two don't
+       visually blend together. Slate-blue matches the existing neutral/closed
+       badge colour used elsewhere in the app (ag-status-closed).
        Confirmed via devtools: the real element is a <span data-baseweb="tag">,
        not a <div> — the earlier div-only selector never matched anything. */
     span[data-baseweb="tag"],
     div[data-baseweb="tag"] {
-        background-color: #00A97F !important;
-        border-color: #00D4A3 !important;
+        background-color: #3D5A8A !important;
+        border-color: #7AA6FF !important;
         color: #FFFFFF !important;
     }
     span[data-baseweb="tag"] *,
@@ -2556,6 +2558,22 @@ def apply_theme() -> None:
     input, textarea, div[data-baseweb="select"] > div { border-radius:12px !important; }
     .danger-button button { background:#8B1E2D !important; border-color:#FF5D5D !important; color:#fff !important; }
     .grey-note { background:#111A2A; border:1px solid #26364A; border-radius:14px; padding:12px 14px; color:#A9BBC9; }
+
+    /* Disabled buttons (e.g. "Activate Settings" while alerts are already
+       active, or "Deactivate alerts" while inactive): force a clearly greyed
+       look that overrides the green primary/danger styling above, so the
+       mutually-exclusive activate/deactivate pair reads as genuinely
+       unclickable rather than just a slightly dimmed version of the action. */
+    button:disabled,
+    button[disabled],
+    button:disabled *,
+    button[disabled] * {
+        background: #1C2B40 !important;
+        border-color: #2A3D57 !important;
+        color: #5C7088 !important;
+        opacity: 1 !important;
+        cursor: not-allowed !important;
+    }
     
     /* ===== Minimal Benzino branding update ===== */
     .benzino-login-wrap {
@@ -4403,6 +4421,37 @@ def render_settings(username: str, settings: dict) -> None:
         current_set = set(current or DEFAULT_ASSETS)
         st.caption("Current active watchlist: " + ", ".join(current or DEFAULT_ASSETS))
 
+        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
+        wl_system_df = load_all_system_signals(settings)
+        if wl_system_df is not None and not wl_system_df.empty:
+            wl_system_df = wl_system_df.copy()
+            wl_system_df["outcome"] = wl_system_df.apply(outcome_label, axis=1)
+            wl_graded = wl_system_df[wl_system_df["grade"].astype(str).isin(VALID_GRADES)].copy()
+            wl_resolved_all = wl_graded[wl_graded["outcome"].isin(["WIN", "LOSS"])].copy()
+            system_win_rate = (wl_resolved_all["outcome"].eq("WIN").mean() * 100) if len(wl_resolved_all) else 0.0
+
+            wl_user_df = wl_graded[wl_graded["asset"].astype(str).isin(current_set)].copy()
+            wl_resolved_user = wl_user_df[wl_user_df["outcome"].isin(["WIN", "LOSS"])].copy()
+            user_win_rate = (wl_resolved_user["outcome"].eq("WIN").mean() * 100) if len(wl_resolved_user) else 0.0
+
+            wl_user_open = wl_user_df[wl_user_df["status"].astype(str).str.upper().eq("OPEN")]
+            wl_user_avg_r = pd.to_numeric(wl_resolved_user.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean() if len(wl_resolved_user) else 0.0
+
+            wm1, wm2, wm3, wm4, wm5 = st.columns(5)
+            with wm1:
+                metric_card("System win rate", f"{system_win_rate:.2f}%", f"{len(wl_resolved_all):,} resolved · all assets")
+            with wm2:
+                metric_card("Watchlist win rate", f"{user_win_rate:.2f}%", f"{len(wl_resolved_user):,} resolved · your {len(current_set)} assets")
+            with wm3:
+                metric_card("Watchlist open trades", f"{len(wl_user_open):,}", "Currently active")
+            with wm4:
+                metric_card("Watchlist avg R", f"{wl_user_avg_r:+.2f}", "Resolved trades only")
+            with wm5:
+                metric_card("Watchlist coverage", f"{len(current_set)}/{len(ASSET_UNIVERSE)}", "Assets enabled")
+        else:
+            st.info("No scanner data yet — win rate metrics will appear once signals have been generated.")
+
+        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         watchlist_rows = []
         for key, meta in ASSET_UNIVERSE.items():
             watchlist_rows.append({
@@ -4454,7 +4503,7 @@ def render_settings(username: str, settings: dict) -> None:
 
             col_a, col_b = st.columns(2)
             with col_a:
-                activate_clicked = st.button("Activate Settings", type="primary", width="stretch")
+                activate_clicked = st.button("Activate Settings", type="primary", width="stretch", disabled=active)
             with col_b:
                 st.markdown("<div class='danger-button'>", unsafe_allow_html=True)
                 deactivate_clicked = st.button("Deactivate alerts", disabled=not active, width="stretch")
