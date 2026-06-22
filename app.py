@@ -2495,11 +2495,20 @@ def apply_theme() -> None:
 
     /* Primary form/submit buttons (e.g. "Save watchlist", "Activate Settings"):
        force green background with fully opaque WHITE text on every possible
-       internal wrapper Streamlit/BaseWeb renders the label in. */
+       internal wrapper Streamlit/BaseWeb renders the label in.
+       Confirmed via devtools: st.form_submit_button(type="primary") renders
+       kind="primaryFormSubmit" / data-testid="stBaseButton-primaryFormSubmit"
+       — NOT plain kind="primary" like a regular st.button. Every rule below
+       must include both kinds or form-submit buttons stay on Streamlit's
+       default red with zero custom styling applied. */
     button[kind="primary"],
     button[kind="primary"] div,
     button[kind="primary"] p,
     button[kind="primary"] span,
+    button[kind="primaryFormSubmit"],
+    button[kind="primaryFormSubmit"] div,
+    button[kind="primaryFormSubmit"] p,
+    button[kind="primaryFormSubmit"] span,
     [data-testid="stFormSubmitButton"] button,
     [data-testid="stFormSubmitButton"] button div,
     [data-testid="stFormSubmitButton"] button p,
@@ -2507,12 +2516,18 @@ def apply_theme() -> None:
     [data-testid="baseButton-primary"],
     [data-testid="baseButton-primary"] div,
     [data-testid="baseButton-primary"] p,
-    [data-testid="baseButton-primary"] span {
+    [data-testid="baseButton-primary"] span,
+    [data-testid="stBaseButton-primaryFormSubmit"],
+    [data-testid="stBaseButton-primaryFormSubmit"] div,
+    [data-testid="stBaseButton-primaryFormSubmit"] p,
+    [data-testid="stBaseButton-primaryFormSubmit"] span {
         color: #FFFFFF !important;
         opacity: 1 !important;
     }
     button[kind="primary"],
-    [data-testid="baseButton-primary"] {
+    button[kind="primaryFormSubmit"],
+    [data-testid="baseButton-primary"],
+    [data-testid="stBaseButton-primaryFormSubmit"] {
         background: #00A97F !important;
         border-color: #00D4A3 !important;
     }

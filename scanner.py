@@ -345,9 +345,23 @@ def is_schedule_controlled_run() -> bool:
     This also keeps manual workflow_dispatch runs predictable: if the user
     manually selects 4h, scanner.py scans 4h immediately instead of waiting for
     the next 4-hour candle window.
+
+    "auto_dispatch" is the label the workflow sets when an EXTERNAL trigger
+    (e.g. cron-job.org calling workflow_dispatch on a schedule, used because
+    GitHub's native schedule: trigger is best-effort and can drift/skip) fires
+    with scan_timeframes=auto. In that case the workflow's bash step re-derives
+    the same 15m/1h/4h/1d cadence from the current UTC minute/hour that the
+    native schedule path would have used — so it is just as trustworthy as
+    "every_15m_dynamic" and must be trusted the same way, or 1h/4h/1d get
+    silently dropped by the minute-window heuristic below even when the
+    workflow correctly included them in SCAN_TIMEFRAMES.
     """
     label = str(SCHEDULE_CRON or "").strip()
-    return bool(label) and (label in SCHEDULED_TIMEFRAME_CRONS or label.startswith("every_15m"))
+    return bool(label) and (
+        label in SCHEDULED_TIMEFRAME_CRONS
+        or label.startswith("every_15m")
+        or label == "auto_dispatch"
+    )
 
 
 # Production scan policy: every run scans the full MASTER_WATCHLIST.
@@ -1673,17 +1687,22 @@ def send_telegram_to(message: str, chat_ids: list[str]) -> tuple[bool, str]:
     return (True, f"Sent to {sent}/{len(chat_ids)} recipient(s).") if sent else (False, "; ".join(errors))
 
 
-def get_activated_telegram_recipients(asset: str) -> list[str]:
+def get_activated_telegram_recipients(asset: str, timeframe: str = "") -> list[str]:
     """
     Read user_telegram_settings (configured from the Settings page in app.py) and
-    return every chat_id that should receive this asset's alert.
+    return every chat_id that should receive this asset+timeframe's alert.
 
-    A user receives the alert if alerts_enabled = TRUE AND either:
+    A user receives the alert if alerts_enabled = TRUE AND their selected
+    timeframe(s) (from user_settings.settings_json, e.g. preferred_timeframe)
+    include this signal's timeframe, AND either:
       - all_signals_alerts = TRUE (wants every signal), or
       - watchlist_alerts = TRUE AND this asset is in their saved user_watchlists.
 
-    This closes the gap where the Settings → Telegram tab saved preferences that
-    the scanner never actually read.
+    Without the timeframe check, a user who selected "1h" would also receive
+    15m/4h/1d alerts for any watchlist asset, since the original version only
+    ever matched on asset and ignored timeframe entirely. If a user has no
+    timeframe preference saved, _extract_timeframes_from_settings() already
+    falls back to DEFAULT_USER_TIMEFRAME, so this filter degrades safely.
     """
     sql = """
     SELECT uts.scan_owner, uts.telegram_chat_id, uts.watchlist_alerts, uts.all_signals_alerts
@@ -1701,31 +1720,42 @@ def get_activated_telegram_recipients(asset: str) -> list[str]:
         print(f"[DB] get_activated_telegram_recipients failed: {e}")
         return []
 
+    tf_norm = _normalize_timeframe(timeframe) if timeframe else ""
+    user_prefs = get_user_scan_preferences() if tf_norm else {}
+
     recipients = []
     for row in rows:
+        owner = str(row.get("scan_owner", ""))
+
+        if tf_norm:
+            owner_timeframes = user_prefs.get(owner, {}).get("timeframes") or [DEFAULT_USER_TIMEFRAME]
+            if tf_norm not in owner_timeframes:
+                continue
+
         if row.get("all_signals_alerts"):
             recipients.append(str(row["telegram_chat_id"]))
             continue
         if row.get("watchlist_alerts"):
-            owner_watchlist = load_user_watchlist(str(row.get("scan_owner", "")))
+            owner_watchlist = load_user_watchlist(owner)
             if asset in owner_watchlist:
                 recipients.append(str(row["telegram_chat_id"]))
     return list(dict.fromkeys(recipients))  # de-duplicated, order-preserving
 
 
-def send_telegram(message: str, asset: str = "") -> tuple[bool, str]:
+def send_telegram(message: str, asset: str = "", timeframe: str = "") -> tuple[bool, str]:
     """
     Send an alert to BOTH:
       1. The global TELEGRAM_CHAT_IDS env var (the owner/admin default — always
-         receives everything, unchanged from earlier versions), and
+         receives everything, unchanged from earlier versions, and is NOT
+         filtered by timeframe since it has no per-user preference attached), and
       2. Every per-user chat_id activated in Settings whose routing rules match
-         this asset (see get_activated_telegram_recipients).
+         this asset AND timeframe (see get_activated_telegram_recipients).
 
     Recipients are merged and de-duplicated so nobody gets the same alert twice.
     """
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     global_ids = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_IDS", "").split(",") if c.strip()]
-    user_ids = get_activated_telegram_recipients(asset) if asset else []
+    user_ids = get_activated_telegram_recipients(asset, timeframe) if asset else []
     all_ids = list(dict.fromkeys(global_ids + user_ids))
 
     if not token or not all_ids:
@@ -1996,7 +2026,7 @@ def run_scan() -> None:
 
             if can_alert:
                 message = build_telegram_message(result)
-                ok, info = send_telegram(message, asset)
+                ok, info = send_telegram(message, asset, result.timeframe)
                 if ok:
                     result.alert_sent = True
                     alerted += 1
