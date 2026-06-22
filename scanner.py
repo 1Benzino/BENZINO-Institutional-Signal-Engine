@@ -1398,39 +1398,131 @@ FEATURES = [
 ]
 
 def train_ensemble(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["target"] = (df["Close"].shift(-LOOKAHEAD) > df["Close"]).astype(int)
-    feats = [f for f in FEATURES if f in df.columns]
-    combined = df[feats + ["target"]].replace([np.inf, -np.inf], np.nan).dropna()
+    """Fit the LR/RF/GB ensemble and attach an out-of-sample-safe signal_prob.
 
-    if len(combined) < 120 or not feats:
-        df["signal_prob"] = 0.5
+    Two bugs this fixes versus the original version:
+
+    1. LABEL CORRUPTION: `target = (Close.shift(-LOOKAHEAD) > Close)` produces
+       NaN for the most recent LOOKAHEAD rows, since there is no future close
+       yet to compare against. `NaN > x` evaluates to False in pandas, and
+       `.astype(int)` then silently turns that False into a real 0 — so the
+       most recent LOOKAHEAD rows were being labelled "price did not rise"
+       even though the true outcome is genuinely unknown. Those fabricated
+       labels were being fed into training as if they were real history.
+       Fixed by building the target as a nullable boolean and dropping rows
+       where the future close does not exist, instead of comparing against NaN.
+
+    2. TRAIN/PREDICT LEAKAGE: the original code called model.fit(X, y) and then
+       model.predict_proba(X) on the IDENTICAL rows — including the most
+       recent row, which is the only one strategy_confluence() actually uses
+       live (via .iloc[-1]). Every live signal_prob was therefore an in-sample
+       prediction with no demonstrated out-of-sample skill; it could not be
+       distinguished from memorized noise. Fixed by fitting only on rows whose
+       LOOKAHEAD-bars-forward outcome is already known and fully in the past,
+       then predicting the live row using a model that never saw it.
+
+    A held-out validation slice (most recent ~20% of the resolved rows, before
+    the final live-fit) is also scored honestly and stored in
+    df.attrs["ml_oos_accuracy"] so callers can see whether the ensemble shows
+    real out-of-sample skill (e.g. ~52-58% on noisy financial data is a
+    plausible genuine edge) versus ~50% (no edge) or implausibly high accuracy
+    (usually a sign of leakage or overfitting on a short history) before
+    trusting it in compute_edge_score().
+    """
+    df = df.copy()
+
+    future_close = df["Close"].shift(-LOOKAHEAD)
+    has_future = future_close.notna()
+    df["target"] = pd.Series(np.nan, index=df.index)
+    df.loc[has_future, "target"] = (future_close[has_future] > df.loc[has_future, "Close"]).astype(int)
+
+    feats = [f for f in FEATURES if f in df.columns]
+    # Only rows with a real, resolved target (i.e. LOOKAHEAD bars already
+    # happened) are eligible for training. The most recent LOOKAHEAD rows
+    # (including the live row used for the actual trading decision) are
+    # excluded here on purpose — their true outcome has not happened yet.
+    resolved = df[feats + ["target"]].replace([np.inf, -np.inf], np.nan).dropna()
+
+    df["signal_prob"] = 0.5
+    df.attrs["ml_oos_accuracy"] = None
+    df.attrs["ml_oos_n"] = 0
+
+    if len(resolved) < 150 or not feats:
         return df
 
-    X, y = combined[feats], combined["target"]
-    models = {
-        "lr": Pipeline([("imp", SimpleImputer()), ("sc", StandardScaler()),
-                        ("m", LogisticRegression(C=0.5, max_iter=1000, random_state=42))]),
-        "rf": Pipeline([("imp", SimpleImputer()),
-                        ("m", RandomForestClassifier(n_estimators=150, max_depth=5,
-                                                     min_samples_leaf=10, random_state=42))]),
-        "gb": Pipeline([("imp", SimpleImputer()),
-                        ("m", GradientBoostingClassifier(n_estimators=120, learning_rate=0.05,
-                                                          max_depth=4, min_samples_leaf=10, random_state=42))]),
-    }
+    # Honest out-of-sample check: hold back the most recent 20% of RESOLVED
+    # rows (still strictly before the live row) purely to measure accuracy.
+    # These rows are never used to fit the model that produces the live
+    # signal_prob below — they only answer "does this ensemble show real
+    # skill", reported separately from the live prediction itself.
+    split_idx = int(len(resolved) * 0.8)
+    train_part = resolved.iloc[:split_idx]
+    holdout_part = resolved.iloc[split_idx:]
+
     weights = {"lr": 0.20, "rf": 0.35, "gb": 0.45}
-    proba = {}
-    for name, model in models.items():
+
+    def _fresh_models():
+        return {
+            "lr": Pipeline([("imp", SimpleImputer()), ("sc", StandardScaler()),
+                            ("m", LogisticRegression(C=0.5, max_iter=1000, random_state=42))]),
+            "rf": Pipeline([("imp", SimpleImputer()),
+                            ("m", RandomForestClassifier(n_estimators=150, max_depth=5,
+                                                         min_samples_leaf=10, random_state=42))]),
+            "gb": Pipeline([("imp", SimpleImputer()),
+                            ("m", GradientBoostingClassifier(n_estimators=120, learning_rate=0.05,
+                                                              max_depth=4, min_samples_leaf=10, random_state=42))]),
+        }
+
+    if len(holdout_part) >= 20 and len(train_part) >= 100:
         try:
-            model.fit(X, y)
-            proba[name] = pd.Series(model.predict_proba(X)[:, 1], index=combined.index)
+            oos_models = _fresh_models()
+            oos_proba = {}
+            for name, model in oos_models.items():
+                model.fit(train_part[feats], train_part["target"])
+                oos_proba[name] = model.predict_proba(holdout_part[feats])[:, 1]
+            oos_ens = sum(weights[n] * oos_proba[n] for n in oos_proba)
+            oos_pred = (oos_ens > 0.5).astype(int)
+            df.attrs["ml_oos_accuracy"] = float((oos_pred == holdout_part["target"].values).mean())
+            df.attrs["ml_oos_n"] = int(len(holdout_part))
         except Exception:
-            proba[name] = pd.Series(0.5, index=combined.index)
-    ens = sum(weights[n] * proba[n] for n in proba)
-    df["signal_prob"] = pd.Series(0.5, index=df.index)
-    df.loc[combined.index, "signal_prob"] = ens
-    df["signal_prob"] = df["signal_prob"].fillna(0.5)
+            df.attrs["ml_oos_accuracy"] = None
+            df.attrs["ml_oos_n"] = 0
+
+    # Final live fit: train on EVERY resolved row (train_part + holdout_part —
+    # both are still strictly in the past relative to the live row), then
+    # predict only the live row, which this fit has never seen in any form.
+    live_models = _fresh_models()
+    live_proba = {}
+    for name, model in live_models.items():
+        try:
+            model.fit(resolved[feats], resolved["target"])
+            live_proba[name] = model
+        except Exception:
+            live_proba[name] = None
+
+    live_row = df[feats].iloc[[-1]].replace([np.inf, -np.inf], np.nan)
+    if live_row.isna().any(axis=1).iloc[0]:
+        # Live row has a missing feature (e.g. not enough bars for a rolling
+        # indicator yet) — leave signal_prob at the neutral 0.5 default.
+        return df
+
+    ens_prob = 0.0
+    any_ok = False
+    for name, model in live_proba.items():
+        if model is None:
+            continue
+        try:
+            ens_prob += weights[name] * model.predict_proba(live_row)[:, 1][0]
+            any_ok = True
+        except Exception:
+            continue
+
+    if any_ok:
+        df.loc[df.index[-1], "signal_prob"] = ens_prob
+
     return df
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1521,13 +1613,27 @@ def build_trade_plan(price: float, atr: float, signal: str) -> dict:
     return {"sl": sl, "tp": tp, "size": size, "rr": rr}
 
 
-def compute_edge_score(signal: str, confidence: float, ml_prob: float, rr: float) -> float:
+def compute_edge_score(signal: str, confidence: float, ml_prob: float, rr: float,
+                        ml_oos_accuracy: float | None = None) -> float:
     """Composite edge score.
 
     `confidence` now means system agreement across all active systems, not
     confidence among only the non-neutral voters. Therefore a 1/5 C setup is
     about 20%, while a 5/5 A+ setup is 100%. The ML component remains
     directional: BUY uses ML probability, SELL uses inverse ML probability.
+
+    ml_oos_accuracy comes from train_ensemble()'s honest held-out validation
+    (df.attrs["ml_oos_accuracy"]) — accuracy on rows the final live model
+    never trained on. The ML component's weight is scaled by how far that
+    accuracy sits above a 50% coin flip, clipped to [0, 1]:
+      - None / 50% or below  -> ML contributes ~0 (no demonstrated edge yet,
+        e.g. too little history, or genuinely no skill on this asset/timeframe)
+      - ~58%+                -> ML contributes close to its full normal weight
+      - linearly in between
+    This stops an unvalidated or genuinely unskilled ML ensemble from quietly
+    carrying 30% of every edge score just because a number happened to come
+    out of a model — the weight now has to be earned by out-of-sample accuracy,
+    re-measured fresh on every scan.
     """
     agreement_component = safe_number(confidence, 0.0)
     if signal == "BUY":
@@ -1537,7 +1643,21 @@ def compute_edge_score(signal: str, confidence: float, ml_prob: float, rr: float
     else:
         ml_component = max(0, 50 - abs(safe_number(ml_prob, 0.5) - 0.5) * 100)
     rr_component = min(max(safe_number(rr, 0.0), 0.0) * 10, 35)
-    return float(round(agreement_component * 0.45 + ml_component * 0.30 + rr_component * 0.25, 2))
+
+    if ml_oos_accuracy is None:
+        ml_trust = 0.0
+    else:
+        ml_trust = float(np.clip((safe_number(ml_oos_accuracy, 0.5) - 0.50) / 0.08, 0.0, 1.0))
+
+    ml_weight = 0.30 * ml_trust
+    # Redistribute the ML weight it didn't earn back onto the two strategies
+    # that don't carry this leakage risk, so the total still sums to 1.0
+    # instead of silently shrinking the overall edge score for everyone.
+    freed_weight = 0.30 - ml_weight
+    agreement_weight = 0.45 + freed_weight * 0.6
+    rr_weight = 0.25 + freed_weight * 0.4
+
+    return float(round(agreement_component * agreement_weight + ml_component * ml_weight + rr_component * rr_weight, 2))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1585,12 +1705,15 @@ def scan_asset(asset: str, ticker: str, timeframe: str = "15m") -> ScanResult | 
             0.0,
         )
         grade, grade_reason = grade_signal(confluence, plan["rr"])
-        edge_score = compute_edge_score(signal, confidence, confluence["ml_prob"], plan["rr"])
+        ml_oos_accuracy = df_entry.attrs.get("ml_oos_accuracy")
+        ml_oos_n = df_entry.attrs.get("ml_oos_n", 0)
+        edge_score = compute_edge_score(signal, confidence, confluence["ml_prob"], plan["rr"], ml_oos_accuracy)
         candle_close = str(df_entry["Date"].iloc[-1])
 
         vote_summary = ", ".join(f"{name}:{v['direction'][:4]}({v['strength']:.2f})" for name, v in confluence["votes"].items())
         mtf_summary = "/".join(f"{tf}:{payload.get('direction','NEUT')[:4]}" for tf, payload in mtf_context.items() if isinstance(payload, dict))
-        reason = f"{grade_reason} | {vote_summary} | MTF score {mtf_score:.0f}% ({mtf_summary}) | Regime: {regime} | RSI {rsi:.1f}"
+        ml_oos_label = f"{ml_oos_accuracy:.1%} (n={ml_oos_n})" if ml_oos_accuracy is not None else "unvalidated"
+        reason = f"{grade_reason} | {vote_summary} | MTF score {mtf_score:.0f}% ({mtf_summary}) | Regime: {regime} | RSI {rsi:.1f} | ML OOS acc: {ml_oos_label}"
 
         result = ScanResult(
             asset=asset, ticker=ticker, timeframe=timeframe, signal=signal, grade=grade,
