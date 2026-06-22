@@ -18,11 +18,12 @@ on:
           - "true"
 
       scan_timeframes:
-        description: "Timeframes to scan on manual runs"
+        description: "Timeframes to scan on manual runs ('auto' = apply the same 15m/1h/4h/1d cadence logic as scheduled runs, based on current UTC time)"
         required: true
-        default: "15m"
+        default: "auto"
         type: choice
         options:
+          - "auto"
           - "15m"
           - "1h"
           - "4h"
@@ -63,15 +64,18 @@ jobs:
           echo "schedule=${{ github.event.schedule }}"
           date -u
 
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.scan_timeframes }}" != "auto" ]; then
             SCAN_TF="${{ github.event.inputs.scan_timeframes }}"
             SCHEDULE_LABEL="manual"
           else
-            # Scheduled runs happen every 15 minutes at UTC minutes 02, 17, 32, 47.
-            # 15m scans run every scheduled run.
+            # Scheduled runs, and manual/external (cron-job.org) dispatches with scan_timeframes=auto,
+            # apply the same dynamic cadence based on current UTC time:
+            # 15m scans run every run.
             # 1h scans are added at minute 17 once per hour.
             # 4h scans are added at minute 17 every 4 UTC hours.
             # 1d scans are added at 00:47 UTC once daily.
+            # NOTE: This is minute-exact, which assumes the trigger lands close to :02/:17/:32/:47.
+            # cron-job.org should be scheduled at those same offsets for this to stay accurate.
             MINUTE="$(date -u +%M)"
             HOUR="$(date -u +%H)"
 
@@ -89,7 +93,11 @@ jobs:
               SCAN_TF="${SCAN_TF},1d"
             fi
 
-            SCHEDULE_LABEL="every_15m_dynamic"
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              SCHEDULE_LABEL="auto_dispatch"
+            else
+              SCHEDULE_LABEL="every_15m_dynamic"
+            fi
           fi
 
           echo "SCAN_TIMEFRAMES=$SCAN_TF" >> "$GITHUB_ENV"
