@@ -2067,7 +2067,7 @@ def benzino_aggrid_css() -> dict:
         ".ag-grade-c": {"background": "rgba(255,93,93,.18) !important", "color": "#FF5D5D !important"},
         ".ag-grade-no-trade": {"background": "rgba(137,95,255,.18) !important", "color": "#A98CFF !important"},
         ".ag-status-active": {"background": "rgba(0,212,163,.16) !important", "color": "#00D4A3 !important"},
-        ".ag-status-win": {"background": "rgba(0,212,163,.18) !important", "color": "#00D4A3 !important"},
+        ".ag-status-win": {"background": "rgba(78,196,214,.22) !important", "color": "#4EC4D6 !important"},
         ".ag-status-loss": {"background": "rgba(255,93,93,.18) !important", "color": "#FF5D5D !important"},
         ".ag-status-expired": {"background": "rgba(214,168,78,.18) !important", "color": "#D6A84E !important"},
         ".ag-status-skipped": {"background": "rgba(139,158,176,.16) !important", "color": "#A9BBC9 !important"},
@@ -2520,16 +2520,20 @@ def apply_theme() -> None:
 
     /* Multiselect tags (e.g. Watchlist asset pills): Streamlit's default tag
        colour is a reddish-orange with no Benzino styling applied. Force the
-       same green theme used everywhere else in the app, with white text. */
+       same green theme used everywhere else in the app, with white text.
+       Confirmed via devtools: the real element is a <span data-baseweb="tag">,
+       not a <div> — the earlier div-only selector never matched anything. */
+    span[data-baseweb="tag"],
     div[data-baseweb="tag"] {
         background-color: #00A97F !important;
         border-color: #00D4A3 !important;
         color: #FFFFFF !important;
     }
-    div[data-baseweb="tag"] span,
-    div[data-baseweb="tag"] div {
+    span[data-baseweb="tag"] *,
+    div[data-baseweb="tag"] * {
         color: #FFFFFF !important;
     }
+    span[data-baseweb="tag"] svg,
     div[data-baseweb="tag"] svg {
         fill: #FFFFFF !important;
     }
@@ -3618,7 +3622,7 @@ def render_opportunity_board(username: str, settings: dict) -> None:
                     ".ag-grade-c": {"background": "rgba(255,93,93,.18) !important", "color": "#FF5D5D !important"},
                     ".ag-grade-no-trade": {"background": "rgba(137,95,255,.18) !important", "color": "#A98CFF !important"},
                     ".ag-status-active": {"background": "rgba(0,212,163,.16) !important", "color": "#00D4A3 !important"},
-                    ".ag-status-win": {"background": "rgba(0,212,163,.18) !important", "color": "#00D4A3 !important"},
+                    ".ag-status-win": {"background": "rgba(78,196,214,.22) !important", "color": "#4EC4D6 !important"},
                     ".ag-status-loss": {"background": "rgba(255,93,93,.18) !important", "color": "#FF5D5D !important"},
                     ".ag-status-expired": {"background": "rgba(214,168,78,.18) !important", "color": "#D6A84E !important"},
                     ".ag-status-skipped": {"background": "rgba(139,158,176,.16) !important", "color": "#A9BBC9 !important"},
