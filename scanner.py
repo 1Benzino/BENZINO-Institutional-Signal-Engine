@@ -287,20 +287,6 @@ def build_scan_plan(now: datetime | None = None) -> tuple[dict[str, str], list[s
     ordered_tfs = [tf for tf in ["15m", "1h", "4h", "1d"] if tf in requested_tfs]
     active_tfs = active_timeframes_for_run(now, ordered_tfs)
 
-    # Safety net: check ALL known timeframes against their watermark — not just
-    # the ones SCAN_TIMEFRAMES already requested. If the workflow's minute/hour
-    # check under-requested (e.g. it decided only "15m" this cycle because the
-    # trigger landed at :14 instead of :17), the watermark can still catch a
-    # genuinely overdue 1h/4h/1d and add it back in. This protects against
-    # scheduling drift (cron-job.org or GitHub Actions firing early/late, or
-    # skipping a cycle) silently causing an entire window to be missed.
-    all_known_tfs = ["15m", "1h", "4h", "1d"]
-    overdue_tfs = overdue_timeframes_by_watermark(now, all_known_tfs)
-    added_back = [tf for tf in overdue_tfs if tf not in active_tfs]
-    if added_back:
-        print(f"[Watermark] Adding overdue timeframe(s) back into this run: {', '.join(added_back)}")
-        active_tfs = [tf for tf in all_known_tfs if tf in active_tfs or tf in overdue_tfs]
-
     mode = "MASTER_SCHEDULED"
     if FORCE_FULL_SCAN:
         mode = "MASTER_MANUAL_FULL"
@@ -421,119 +407,6 @@ def active_timeframes_for_run(now: datetime | None = None, requested_timeframes:
 
     # No scheduled scans. If no configured timeframe is due, skip scanner work.
     return active
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Drift-tolerant scheduling via persisted watermarks.
-#
-# The GitHub Actions workflow (or an external trigger like cron-job.org)
-# decides SCAN_TIMEFRAMES based on the wall-clock minute/hour at trigger time.
-# If the trigger fires a few minutes early/late or is skipped entirely for a
-# cycle, an exact-minute check (e.g. "minute == 17") can silently miss a 1h,
-# 4h, or 1d window for an entire cycle with no error.
-#
-# This safety net tracks the last time each timeframe was actually scanned in
-# timeframe_watermarks. Regardless of what minute the workflow thinks it is,
-# any timeframe whose watermark is older than its expected cadence (with a
-# small grace period) is added back into the active set. This makes scanner.py
-# self-correcting against scheduling drift, missed runs, or GitHub Actions
-# delays — the watermark, not the clock, is the source of truth for "is this
-# timeframe overdue".
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Expected cadence per timeframe, in minutes. Used only to detect "overdue",
-# not to decide exact scan times.
-TIMEFRAME_CADENCE_MINUTES = {
-    "15m": 15,
-    "1h": 60,
-    "4h": 240,
-    "1d": 1440,
-}
-
-# Extra grace period added on top of the expected cadence before a timeframe
-# is considered overdue. Covers normal trigger jitter (a minute or two early)
-# without constantly re-triggering 1h/4h/1d scans every cycle.
-WATERMARK_GRACE_MINUTES = int(os.environ.get("WATERMARK_GRACE_MINUTES", "5"))
-
-
-def get_timeframe_watermarks() -> dict[str, datetime]:
-    """Return {timeframe: last_scanned_at} for every timeframe with a row.
-
-    Missing rows (never scanned, or table just created) are simply absent
-    from the returned dict — callers should treat an absent timeframe as
-    "overdue" so a fresh deployment scans everything on its first run.
-    """
-    try:
-        conn = db_connect()
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT timeframe, last_scanned_at FROM timeframe_watermarks")
-                rows = cur.fetchall()
-        conn.close()
-        out: dict[str, datetime] = {}
-        for row in rows:
-            ts = row["last_scanned_at"]
-            if ts is not None:
-                out[row["timeframe"]] = ts
-        return out
-    except Exception as e:
-        print(f"[Watermark] get_timeframe_watermarks failed: {e}")
-        return {}
-
-
-def update_timeframe_watermarks(timeframes: list[str], when: datetime | None = None) -> None:
-    """Record that each timeframe in `timeframes` was scanned at `when` (default now)."""
-    if not timeframes:
-        return
-    when = when or datetime.now(timezone.utc)
-    try:
-        conn = db_connect()
-        with conn:
-            with conn.cursor() as cur:
-                for tf in timeframes:
-                    cur.execute(
-                        """
-                        INSERT INTO timeframe_watermarks (timeframe, last_scanned_at)
-                        VALUES (%s, %s)
-                        ON CONFLICT (timeframe) DO UPDATE
-                            SET last_scanned_at = EXCLUDED.last_scanned_at
-                        """,
-                        (tf, when.isoformat()),
-                    )
-        conn.close()
-        print(f"[Watermark] Updated last_scanned_at for: {', '.join(timeframes)}")
-    except Exception as e:
-        print(f"[Watermark] update_timeframe_watermarks failed: {e}")
-
-
-def overdue_timeframes_by_watermark(now: datetime | None = None,
-                                     candidate_timeframes: list[str] | None = None) -> list[str]:
-    """Return timeframes from candidate_timeframes that are overdue per their watermark.
-
-    A timeframe is overdue if it has never been scanned, or if more time has
-    elapsed since its last_scanned_at than its expected cadence plus a grace
-    period. This is independent of the current minute/hour — it only cares
-    about elapsed wall-clock time since the last successful scan of that
-    timeframe, so it self-corrects regardless of trigger jitter or missed runs.
-    """
-    now = now or datetime.now(timezone.utc)
-    candidates = [tf for tf in (candidate_timeframes or list(TIMEFRAME_CADENCE_MINUTES)) if tf in TIMEFRAME_CADENCE_MINUTES]
-    watermarks = get_timeframe_watermarks()
-
-    overdue: list[str] = []
-    for tf in candidates:
-        cadence = TIMEFRAME_CADENCE_MINUTES[tf]
-        last_scanned = watermarks.get(tf)
-
-        if last_scanned is None:
-            overdue.append(tf)
-            continue
-
-        elapsed_minutes = (now - last_scanned).total_seconds() / 60.0
-        if elapsed_minutes >= (cadence + WATERMARK_GRACE_MINUTES):
-            overdue.append(tf)
-
-    return overdue
 
 # Legacy aliases retained for older helper code and Telegram text.
 ENTRY_INTERVAL, ENTRY_PERIOD = "15m", "60d"
@@ -726,11 +599,6 @@ def init_tables() -> None:
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_prop_firm_trades_signal_id
         ON prop_firm_trades (signal_id);
-
-    CREATE TABLE IF NOT EXISTS timeframe_watermarks (
-        timeframe       TEXT PRIMARY KEY,
-        last_scanned_at TIMESTAMPTZ
-    );
     """
     try:
         conn = db_connect()
@@ -744,6 +612,7 @@ def init_tables() -> None:
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_exit_price NUMERIC")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_closed_at TIMESTAMPTZ")
                 cur.execute("ALTER TABLE user_telegram_settings ADD COLUMN IF NOT EXISTS alerts_enabled BOOLEAN DEFAULT FALSE")
+                cur.execute("ALTER TABLE user_telegram_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()")
                 cur.execute("ALTER TABLE scanner_runtime_log ADD COLUMN IF NOT EXISTS open_trades INTEGER DEFAULT 0")
                 cur.execute("ALTER TABLE scanner_runtime_log ADD COLUMN IF NOT EXISTS alerted INTEGER DEFAULT 0")
                 # Migration/fix: a journaled A+/A/B/C BUY/SELL setup must be OPEN even when Telegram is disabled.
@@ -2145,12 +2014,6 @@ def run_scan() -> None:
     force_open_graded_setups()
     state = load_prop_firm_state()
     finished = datetime.now(timezone.utc)
-
-    # Record that these timeframes were actually scanned, so future runs can
-    # detect overdue timeframes by elapsed time rather than relying on the
-    # workflow having fired at an exact minute.
-    update_timeframe_watermarks(active_tfs, when=finished)
-
     elapsed = (finished - started).total_seconds()
     print(f"\n{'='*70}")
     print(f"  Scan complete in {elapsed:.1f}s")

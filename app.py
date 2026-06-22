@@ -350,6 +350,7 @@ def init_tables() -> None:
                 cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user'")
                 cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT")
                 cur.execute("ALTER TABLE user_telegram_settings ADD COLUMN IF NOT EXISTS alerts_enabled BOOLEAN DEFAULT FALSE")
+                cur.execute("ALTER TABLE user_telegram_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()")
                 # Admin policy: the earliest account becomes the only admin.
                 # Every later profile remains a normal user, regardless of username.
                 cur.execute("""
@@ -737,18 +738,6 @@ def render_auth_gate() -> None:
             overflow: hidden !important;
         }
         header, [data-testid="stToolbar"], [data-testid="stSidebar"], [data-testid="collapsedControl"] { display:none !important; }
-
-        /* Suppress Streamlit's native dim/fade-on-rerun overlay on the login
-           page too — same reasoning as apply_theme(). Without this, typing a
-           username/password and submitting visibly dims the whole screen on
-           every st.rerun(), separately from our own benzino-signin-loading
-           spinner below. */
-        [data-testid="stStatusWidget"] { display: none !important; }
-        [data-testid="stDecoration"] { display: none !important; }
-        .stApp[data-stale="true"] { opacity: 1 !important; transition: none !important; }
-        [data-testid="stAppViewContainer"] { opacity: 1 !important; transition: none !important; }
-        [data-testid="stMain"] { opacity: 1 !important; transition: none !important; }
-        .main { opacity: 1 !important; transition: none !important; }
         [data-testid="stAppViewContainer"] > .main, section.main {
             margin-left:0 !important;
             height:100vh !important;
@@ -2243,22 +2232,6 @@ def apply_theme() -> None:
     st.set_page_config(page_title="Benzino ISE", page_icon="📡", layout="wide")
     st.markdown("""
     <style>
-
-    /* ── Suppress Streamlit's native "app is busy" dim/fade overlay ──────────
-       By default, Streamlit fades the main view and shows a top progress bar
-       and a small running-status widget every time the script reruns (page
-       nav, button clicks, st.rerun()). That default behaviour is what causes
-       the screen to visibly dim on every navigation/login click. We disable
-       it here and rely on our own explicit st.spinner(...) calls instead,
-       which already cover the moments that need user feedback (login,
-       Supabase refreshes, etc.). This does not affect actual data loading —
-       it only removes the default greyed-out visual treatment. */
-    [data-testid="stStatusWidget"] { display: none !important; }
-    [data-testid="stDecoration"] { display: none !important; }
-    .stApp[data-stale="true"] { opacity: 1 !important; transition: none !important; }
-    [data-testid="stAppViewContainer"] { opacity: 1 !important; transition: none !important; }
-    [data-testid="stMain"] { opacity: 1 !important; transition: none !important; }
-    .main { opacity: 1 !important; transition: none !important; }
 
     :root {
         --font-page-title: 42px;
