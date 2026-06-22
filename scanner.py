@@ -1,7 +1,7 @@
 """
 scanner.py — Benzino Institutional-Grade Autonomous Signal Engine
 ═══════════════════════════════════════════════════════════════════════════════
-Runs standalone (no Streamlit) on a 5-minute GitHub Actions cron.
+Runs standalone (no Streamlit) on a 15-minute GitHub Actions cron.
 
 STRATEGY ENGINE — four independent, literature-backed systems vote on direction:
   1. Time-Series Momentum      Moskowitz, Ooi & Pedersen (2012) — AQR / JFE
@@ -12,7 +12,7 @@ STRATEGY ENGINE — four independent, literature-backed systems vote on directio
 Signals are graded A+/A/B/C/NO TRADE by strategy CONFLUENCE, not a single metric.
 
 INSTITUTIONAL BEHAVIOUR:
-  - Runs every 5 minutes regardless of who is logged into the Streamlit app.
+  - Runs every 15 minutes regardless of who is logged into the Streamlit app.
   - Every grade (A+, A, B, C) is auto-journaled. NO TRADE signals are shadow-
     tracked (saved, never alerted) so the research panel can study what was
     filtered out.
@@ -250,67 +250,61 @@ def get_user_scan_preferences() -> dict[str, dict]:
 
 
 def should_run_full_universe(now: datetime | None = None) -> bool:
-    """Return True when a broad research scan should run.
+    """Backward-compatible helper retained for older code paths.
 
-    Scheduled 5-minute cron runs stay fast and use user watchlists. Manual
-    GitHub workflow runs can pass FORCE_FULL_SCAN=true to scan the complete
-    MASTER_WATCHLIST without changing normal production cadence.
+    Production scanner runs now scan the full MASTER_WATCHLIST every time.
+    The GitHub schedule controls which timeframe group is scanned.
+    The Streamlit app controls which saved scanner rows each user sees.
     """
-    if FORCE_FULL_SCAN:
-        return True
-    if FULL_UNIVERSE_SCAN_EVERY_HOURS <= 0:
-        return False
-    now = now or datetime.now(timezone.utc)
-    return now.minute < max(5, SLOW_TIMEFRAME_WINDOW_MINUTES) and (now.hour % FULL_UNIVERSE_SCAN_EVERY_HOURS == 0)
+    return True
 
 
 def build_scan_plan(now: datetime | None = None) -> tuple[dict[str, str], list[str], str]:
-    """Build the smallest useful scan universe from active user watchlists.
+    """Build the production scan plan.
 
-    The scanner scans each unique asset/timeframe once, regardless of how many
-    users follow it. User-specific dashboard filtering still happens in app.py.
+    Asset universe:
+        Always scan the full MASTER_WATCHLIST.
+
+    Timeframe universe:
+        Controlled by SCAN_TIMEFRAMES from GitHub Actions:
+          - 15m every 15 minutes
+          - 1h every hour
+          - 4h every 4 hours
+          - 1d once daily
+
+    User watchlists:
+        Do NOT control scanner coverage. They only filter what each user sees
+        in app.py after login, and optionally route per-user Telegram alerts.
     """
     now = now or datetime.now(timezone.utc)
-    user_watchlists = get_all_user_watchlists()
-    user_prefs = get_user_scan_preferences()
 
-    assets: dict[str, str] = {}
-    requested_tfs: set[str] = set()
-
-    for username, watchlist in user_watchlists.items():
-        if not watchlist:
-            continue
-        for asset, ticker in watchlist.items():
-            if asset in MASTER_WATCHLIST:
-                assets[asset] = ticker or MASTER_WATCHLIST[asset]
-        pref = user_prefs.get(username, {})
-        for tf in pref.get("timeframes", [DEFAULT_USER_TIMEFRAME]):
-            if tf in TIMEFRAME_CONFIGS:
-                requested_tfs.add(tf)
+    assets: dict[str, str] = dict(MASTER_WATCHLIST)
+    requested_tfs: set[str] = set(SCAN_TIMEFRAMES)
 
     if not requested_tfs:
         requested_tfs.add(DEFAULT_USER_TIMEFRAME)
 
-    mode = "USER_FAST"
-    if should_run_full_universe(now):
-        assets = dict(MASTER_WATCHLIST)
-        requested_tfs = set(SCAN_TIMEFRAMES)
-        mode = "FORCED_FULL_UNIVERSE" if FORCE_FULL_SCAN else "FULL_UNIVERSE"
-    elif not assets:
-        if SCAN_MASTER_WATCHLIST_FALLBACK:
-            assets = dict(MASTER_WATCHLIST)
-            requested_tfs = {DEFAULT_USER_TIMEFRAME}
-            mode = "MASTER_FALLBACK"
-        else:
-            # No users/watchlists yet. Do a tiny heartbeat scan so runtime logging
-            # works, but do not burn 28 minutes scanning the whole universe.
-            fallback_assets = {"XAUUSD": MASTER_WATCHLIST["XAUUSD"]}
-            assets = fallback_assets
-            requested_tfs = {DEFAULT_USER_TIMEFRAME}
-            mode = "NO_USERS_HEARTBEAT"
-
     ordered_tfs = [tf for tf in ["15m", "1h", "4h", "1d"] if tf in requested_tfs]
     active_tfs = active_timeframes_for_run(now, ordered_tfs)
+
+    # Safety net: check ALL known timeframes against their watermark — not just
+    # the ones SCAN_TIMEFRAMES already requested. If the workflow's minute/hour
+    # check under-requested (e.g. it decided only "15m" this cycle because the
+    # trigger landed at :14 instead of :17), the watermark can still catch a
+    # genuinely overdue 1h/4h/1d and add it back in. This protects against
+    # scheduling drift (cron-job.org or GitHub Actions firing early/late, or
+    # skipping a cycle) silently causing an entire window to be missed.
+    all_known_tfs = ["15m", "1h", "4h", "1d"]
+    overdue_tfs = overdue_timeframes_by_watermark(now, all_known_tfs)
+    added_back = [tf for tf in overdue_tfs if tf not in active_tfs]
+    if added_back:
+        print(f"[Watermark] Adding overdue timeframe(s) back into this run: {', '.join(added_back)}")
+        active_tfs = [tf for tf in all_known_tfs if tf in active_tfs or tf in overdue_tfs]
+
+    mode = "MASTER_SCHEDULED"
+    if FORCE_FULL_SCAN:
+        mode = "MASTER_MANUAL_FULL"
+
     return assets, active_tfs, mode
 
 
@@ -331,13 +325,49 @@ SCAN_TIMEFRAMES = [tf.strip().lower() for tf in os.environ.get("SCAN_TIMEFRAMES"
 if not SCAN_TIMEFRAMES:
     SCAN_TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 
-# Fast-mode optimisation. By default the scanner only scans assets/timeframes
-# selected by active Streamlit users. This keeps the 5-minute cron realistic.
-# Set FORCE_FULL_SCAN=true for a manual GitHub Actions run that scans the full
-# master universe. Scheduled cron runs should keep this false.
-# Set SCAN_MASTER_WATCHLIST_FALLBACK=true to scan the full universe when no user
-# watchlists exist yet. Set FULL_UNIVERSE_SCAN_EVERY_HOURS to a positive number
-# if you also want an occasional broad research sweep.
+SCHEDULE_CRON = os.environ.get("SCHEDULE_CRON", "").strip()
+SCHEDULED_TIMEFRAME_CRONS = {
+    # Legacy multi-cron workflow labels.
+    "2,17,32,47 * * * *": ["15m"],
+    "7 * * * *": ["1h"],
+    "17 */4 * * *": ["4h"],
+    "37 0 * * *": ["1d"],
+
+    # New single-cron workflow labels.
+    # The workflow runs every 15 minutes and passes the exact comma-separated
+    # SCAN_TIMEFRAMES for that run, for example:
+    #   15m
+    #   15m,1h
+    #   15m,1h,4h
+    #   15m,1d
+    "every_15m_dynamic": ["15m", "1h", "4h", "1d"],
+
+    # Manual workflow_dispatch should also trust the selected input exactly.
+    "manual": ["15m", "1h", "4h", "1d"],
+}
+
+
+def is_schedule_controlled_run() -> bool:
+    """True when GitHub Actions has already selected the exact timeframe set.
+
+    In the new workflow, GitHub runs one schedule every 15 minutes and writes
+    SCAN_TIMEFRAMES into the environment before scanner.py starts. When that
+    happens, scanner.py must trust the workflow and must not apply its old
+    runtime optimiser, otherwise a valid 1h scan at minute 17 could be skipped
+    because it is not near minute 00.
+
+    This also keeps manual workflow_dispatch runs predictable: if the user
+    manually selects 4h, scanner.py scans 4h immediately instead of waiting for
+    the next 4-hour candle window.
+    """
+    label = str(SCHEDULE_CRON or "").strip()
+    return bool(label) and (label in SCHEDULED_TIMEFRAME_CRONS or label.startswith("every_15m"))
+
+
+# Production scan policy: every run scans the full MASTER_WATCHLIST.
+# GitHub Actions controls the timeframe group through SCAN_TIMEFRAMES.
+# User watchlists only filter the Streamlit dashboard and per-user Telegram routing.
+# The legacy flags below are retained so existing secrets/workflows do not break.
 FORCE_FULL_SCAN = os.environ.get("FORCE_FULL_SCAN", "false").strip().lower() in {"1", "true", "yes", "y"}
 SCAN_MASTER_WATCHLIST_FALLBACK = os.environ.get("SCAN_MASTER_WATCHLIST_FALLBACK", "false").strip().lower() in {"1", "true", "yes", "y"}
 FULL_UNIVERSE_SCAN_EVERY_HOURS = int(os.environ.get("FULL_UNIVERSE_SCAN_EVERY_HOURS", "0"))
@@ -366,7 +396,9 @@ def active_timeframes_for_run(now: datetime | None = None, requested_timeframes:
     if not configured:
         configured = [DEFAULT_USER_TIMEFRAME]
 
-    if SCAN_ALL_TIMEFRAMES_EVERY_RUN:
+    if SCAN_ALL_TIMEFRAMES_EVERY_RUN or is_schedule_controlled_run():
+        # GitHub Actions or a manual dispatch has already selected the intended
+        # timeframe list through SCAN_TIMEFRAMES. Return it exactly as received.
         return configured
 
     now = now or datetime.now(timezone.utc)
@@ -387,12 +419,121 @@ def active_timeframes_for_run(now: datetime | None = None, requested_timeframes:
             if now.hour == 0 and now.minute < minute_window:
                 active.append(tf)
 
-    # If none are due, run the fastest selected timeframe as a heartbeat so the
-    # scanner still evaluates nearby trades and logs runtime health.
-    if not active:
-        priority = ["15m", "1h", "4h", "1d"]
-        active.append(next((tf for tf in priority if tf in configured), configured[0]))
+    # No scheduled scans. If no configured timeframe is due, skip scanner work.
     return active
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Drift-tolerant scheduling via persisted watermarks.
+#
+# The GitHub Actions workflow (or an external trigger like cron-job.org)
+# decides SCAN_TIMEFRAMES based on the wall-clock minute/hour at trigger time.
+# If the trigger fires a few minutes early/late or is skipped entirely for a
+# cycle, an exact-minute check (e.g. "minute == 17") can silently miss a 1h,
+# 4h, or 1d window for an entire cycle with no error.
+#
+# This safety net tracks the last time each timeframe was actually scanned in
+# timeframe_watermarks. Regardless of what minute the workflow thinks it is,
+# any timeframe whose watermark is older than its expected cadence (with a
+# small grace period) is added back into the active set. This makes scanner.py
+# self-correcting against scheduling drift, missed runs, or GitHub Actions
+# delays — the watermark, not the clock, is the source of truth for "is this
+# timeframe overdue".
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Expected cadence per timeframe, in minutes. Used only to detect "overdue",
+# not to decide exact scan times.
+TIMEFRAME_CADENCE_MINUTES = {
+    "15m": 15,
+    "1h": 60,
+    "4h": 240,
+    "1d": 1440,
+}
+
+# Extra grace period added on top of the expected cadence before a timeframe
+# is considered overdue. Covers normal trigger jitter (a minute or two early)
+# without constantly re-triggering 1h/4h/1d scans every cycle.
+WATERMARK_GRACE_MINUTES = int(os.environ.get("WATERMARK_GRACE_MINUTES", "5"))
+
+
+def get_timeframe_watermarks() -> dict[str, datetime]:
+    """Return {timeframe: last_scanned_at} for every timeframe with a row.
+
+    Missing rows (never scanned, or table just created) are simply absent
+    from the returned dict — callers should treat an absent timeframe as
+    "overdue" so a fresh deployment scans everything on its first run.
+    """
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT timeframe, last_scanned_at FROM timeframe_watermarks")
+                rows = cur.fetchall()
+        conn.close()
+        out: dict[str, datetime] = {}
+        for row in rows:
+            ts = row["last_scanned_at"]
+            if ts is not None:
+                out[row["timeframe"]] = ts
+        return out
+    except Exception as e:
+        print(f"[Watermark] get_timeframe_watermarks failed: {e}")
+        return {}
+
+
+def update_timeframe_watermarks(timeframes: list[str], when: datetime | None = None) -> None:
+    """Record that each timeframe in `timeframes` was scanned at `when` (default now)."""
+    if not timeframes:
+        return
+    when = when or datetime.now(timezone.utc)
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                for tf in timeframes:
+                    cur.execute(
+                        """
+                        INSERT INTO timeframe_watermarks (timeframe, last_scanned_at)
+                        VALUES (%s, %s)
+                        ON CONFLICT (timeframe) DO UPDATE
+                            SET last_scanned_at = EXCLUDED.last_scanned_at
+                        """,
+                        (tf, when.isoformat()),
+                    )
+        conn.close()
+        print(f"[Watermark] Updated last_scanned_at for: {', '.join(timeframes)}")
+    except Exception as e:
+        print(f"[Watermark] update_timeframe_watermarks failed: {e}")
+
+
+def overdue_timeframes_by_watermark(now: datetime | None = None,
+                                     candidate_timeframes: list[str] | None = None) -> list[str]:
+    """Return timeframes from candidate_timeframes that are overdue per their watermark.
+
+    A timeframe is overdue if it has never been scanned, or if more time has
+    elapsed since its last_scanned_at than its expected cadence plus a grace
+    period. This is independent of the current minute/hour — it only cares
+    about elapsed wall-clock time since the last successful scan of that
+    timeframe, so it self-corrects regardless of trigger jitter or missed runs.
+    """
+    now = now or datetime.now(timezone.utc)
+    candidates = [tf for tf in (candidate_timeframes or list(TIMEFRAME_CADENCE_MINUTES)) if tf in TIMEFRAME_CADENCE_MINUTES]
+    watermarks = get_timeframe_watermarks()
+
+    overdue: list[str] = []
+    for tf in candidates:
+        cadence = TIMEFRAME_CADENCE_MINUTES[tf]
+        last_scanned = watermarks.get(tf)
+
+        if last_scanned is None:
+            overdue.append(tf)
+            continue
+
+        elapsed_minutes = (now - last_scanned).total_seconds() / 60.0
+        if elapsed_minutes >= (cadence + WATERMARK_GRACE_MINUTES):
+            overdue.append(tf)
+
+    return overdue
 
 # Legacy aliases retained for older helper code and Telegram text.
 ENTRY_INTERVAL, ENTRY_PERIOD = "15m", "60d"
@@ -516,7 +657,11 @@ def init_tables() -> None:
         exit_price     NUMERIC,
         exit_reason    TEXT,
         exit_at        TIMESTAMPTZ,
-        r_multiple     NUMERIC
+        r_multiple     NUMERIC,
+        shadow_outcome     TEXT,
+        shadow_r_multiple  NUMERIC,
+        shadow_exit_price  NUMERIC,
+        shadow_closed_at   TIMESTAMPTZ
     );
     CREATE INDEX IF NOT EXISTS idx_scanner_asset_tf_signal_candle
         ON scanner_signals (asset, timeframe, signal, candle_close);
@@ -581,6 +726,11 @@ def init_tables() -> None:
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_prop_firm_trades_signal_id
         ON prop_firm_trades (signal_id);
+
+    CREATE TABLE IF NOT EXISTS timeframe_watermarks (
+        timeframe       TEXT PRIMARY KEY,
+        last_scanned_at TIMESTAMPTZ
+    );
     """
     try:
         conn = db_connect()
@@ -589,6 +739,11 @@ def init_tables() -> None:
                 cur.execute(ddl)
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS mtf_score NUMERIC")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS mtf_context JSONB")
+                cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_outcome TEXT")
+                cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_r_multiple NUMERIC")
+                cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_exit_price NUMERIC")
+                cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_closed_at TIMESTAMPTZ")
+                cur.execute("ALTER TABLE user_telegram_settings ADD COLUMN IF NOT EXISTS alerts_enabled BOOLEAN DEFAULT FALSE")
                 cur.execute("ALTER TABLE scanner_runtime_log ADD COLUMN IF NOT EXISTS open_trades INTEGER DEFAULT 0")
                 cur.execute("ALTER TABLE scanner_runtime_log ADD COLUMN IF NOT EXISTS alerted INTEGER DEFAULT 0")
                 # Migration/fix: a journaled A+/A/B/C BUY/SELL setup must be OPEN even when Telegram is disabled.
@@ -745,7 +900,7 @@ def duplicate_setup_exists(asset: str, timeframe: str, signal: str, candle_close
     True setup duplicate definition: same asset + timeframe + signal + candle close
     already exists in Supabase. This is independent of Telegram.
 
-    This prevents the 5-minute scanner from opening/saving the same 15-minute
+    This prevents the scheduled scanner from opening/saving the same 15-minute
     candle setup multiple times when Telegram is disabled or optional.
     """
     sql = """
@@ -837,6 +992,62 @@ def fetch_open_trades(assets: set[str] | None = None, timeframes: set[str] | Non
     except Exception as e:
         print(f"[DB] fetch_open_trades failed: {e}")
         return []
+
+
+def fetch_unresolved_shadow_trades(assets: set[str] | None = None, timeframes: set[str] | None = None,
+                                   max_age_days: int = 14) -> list[dict]:
+    """
+    NO TRADE signals are never alerted and never touch the prop ledger, but they
+    ARE still worth tracking hypothetically: "if a trader had taken this blocked
+    idea anyway, would it have won?" This is shadow research only — it must never
+    influence the real journal win rate.
+    """
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            sql = """
+                SELECT * FROM scanner_signals
+                WHERE status = 'SHADOW'
+                  AND shadow_outcome IS NULL
+                  AND signal IN ('BUY', 'SELL')
+                  AND created_at >= NOW() - INTERVAL '%s days'
+            """
+            params: list = [max_age_days]
+            if assets:
+                sql += " AND asset = ANY(%s)"
+                params.append(list(assets))
+            if timeframes:
+                sql += " AND timeframe = ANY(%s)"
+                params.append(list(timeframes))
+            sql += " ORDER BY created_at ASC LIMIT 500"
+            cur.execute(sql, tuple(params))
+            rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        print(f"[DB] fetch_unresolved_shadow_trades failed: {e}")
+        return []
+
+
+def close_shadow_trade(signal_id: str, exit_price: float, outcome: str, r_multiple: float) -> None:
+    """
+    Resolve a NO TRADE shadow row's hypothetical outcome. This NEVER changes
+    `status` (it stays 'SHADOW' forever — it was never a real trade) and NEVER
+    touches the prop-firm ledger. It only fills in shadow_* research columns.
+    """
+    sql = """
+    UPDATE scanner_signals
+    SET shadow_outcome = %s, shadow_r_multiple = %s, shadow_exit_price = %s, shadow_closed_at = NOW()
+    WHERE signal_id = %s;
+    """
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (outcome, r_multiple, exit_price, signal_id))
+        conn.close()
+    except Exception as e:
+        print(f"[DB] close_shadow_trade failed: {e}")
 
 
 # ── Prop firm ledger — A+/A trades only ───────────────────────────────────────
@@ -1575,12 +1786,12 @@ RSI: {sig.rsi:.1f}
 """.strip()
 
 
-def send_telegram(message: str) -> tuple[bool, str]:
+def send_telegram_to(message: str, chat_ids: list[str]) -> tuple[bool, str]:
+    """Send one message to an explicit list of chat IDs."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    ids   = os.environ.get("TELEGRAM_CHAT_IDS", "").strip()
-    if not token or not ids:
-        return False, "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_IDS not set."
-    chat_ids = [c.strip() for c in ids.split(",") if c.strip()]
+    chat_ids = [str(c).strip() for c in chat_ids if str(c).strip()]
+    if not token or not chat_ids:
+        return False, "No bot token or no recipients."
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     sent, errors = 0, []
     for chat_id in chat_ids:
@@ -1590,7 +1801,67 @@ def send_telegram(message: str) -> tuple[bool, str]:
             else: errors.append(f"{chat_id}: HTTP {resp.status_code}")
         except Exception as e:
             errors.append(f"{chat_id}: {e}")
-    return (True, f"Sent to {sent} recipient(s).") if sent else (False, "; ".join(errors))
+    return (True, f"Sent to {sent}/{len(chat_ids)} recipient(s).") if sent else (False, "; ".join(errors))
+
+
+def get_activated_telegram_recipients(asset: str) -> list[str]:
+    """
+    Read user_telegram_settings (configured from the Settings page in app.py) and
+    return every chat_id that should receive this asset's alert.
+
+    A user receives the alert if alerts_enabled = TRUE AND either:
+      - all_signals_alerts = TRUE (wants every signal), or
+      - watchlist_alerts = TRUE AND this asset is in their saved user_watchlists.
+
+    This closes the gap where the Settings → Telegram tab saved preferences that
+    the scanner never actually read.
+    """
+    sql = """
+    SELECT uts.scan_owner, uts.telegram_chat_id, uts.watchlist_alerts, uts.all_signals_alerts
+    FROM user_telegram_settings uts
+    WHERE uts.alerts_enabled = TRUE
+      AND COALESCE(uts.telegram_chat_id, '') <> ''
+    """
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    except Exception as e:
+        print(f"[DB] get_activated_telegram_recipients failed: {e}")
+        return []
+
+    recipients = []
+    for row in rows:
+        if row.get("all_signals_alerts"):
+            recipients.append(str(row["telegram_chat_id"]))
+            continue
+        if row.get("watchlist_alerts"):
+            owner_watchlist = load_user_watchlist(str(row.get("scan_owner", "")))
+            if asset in owner_watchlist:
+                recipients.append(str(row["telegram_chat_id"]))
+    return list(dict.fromkeys(recipients))  # de-duplicated, order-preserving
+
+
+def send_telegram(message: str, asset: str = "") -> tuple[bool, str]:
+    """
+    Send an alert to BOTH:
+      1. The global TELEGRAM_CHAT_IDS env var (the owner/admin default — always
+         receives everything, unchanged from earlier versions), and
+      2. Every per-user chat_id activated in Settings whose routing rules match
+         this asset (see get_activated_telegram_recipients).
+
+    Recipients are merged and de-duplicated so nobody gets the same alert twice.
+    """
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    global_ids = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_IDS", "").split(",") if c.strip()]
+    user_ids = get_activated_telegram_recipients(asset) if asset else []
+    all_ids = list(dict.fromkeys(global_ids + user_ids))
+
+    if not token or not all_ids:
+        return False, "TELEGRAM_BOT_TOKEN not set or no recipients (global + per-user) configured."
+    return send_telegram_to(message, all_ids)
 
 
 def telegram_configured() -> bool:
@@ -1602,7 +1873,21 @@ def telegram_configured() -> bool:
     """
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     ids = os.environ.get("TELEGRAM_CHAT_IDS", "").strip()
-    return bool(token and ids)
+    if token and ids:
+        return True
+    # Telegram can also be "configured" purely through per-user activation in
+    # Settings, with no global TELEGRAM_CHAT_IDS secret set at all.
+    if token:
+        try:
+            conn = db_connect()
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM user_telegram_settings WHERE alerts_enabled = TRUE LIMIT 1")
+                row = cur.fetchone()
+            conn.close()
+            return row is not None
+        except Exception:
+            return False
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1683,6 +1968,81 @@ def evaluate_open_trades(assets: set[str] | None = None, timeframes: set[str] | 
             bump_bars_open(signal_id, bars_open)
 
 
+def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] | None = None) -> int:
+    """
+    Hypothetically resolve NO TRADE (shadow) signals using the exact same
+    TP/SL/expiry logic as real trades, but writing only to shadow_* columns.
+    Returns the number of shadow rows resolved this run.
+
+    This is what lets the dashboard show "if you had taken every blocked idea,
+    your hypothetical win rate would have been X%" — clearly separate from the
+    real journal win rate, which only ever counts A+/A/B/C trades.
+    """
+    shadow_trades = fetch_unresolved_shadow_trades(assets=assets, timeframes=timeframes)
+    if not shadow_trades:
+        print("[Shadow] No unresolved NO TRADE rows to evaluate.")
+        return 0
+
+    print(f"[Shadow] Checking {len(shadow_trades)} unresolved NO TRADE row(s)...")
+    resolved = 0
+    for t in shadow_trades:
+        asset, ticker, timeframe = t["asset"], t["ticker"], t["timeframe"]
+        signal, entry, sl, tp = t["signal"], float(t["entry"]), float(t["sl"]), float(t["tp"])
+        signal_id = t["signal_id"]
+
+        if abs(entry - sl) <= 0 or sl == tp:
+            continue  # no usable hypothetical trade plan was ever built for this row
+
+        df = get_timeframe_df(ticker, timeframe)
+        if df is None:
+            continue
+
+        created = pd.to_datetime(t["created_at"], utc=True)
+        df["Date"] = pd.to_datetime(df["Date"], utc=True)
+        new_bars = df[df["Date"] > created]
+        if new_bars.empty:
+            continue
+
+        bars_open = int(t.get("bars_open") or 0)
+        expiry_bars = int(TIMEFRAME_CONFIGS.get(str(timeframe).lower(), {}).get("expiry_bars", EXPIRY_BARS))
+        closed = False
+
+        for _, bar in new_bars.iterrows():
+            bars_open += 1
+            high, low = float(bar["High"]), float(bar["Low"])
+            if signal == "BUY":
+                hit_sl, hit_tp = low <= sl, high >= tp
+            else:
+                hit_sl, hit_tp = high >= sl, low <= tp
+
+            if hit_sl:
+                close_shadow_trade(signal_id, sl, "SHADOW_SL", -1.0)
+                closed = True
+                break
+            if hit_tp:
+                r_mult = abs(tp - entry) / abs(entry - sl)
+                close_shadow_trade(signal_id, tp, "SHADOW_TP", r_mult)
+                closed = True
+                break
+
+        if closed:
+            resolved += 1
+            continue
+
+        if bars_open >= expiry_bars:
+            last_price = float(df["Close"].iloc[-1])
+            risk_dist = abs(entry - sl)
+            r_mult = ((last_price - entry) / risk_dist if signal == "BUY"
+                      else (entry - last_price) / risk_dist) if risk_dist > 0 else 0
+            close_shadow_trade(signal_id, last_price, "SHADOW_EXPIRY", r_mult)
+            resolved += 1
+        else:
+            bump_bars_open(signal_id, bars_open)
+
+    print(f"[Shadow] Resolved {resolved} NO TRADE hypothetical outcome(s) this run.")
+    return resolved
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MAIN SCAN LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1698,10 +2058,10 @@ def run_scan() -> None:
     if set(active_tfs) != set(SCAN_TIMEFRAMES):
         skipped = [tf for tf in SCAN_TIMEFRAMES if tf not in active_tfs]
         print(f"  Runtime optimiser: skipped TFs this run: {', '.join(skipped) if skipped else 'None'}")
-    if scan_mode == "NO_USERS_HEARTBEAT":
-        print("  No active user watchlists found yet — running tiny heartbeat scan only.")
-    if scan_mode == "FORCED_FULL_UNIVERSE":
-        print("  Manual full scan requested — scanning MASTER_WATCHLIST instead of only user watchlists.")
+    if scan_mode == "MASTER_SCHEDULED":
+        print("  Asset universe: full MASTER_WATCHLIST. User watchlists only filter dashboard visibility.")
+    if scan_mode == "MASTER_MANUAL_FULL":
+        print("  Manual full scan requested — scanning full MASTER_WATCHLIST.")
     print(f"{'='*70}\n")
 
     _TF_CACHE.clear()
@@ -1710,6 +2070,7 @@ def run_scan() -> None:
 
     # 1. Resolve outcomes for everything already open BEFORE scanning for new setups.
     evaluate_open_trades(assets=set(scan_assets.keys()), timeframes=set(active_tfs))
+    evaluate_shadow_trades(assets=set(scan_assets.keys()), timeframes=set(active_tfs))
 
     journaled, alerted, shadowed = 0, 0, 0
     assets_scanned = 0
@@ -1766,7 +2127,7 @@ def run_scan() -> None:
 
             if can_alert:
                 message = build_telegram_message(result)
-                ok, info = send_telegram(message)
+                ok, info = send_telegram(message, asset)
                 if ok:
                     result.alert_sent = True
                     alerted += 1
@@ -1784,6 +2145,12 @@ def run_scan() -> None:
     force_open_graded_setups()
     state = load_prop_firm_state()
     finished = datetime.now(timezone.utc)
+
+    # Record that these timeframes were actually scanned, so future runs can
+    # detect overdue timeframes by elapsed time rather than relying on the
+    # workflow having fired at an exact minute.
+    update_timeframe_watermarks(active_tfs, when=finished)
+
     elapsed = (finished - started).total_seconds()
     print(f"\n{'='*70}")
     print(f"  Scan complete in {elapsed:.1f}s")
