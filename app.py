@@ -2360,6 +2360,31 @@ def apply_theme() -> None:
         width:100%;
     }
 
+    /* REAL fix: Streamlit's actual selected-segment button uses kind="segmented_controlActive"
+       and data-testid="stBaseButton-segmented_controlActive" — confirmed via browser devtools.
+       None of the aria-pressed/aria-selected/aria-checked/data-selected guesses above ever
+       matched the real DOM, which is why the border stayed red (Streamlit's default) despite
+       every previous attempt. This rule targets the actual element. */
+    button[kind="segmented_controlActive"],
+    [data-testid="stBaseButton-segmented_controlActive"] {
+        background: linear-gradient(135deg, #00C896, #00A67D) !important;
+        border: 1px solid #00C896 !important;
+        border-color: #00C896 !important;
+        color: #FFFFFF !important;
+        box-shadow: 0 0 0 1px rgba(0,200,150,.35) inset !important;
+        outline: none !important;
+    }
+
+    button[kind="segmented_controlActive"]:focus,
+    button[kind="segmented_controlActive"]:focus-visible,
+    button[kind="segmented_controlActive"]:active,
+    [data-testid="stBaseButton-segmented_controlActive"]:focus,
+    [data-testid="stBaseButton-segmented_controlActive"]:focus-visible {
+        border-color: #00C896 !important;
+        outline: none !important;
+        box-shadow: 0 0 0 1px rgba(0,200,150,.35) inset !important;
+    }
+
     /* FINAL dashboard override: Equity Curve segmented selector active/focus color */
     [data-testid="stSegmentedControl"] button[aria-pressed="true"],
     [data-testid="stSegmentedControl"] button[aria-selected="true"],
@@ -3413,11 +3438,34 @@ def render_opportunity_board(username: str, settings: dict) -> None:
                 class StatusRenderer {
                   init(params) {
                     const raw = (params.value || '—').toString();
-                    const v = raw.toLowerCase();
+                    const v = raw.toUpperCase();
                     const span = document.createElement('span');
-                    let cls = 'ag-status-closed';
-                    if (v.includes('skip') || v.includes('no trade') || v.includes('hold')) cls = 'ag-status-skipped';
-                    if (v.includes('active') || v.includes('open')) cls = 'ag-status-active';
+
+                    // Mirrors the Python outcome_label() logic so badge colour always
+                    // matches the real trade outcome, not just the raw status string:
+                    //   - TP in status            -> win (green)
+                    //   - SL in status            -> loss (red)
+                    //   - EXPIRED or CLOSED       -> look at r_multiple sign:
+                    //         r > 0 -> win (green), r < 0 -> loss (red), r == 0/missing -> neutral (grey)
+                    //   - OPEN / ACTIVE           -> active (green)
+                    //   - SHADOW / SKIP / NO TRADE / HOLD -> neutral (grey)
+                    let cls = 'ag-status-skipped';
+
+                    if (v.includes('TP')) {
+                      cls = 'ag-status-win';
+                    } else if (v.includes('SL')) {
+                      cls = 'ag-status-loss';
+                    } else if (v.includes('EXPIRED') || v.includes('CLOSED')) {
+                      const r = parseFloat(params.data ? params.data.r_multiple : NaN);
+                      if (isNaN(r) || r === 0) cls = 'ag-status-skipped';
+                      else if (r > 0) cls = 'ag-status-win';
+                      else cls = 'ag-status-loss';
+                    } else if (v.includes('ACTIVE') || v.includes('OPEN')) {
+                      cls = 'ag-status-active';
+                    } else if (v.includes('SHADOW') || v.includes('SKIP') || v.includes('NO TRADE') || v.includes('HOLD')) {
+                      cls = 'ag-status-skipped';
+                    }
+
                     span.className = 'ag-status-badge ' + cls;
                     span.innerText = raw;
                     this.eGui = span;
@@ -3535,6 +3583,9 @@ def render_opportunity_board(username: str, settings: dict) -> None:
                     ".ag-grade-c": {"background": "rgba(255,93,93,.18) !important", "color": "#FF5D5D !important"},
                     ".ag-grade-no-trade": {"background": "rgba(137,95,255,.18) !important", "color": "#A98CFF !important"},
                     ".ag-status-active": {"background": "rgba(0,212,163,.16) !important", "color": "#00D4A3 !important"},
+                    ".ag-status-win": {"background": "rgba(0,212,163,.18) !important", "color": "#00D4A3 !important"},
+                    ".ag-status-loss": {"background": "rgba(255,93,93,.18) !important", "color": "#FF5D5D !important"},
+                    ".ag-status-expired": {"background": "rgba(214,168,78,.18) !important", "color": "#D6A84E !important"},
                     ".ag-status-skipped": {"background": "rgba(139,158,176,.16) !important", "color": "#A9BBC9 !important"},
                     ".ag-status-closed": {"background": "rgba(76,140,255,.14) !important", "color": "#7AA6FF !important"},
                 }
@@ -4323,6 +4374,17 @@ def render_settings(username: str, settings: dict) -> None:
             row = tg.iloc[0].to_dict() if not tg.empty else {}
             active = bool(row.get("alerts_enabled", False))
             st.markdown(f"**Telegram alerts:** {'Active' if active else 'Inactive'}")
+
+            # Show the confirmation from the PREVIOUS run here, before anything else.
+            # st.success() called right before st.rerun() never has a chance to paint
+            # in the browser, since the rerun wipes the frame immediately — so the
+            # save was always working, it just looked silent. Stashing a flag in
+            # session_state across the rerun and showing the message on the next run
+            # makes the confirmation actually visible.
+            _tg_flash = st.session_state.pop("telegram_settings_flash", None)
+            if _tg_flash:
+                st.success(_tg_flash)
+
             chat_id = st.text_input("Telegram chat ID", value=str(row.get("telegram_chat_id") or settings.get("telegram_chat_ids") or ""))
             current_mode = "All signals" if bool(row.get("all_signals_alerts", False)) else "Watchlist only"
             alert_mode = st.selectbox("Alert route", ["Watchlist only", "All signals"], index=0 if current_mode == "Watchlist only" else 1)
@@ -4361,7 +4423,10 @@ def render_settings(username: str, settings: dict) -> None:
                 if activate_clicked:
                     settings["telegram_alerts_activated_at"] = datetime.now(timezone.utc).isoformat()
                 save_settings(username, settings)
-                st.success("Telegram settings activated." if new_active else "Telegram alerts deactivated.")
+                # Stash the confirmation so it survives the rerun below and actually displays.
+                st.session_state["telegram_settings_flash"] = (
+                    "Telegram settings activated." if new_active else "Telegram alerts deactivated."
+                )
                 st.rerun()
             st.caption("Activate Settings saves the chat ID and alert route in one step. Only one route can be active at a time.")
         except Exception as exc:
@@ -4419,4 +4484,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
