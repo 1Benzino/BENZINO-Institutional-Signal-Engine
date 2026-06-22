@@ -1995,7 +1995,7 @@ def aggrid_badge_renderers() -> dict:
             } else if (v.includes('EXPIRED')) {
               bg = 'rgba(214,168,78,.18)';
               color = '#D6A84E';
-            } else if (v.includes('OPEN') || v.includes('ACTIVE')) {
+            } else if (v.includes('ENABLED') || v.includes('OPEN') || v.includes('ACTIVE') || v === 'YES') {
               bg = 'rgba(0,212,163,.16)';
               color = '#00D4A3';
             } else if (v.includes('CLOSED')) {
@@ -2492,13 +2492,48 @@ def apply_theme() -> None:
 
 
     div[data-testid="stDataFrame"] { border:1px solid #1E3050; border-radius:14px; overflow:hidden; margin-top:12px; }
-    button[kind="primary"] { background:#00A97F !important; border-color:#00D4A3 !important; color:#FFFFFF !important; }
-    button[kind="primary"] * { color:#FFFFFF !important; }
-    .stButton button[kind="primary"] p,
-    .stButton button[kind="primary"] span,
-    [data-testid="stFormSubmitButton"] button[kind="primary"] p,
-    [data-testid="stFormSubmitButton"] button[kind="primary"] span { color:#FFFFFF !important; }
+
+    /* Primary form/submit buttons (e.g. "Save watchlist", "Activate Settings"):
+       force green background with fully opaque WHITE text on every possible
+       internal wrapper Streamlit/BaseWeb renders the label in. */
+    button[kind="primary"],
+    button[kind="primary"] div,
+    button[kind="primary"] p,
+    button[kind="primary"] span,
+    [data-testid="stFormSubmitButton"] button,
+    [data-testid="stFormSubmitButton"] button div,
+    [data-testid="stFormSubmitButton"] button p,
+    [data-testid="stFormSubmitButton"] button span,
+    [data-testid="baseButton-primary"],
+    [data-testid="baseButton-primary"] div,
+    [data-testid="baseButton-primary"] p,
+    [data-testid="baseButton-primary"] span {
+        color: #FFFFFF !important;
+        opacity: 1 !important;
+    }
+    button[kind="primary"],
+    [data-testid="baseButton-primary"] {
+        background: #00A97F !important;
+        border-color: #00D4A3 !important;
+    }
     .stDownloadButton button[kind="primary"] * { color:#FFFFFF !important; }
+
+    /* Multiselect tags (e.g. Watchlist asset pills): Streamlit's default tag
+       colour is a reddish-orange with no Benzino styling applied. Force the
+       same green theme used everywhere else in the app, with white text. */
+    div[data-baseweb="tag"] {
+        background-color: #00A97F !important;
+        border-color: #00D4A3 !important;
+        color: #FFFFFF !important;
+    }
+    div[data-baseweb="tag"] span,
+    div[data-baseweb="tag"] div {
+        color: #FFFFFF !important;
+    }
+    div[data-baseweb="tag"] svg {
+        fill: #FFFFFF !important;
+    }
+
     input, textarea, div[data-baseweb="select"] > div { border-radius:12px !important; }
     .danger-button button { background:#8B1E2D !important; border-color:#FF5D5D !important; color:#fff !important; }
     .grey-note { background:#111A2A; border:1px solid #26364A; border-radius:14px; padding:12px 14px; color:#A9BBC9; }
@@ -4232,6 +4267,7 @@ def render_settings(username: str, settings: dict) -> None:
                 all_users = all_users.copy()
                 settings_rows = read_df("SELECT username, settings_json, updated_at FROM user_settings")
                 watch_rows = read_df("SELECT scan_owner, asset FROM user_watchlists WHERE enabled = TRUE ORDER BY scan_owner, asset")
+                telegram_rows = read_df("SELECT scan_owner, alerts_enabled FROM user_telegram_settings")
 
                 settings_map = {}
                 if not settings_rows.empty:
@@ -4247,6 +4283,11 @@ def render_settings(username: str, settings: dict) -> None:
                     for owner, grp in watch_rows.groupby("scan_owner"):
                         watch_map[str(owner)] = ", ".join(grp["asset"].astype(str).tolist())
 
+                telegram_map = {}
+                if not telegram_rows.empty:
+                    for _, tr in telegram_rows.iterrows():
+                        telegram_map[str(tr.get("scan_owner"))] = bool(tr.get("alerts_enabled"))
+
                 all_users["watchlist"] = all_users["username"].astype(str).map(watch_map).fillna("")
                 all_users["watchlist_count"] = all_users["watchlist"].apply(lambda x: len([v for v in str(x).split(",") if v.strip()]))
                 all_users["account_size"] = all_users["username"].astype(str).map(lambda u: settings_map.get(u, {}).get("account_size", ""))
@@ -4255,11 +4296,12 @@ def render_settings(username: str, settings: dict) -> None:
                 all_users["leverage"] = all_users["username"].astype(str).map(lambda u: settings_map.get(u, {}).get("leverage", ""))
                 all_users["preferred_timeframe"] = all_users["username"].astype(str).map(lambda u: settings_map.get(u, {}).get("preferred_timeframe", ""))
                 all_users["tracking_started_at"] = all_users["username"].astype(str).map(lambda u: settings_map.get(u, {}).get("tracking_started_at", ""))
+                all_users["telegram_activated"] = all_users["username"].astype(str).map(lambda u: "Yes" if telegram_map.get(u) else "No")
                 all_users["created_at"] = all_users["created_at"].apply(fmt_nairobi)
                 all_users["tracking_started_at"] = all_users["tracking_started_at"].apply(fmt_nairobi)
-                user_cols = ["username", "email", "role", "watchlist_count", "watchlist", "account_size", "risk_pct", "leverage", "preferred_timeframe", "created_at", "tracking_started_at"]
+                user_cols = ["username", "email", "role", "watchlist_count", "watchlist", "account_size", "risk_pct", "leverage", "preferred_timeframe", "telegram_activated", "created_at", "tracking_started_at"]
                 all_users = all_users[[c for c in user_cols if c in all_users.columns]]
-                render_benzino_aggrid(all_users, key="admin_user_management", title="User Management", height=360, page_size=10, pinned=["username"], numeric_cols_right=["watchlist_count", "account_size", "risk_pct", "leverage"])
+                render_benzino_aggrid(all_users, key="admin_user_management", title="User Management", height=360, page_size=10, pinned=["username"], numeric_cols_right=["watchlist_count", "account_size", "risk_pct", "leverage"], badge_cols={"telegram_activated": "status"})
 
 
         with st.expander("Profile email and password", expanded=False):
