@@ -29,6 +29,10 @@ import hashlib
 import secrets
 import smtplib
 import ssl
+try:
+    import requests
+except Exception:
+    requests = None
 from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -1458,9 +1462,7 @@ def compute_user_performance(df: pd.DataFrame, settings: dict, prop_mode: bool =
         out["current_balance"] = account + realised
         out["roi_pct"] = (realised / account) * 100 if account else 0.0
         wins = closed["pnl_cash"] > 0
-        losses = closed["pnl_cash"] < 0
-        resolved = int((wins | losses).sum())
-        out["win_rate"] = float(wins.sum() / resolved * 100) if resolved else 0.0
+        out["win_rate"] = float(wins.sum() / len(closed) * 100) if len(closed) else 0.0
         try:
             out["trading_days"] = int(pd.to_datetime(closed["created_at"], utc=True, errors="coerce").dt.date.nunique())
         except Exception:
@@ -1552,11 +1554,10 @@ def compute_dashboard_summary(df: pd.DataFrame, settings: dict) -> dict:
 
     wins = closed["pnl_cash"] > 0
     losses = closed["pnl_cash"] < 0
-    resolved = int((wins | losses).sum())
     out["total_trades"] = int(len(closed))
     out["winning_trades"] = int(wins.sum())
     out["losing_trades"] = int(losses.sum())
-    out["win_rate"] = float(wins.sum() / resolved * 100) if resolved else 0.0
+    out["win_rate"] = float(wins.sum() / len(closed) * 100) if len(closed) else 0.0
 
     gross_profit = float(closed.loc[wins, "pnl_cash"].sum())
     gross_loss = float(-closed.loc[losses, "pnl_cash"].sum())
@@ -1811,7 +1812,7 @@ def rich_open_trade_explanation(row: pd.Series) -> str:
         f"**{asset} · {tf} · {signal} · Grade {grade}**  \n\n"
         f"This trade is still **OPEN**, opened **{age}**, and has lived through **{bars_open}** "
         f"{tf} candle(s) so far without hitting take-profit or stop-loss. Entry **{entry:.5f}**, "
-        f"stop **{sl:.5f}**, target **{tp:.5f}**, planned risk:reward **{rr:.2f}R**.\n\n"
+        f"stop **{format_market_price(sl)}**, target **{format_market_price(tp)}**, planned risk:reward **{rr:.2f}R**.\n\n"
         f"**Why it was opened:** {reason}\n\n"
         f"**Strategy reasoning at entry:** {format_votes(votes)}\n\n"
         f"**What to watch:** the trade auto-expires if neither level is hit within the configured bar limit "
@@ -2079,19 +2080,20 @@ def benzino_aggrid_css() -> dict:
 
 def format_market_price(value):
     """
-    Display prices with market precision:
-    - Keeps up to 6 decimal places for FX / low-price assets.
-    - Removes unnecessary trailing zeroes.
-    - Keeps at least 2 decimals when there is a decimal.
+    Display market prices without destroying precision.
+
+    FX and low-price instruments can need 5-6 decimals, while metals, indices,
+    crypto and equities often look right with 2. This keeps up to 6 decimals,
+    removes unnecessary trailing zeroes, and keeps at least 2 decimals for price
+    values that contain a decimal.
     """
     try:
         if value is None or pd.isna(value):
             return ""
-        x = float(value)
+        x = float(str(value).replace(",", ""))
         if not np.isfinite(x):
             return ""
-
-        s = f"{x:.6f}".rstrip("0").rstrip(".")
+        s = f"{x:,.6f}".rstrip("0").rstrip(".")
         if "." in s:
             whole, frac = s.split(".", 1)
             if len(frac) == 1:
@@ -2102,19 +2104,23 @@ def format_market_price(value):
 
 
 def is_price_display_column(col_name: str) -> bool:
+    """True only for market-price fields, not PnL/risk/cash metrics."""
     c = str(col_name or "").strip().lower()
     c = c.replace("_", " ").replace("-", " ")
     c = re.sub(r"\s+", " ", c)
-
     exact = {
-        "entry", "sl", "tp", "exit price", "exit", "price",
-        "hypothetical exit", "hypothetical entry", "hypothetical sl", "hypothetical tp",
-        "open", "high", "low", "close"
+        "entry", "entry price",
+        "sl", "stop", "stop loss", "stop price",
+        "tp", "target", "take profit", "target price",
+        "exit", "exit price",
+        "hypothetical entry", "hypothetical sl", "hypothetical tp", "hypothetical exit",
+        "open", "high", "low", "close",
     }
     if c in exact:
         return True
-
-    return any(token in c for token in ("entry", "sl", "tp", "exit price", "hypothetical exit"))
+    if c.endswith(" price") and not any(x in c for x in ("cash", "pnl", "risk", "margin", "balance")):
+        return True
+    return False
 
 
 def render_benzino_aggrid(
@@ -2153,6 +2159,20 @@ def render_benzino_aggrid(
         ordered = [c for c in column_order if c in view.columns]
         rest = [c for c in view.columns if c not in ordered]
         view = view[ordered + rest]
+
+    # Universal status filter for every table that carries a lifecycle/status column.
+    status_filter_col = "Status" if "Status" in view.columns else ("status" if "status" in view.columns else None)
+    if status_filter_col and not view.empty:
+        statuses = sorted([s for s in view[status_filter_col].dropna().astype(str).unique().tolist() if s.strip()])
+        if statuses:
+            chosen_status = st.selectbox(
+                "Status",
+                ["All"] + statuses,
+                label_visibility="collapsed",
+                key=f"{key}_status_filter",
+            )
+            if chosen_status != "All":
+                view = view[view[status_filter_col].astype(str).eq(chosen_status)].copy()
 
     # Market-aware table formatting:
     # Price columns keep up to 6 decimals where needed, while non-price metrics
@@ -3224,7 +3244,7 @@ def sidebar_controls(username: str, settings: dict) -> str:
         st.markdown("<div class='benzino-side-title'>Main Menu</div>", unsafe_allow_html=True)
         page = st.radio(
             "Main Menu",
-            ["Dashboard", "Asset Deep Dive", "Workflow", "Settings"],
+            ["Dashboard", "Asset Deep Dive", "Market News", "Workflow", "Settings"],
             label_visibility="collapsed",
             key="main_navigation",
         )
@@ -3381,7 +3401,7 @@ def render_opportunity_board(username: str, settings: dict) -> None:
         generated = generated.head(100).copy()
 
         # Top toolbar: title + real filter controls + search.
-        title_col, signal_filter_col, grade_filter_col, search_col = st.columns([5.2, 1.15, 1.15, 2.3], vertical_alignment="center")
+        title_col, signal_filter_col, grade_filter_col, status_filter_col, search_col = st.columns([4.6, 1.05, 1.05, 1.15, 2.15], vertical_alignment="center")
         with title_col:
             st.markdown("<div class='benzino-panel-title'>Generated Signals</div>", unsafe_allow_html=True)
         with signal_filter_col:
@@ -3399,6 +3419,14 @@ def render_opportunity_board(username: str, settings: dict) -> None:
                 index=0,
                 label_visibility="collapsed",
                 key="generated_signals_grade_filter",
+            )
+        with status_filter_col:
+            status_filter = st.selectbox(
+                "Status filter",
+                ["All", "OPEN", "CLOSED_TP", "CLOSED_SL", "EXPIRED", "SHADOW"],
+                index=0,
+                label_visibility="collapsed",
+                key="generated_signals_status_filter",
             )
         with search_col:
             table_search = st.text_input(
@@ -3449,6 +3477,8 @@ def render_opportunity_board(username: str, settings: dict) -> None:
                 display_df = display_df[display_df["signal"].astype(str).str.upper().eq(signal_filter)].copy()
             if grade_filter != "All" and "grade" in display_df.columns:
                 display_df = display_df[display_df["grade"].astype(str).str.upper().eq(grade_filter)].copy()
+            if status_filter != "All" and "status" in display_df.columns:
+                display_df = display_df[display_df["status"].astype(str).str.upper().eq(status_filter)].copy()
 
             # Format timestamps after age is derived.
             for col in list(display_df.columns):
@@ -3498,7 +3528,7 @@ def render_opportunity_board(username: str, settings: dict) -> None:
                     return "—"
                 n = pd.to_numeric(x, errors="coerce")
                 if pd.notna(n):
-                    return f"{float(n):,.2f}"
+                    return format_market_price(n)
                 return str(x)
 
             def _fmt_pct(x):
@@ -3824,19 +3854,23 @@ def render_asset_deep_dive(username: str, settings: dict) -> None:
     hist["created_at_eat"] = hist["created_at"].apply(fmt_nairobi)
     cols = ["created_at", "created_at_eat", "asset", "ticker", "timeframe", "signal", "grade", "status", "confidence", "edge_score", "mtf_score", "rr", "r_multiple", "exit_reason", "session"]
     hist_view = prepare_signal_table(hist[[c for c in cols if c in hist.columns]].head(100))
-    title_col, sig_col, grade_col, search_col = st.columns([5.0, 1.15, 1.15, 2.4], vertical_alignment="center")
+    title_col, sig_col, grade_col, status_col, search_col = st.columns([4.4, 1.05, 1.05, 1.15, 2.35], vertical_alignment="center")
     with title_col:
         st.markdown("<div class='benzino-panel-title'>History for selected asset</div>", unsafe_allow_html=True)
     with sig_col:
         hist_signal_filter = st.selectbox("Signal", ["All", "BUY", "SELL", "HOLD", "NO TRADE"], label_visibility="collapsed", key="asset_history_signal_filter")
     with grade_col:
         hist_grade_filter = st.selectbox("Grade", ["All", "A+", "A", "B", "C", "NO TRADE"], label_visibility="collapsed", key="asset_history_grade_filter")
+    with status_col:
+        hist_status_filter = st.selectbox("Status", ["All"] + (sorted(hist_view["Status"].dropna().astype(str).unique().tolist()) if "Status" in hist_view.columns else []), label_visibility="collapsed", key="asset_history_status_filter")
     with search_col:
         hist_search = st.text_input("Search asset history", placeholder="Search…", label_visibility="collapsed", key="asset_history_search")
     if hist_signal_filter != "All" and "Signal" in hist_view.columns:
         hist_view = hist_view[hist_view["Signal"].astype(str).str.upper().str.contains(hist_signal_filter, na=False)]
     if hist_grade_filter != "All" and "Grade" in hist_view.columns:
         hist_view = hist_view[hist_view["Grade"].astype(str).str.upper().eq(hist_grade_filter.upper())]
+    if hist_status_filter != "All" and "Status" in hist_view.columns:
+        hist_view = hist_view[hist_view["Status"].astype(str).eq(hist_status_filter)]
     if hist_search:
         q = str(hist_search).lower().strip()
         hist_view = hist_view[hist_view.astype(str).apply(lambda col: col.str.lower().str.contains(q, na=False)).any(axis=1)]
@@ -3876,7 +3910,7 @@ def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
     closed = graded[graded["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])].copy()
     resolved = closed[closed["outcome"].isin(["WIN", "LOSS"])].copy()
 
-    win_rate = (resolved["outcome"].eq("WIN").mean() * 100) if len(resolved) else 0.0
+    win_rate = (closed["outcome"].eq("WIN").sum() / len(closed) * 100) if len(closed) else 0.0
     avg_r = pd.to_numeric(resolved.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean() if len(resolved) else 0.0
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -3895,8 +3929,8 @@ def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
 
     g1, g2 = st.columns(2)
     with g1:
-        grade_perf = resolved.groupby("grade", as_index=False).agg(
-            win_rate=("outcome", lambda x: (x == "WIN").mean() * 100),
+        grade_perf = closed.groupby("grade", as_index=False).agg(
+            win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100),
             trades=("signal_id", "count"),
             avg_r=("r_multiple", "mean"),
         ).sort_values("grade")
@@ -3904,8 +3938,8 @@ def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
         render_benzino_aggrid(grade_perf, key="system_perf_grade", height=240, page_size=10, pinned=["grade"], badge_cols={"grade":"grade", "Grade":"grade"}, numeric_cols_right=[c for c in grade_perf.columns if c not in ["grade", "Grade"]], enable_search=False, show_footer=False, use_pagination=False)
 
     with g2:
-        session_perf = resolved.groupby("session", as_index=False).agg(
-            win_rate=("outcome", lambda x: (x == "WIN").mean() * 100),
+        session_perf = closed.groupby("session", as_index=False).agg(
+            win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100),
             trades=("signal_id", "count"),
             avg_r=("r_multiple", "mean"),
         ).sort_values("trades", ascending=False)
@@ -3914,8 +3948,8 @@ def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
 
     a1, a2 = st.columns(2)
     with a1:
-        timeframe_perf = resolved.groupby("timeframe", as_index=False).agg(
-            win_rate=("outcome", lambda x: (x == "WIN").mean() * 100),
+        timeframe_perf = closed.groupby("timeframe", as_index=False).agg(
+            win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100),
             trades=("signal_id", "count"),
             avg_r=("r_multiple", "mean"),
         ).sort_values("timeframe")
@@ -3923,8 +3957,8 @@ def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
         render_benzino_aggrid(timeframe_perf, key="system_perf_timeframe_split", height=240, page_size=10, pinned=["timeframe"], numeric_cols_right=[c for c in timeframe_perf.columns if c != "timeframe"], enable_search=False, show_footer=False, use_pagination=False)
 
     with a2:
-        asset_perf = resolved.groupby("asset", as_index=False).agg(
-            win_rate=("outcome", lambda x: (x == "WIN").mean() * 100),
+        asset_perf = closed.groupby("asset", as_index=False).agg(
+            win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100),
             trades=("signal_id", "count"),
             avg_r=("r_multiple", "mean"),
         ).sort_values(["trades", "win_rate"], ascending=[False, False])
@@ -3975,6 +4009,123 @@ def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
     render_benzino_aggrid(latest_view, key="system_latest_signals", height=480, page_size=10, pinned=["Asset", "Signal", "Grade", "Age"], badge_cols={"Signal":"signal", "Grade":"grade", "Status":"status", "Outcome":"outcome"}, numeric_cols_right=["Confidence", "Decayed Confidence", "RR", "R Multiple", "Edge Score", "MTF Score"], enable_search=False)
 
 
+
+def news_impact_score(article: dict, asset: str) -> tuple[int, str]:
+    title = str(article.get("title") or "")
+    desc = str(article.get("description") or "")
+    text_blob = f"{title} {desc}".lower()
+    high_keywords = ["fed", "rate", "inflation", "cpi", "nfp", "jobs", "earnings", "war", "tariff", "oil", "gold", "bitcoin", "etf", "recession", "central bank", "powell"]
+    medium_keywords = ["forecast", "outlook", "rally", "selloff", "volatility", "dollar", "yield", "policy", "inventory", "supply", "demand"]
+    score = 20
+    score += 25 if str(asset).lower() in text_blob else 0
+    score += min(35, sum(10 for k in high_keywords if k in text_blob))
+    score += min(20, sum(5 for k in medium_keywords if k in text_blob))
+    try:
+        published = pd.to_datetime(article.get("publishedAt"), utc=True, errors="coerce")
+        if pd.notna(published):
+            age_hours = (pd.Timestamp.now(tz="UTC") - published).total_seconds() / 3600
+            if age_hours <= 6:
+                score += 20
+            elif age_hours <= 24:
+                score += 10
+    except Exception:
+        pass
+    score = int(max(0, min(100, score)))
+    label = "HIGH" if score >= 80 else "MEDIUM" if score >= 50 else "LOW"
+    return score, label
+
+
+def article_sentiment(article: dict) -> str:
+    text_blob = f"{article.get('title') or ''} {article.get('description') or ''}".lower()
+    positive = ["rally", "surge", "gain", "beat", "strong", "bull", "record", "optimism", "eases"]
+    negative = ["fall", "drop", "slump", "miss", "weak", "bear", "risk", "war", "fear", "inflation", "hike"]
+    p = sum(1 for w in positive if w in text_blob)
+    n = sum(1 for w in negative if w in text_blob)
+    if p > n:
+        return "Positive"
+    if n > p:
+        return "Negative"
+    return "Neutral"
+
+
+@st.cache_data(ttl=900)
+def fetch_newsapi_articles(query: str, api_key: str, page_size: int = 8) -> list[dict]:
+    if not api_key or requests is None:
+        return []
+    try:
+        resp = requests.get(
+            "https://newsapi.org/v2/everything",
+            params={
+                "q": query,
+                "language": "en",
+                "sortBy": "publishedAt",
+                "pageSize": page_size,
+                "apiKey": api_key,
+            },
+            timeout=12,
+        )
+        if resp.status_code != 200:
+            return []
+        return resp.json().get("articles", []) or []
+    except Exception:
+        return []
+
+
+def render_market_news(username: str, settings: dict) -> None:
+    page_header("Market News", "Watchlist news with impact scoring for the assets you actually track.")
+    api_key = first_secret("NEWS_API_KEY", "NEWSAPI_KEY", "NEWS_API", fallback="")
+    if not api_key:
+        st.warning("NEWS_API_KEY is not configured yet. Add it to Streamlit secrets to activate this page.")
+        return
+
+    watchlist = load_user_watchlist(username)
+    assets = list(watchlist.keys()) or DEFAULT_ASSETS
+    selected_assets = st.multiselect("News assets", options=assets, default=assets[: min(6, len(assets))])
+    if not selected_assets:
+        st.info("Select at least one watchlist asset to load news.")
+        return
+
+    rows = []
+    query_aliases = {
+        "XAUUSD": "gold OR XAUUSD", "XAGUSD": "silver OR XAGUSD", "OIL": "crude oil OR WTI", "BRENT": "Brent crude",
+        "BTCUSD": "bitcoin OR BTC", "ETHUSD": "ethereum OR ETH", "SP500": "S&P 500", "NAS100": "Nasdaq 100", "DOW30": "Dow Jones",
+    }
+    with st.spinner("Loading watchlist news…"):
+        for asset in selected_assets:
+            query = query_aliases.get(asset, asset)
+            articles = fetch_newsapi_articles(query, api_key, page_size=8)
+            for article in articles:
+                impact, impact_label = news_impact_score(article, asset)
+                rows.append({
+                    "Asset": asset,
+                    "Headline": article.get("title") or "",
+                    "Source": (article.get("source") or {}).get("name", ""),
+                    "Published": fmt_nairobi(article.get("publishedAt")),
+                    "Sentiment": article_sentiment(article),
+                    "Impact Score": impact,
+                    "Impact": impact_label,
+                    "URL": article.get("url") or "",
+                })
+
+    if not rows:
+        st.info("No recent NewsAPI articles were returned for your selected watchlist assets.")
+        return
+    news_df = pd.DataFrame(rows).drop_duplicates(subset=["Asset", "Headline"]).sort_values(["Impact Score", "Published"], ascending=[False, False])
+    c1, c2, c3 = st.columns(3)
+    with c1: metric_card("Articles", f"{len(news_df):,}", "Watchlist-matched")
+    with c2: metric_card("High impact", f"{int((news_df['Impact'] == 'HIGH').sum()):,}", "Score 80+")
+    with c3: metric_card("Assets covered", f"{news_df['Asset'].nunique():,}", "From your watchlist")
+    render_benzino_aggrid(
+        news_df[["Asset", "Headline", "Source", "Published", "Sentiment", "Impact Score", "Impact", "URL"]],
+        key="market_news_table",
+        title="Watchlist News",
+        height=560,
+        page_size=12,
+        pinned=["Asset"],
+        badge_cols={"Impact": "status", "Sentiment": "outcome"},
+        numeric_cols_right=["Impact Score"],
+    )
+
 def render_workflow(username: str, settings: dict) -> None:
     page_header("Workflow", "User journal, prop-firm mode, NO TRADE tracker, Coach AI, and Explain AI.")
     raw_df = enrich_position_sizing(load_signals_for_user(username, settings), settings)
@@ -3989,10 +4140,26 @@ def render_workflow(username: str, settings: dict) -> None:
         df = pd.DataFrame(columns=raw_df.columns if raw_df is not None else [])
     df["outcome"] = df.apply(outcome_label, axis=1)
     trades = df[df["grade"].astype(str).isin(VALID_GRADES)].copy()
-    no_trades = df[
-        df["grade"].astype(str).str.upper().eq("NO TRADE")
-        & df["signal"].astype(str).str.upper().isin(["BUY", "SELL"])
-    ].copy()
+    # No Trade research queue: only rejected ideas that have an actual directional
+    # trade path. HOLD-only rows are excluded because they cannot produce a useful
+    # hypothetical TP/SL outcome.
+    no_trades = df[df["grade"].astype(str).str.upper().eq("NO TRADE")].copy()
+    if not no_trades.empty:
+        sig_upper = no_trades["signal"].astype(str).str.upper() if "signal" in no_trades.columns else pd.Series("", index=no_trades.index)
+        has_trade_path = (
+            pd.to_numeric(no_trades.get("entry"), errors="coerce").notna()
+            & pd.to_numeric(no_trades.get("sl"), errors="coerce").notna()
+            & pd.to_numeric(no_trades.get("tp"), errors="coerce").notna()
+        )
+        directional = sig_upper.isin(["BUY", "SELL"])
+        no_trades = no_trades[(directional | has_trade_path) & ~sig_upper.eq("HOLD")].copy()
+        if "signal" in no_trades.columns:
+            # If an older scanner row stored the rejected idea as NO TRADE but kept a
+            # valid entry/TP path, infer the hypothetical direction for display only.
+            entry_num = pd.to_numeric(no_trades.get("entry"), errors="coerce")
+            tp_num = pd.to_numeric(no_trades.get("tp"), errors="coerce")
+            inferred = np.where(tp_num > entry_num, "BUY", np.where(tp_num < entry_num, "SELL", no_trades["signal"].astype(str)))
+            no_trades["signal"] = np.where(sig_upper.isin(["BUY", "SELL"]), no_trades["signal"], inferred)
     open_trades = trades[trades["status"].astype(str).str.upper().eq("OPEN")]
     closed_trades = trades[trades["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])]
 
@@ -4000,54 +4167,57 @@ def render_workflow(username: str, settings: dict) -> None:
 
     with t1:
         c1, c2, c3, c4 = st.columns(4)
-        win_rate = 0.0
         resolved = closed_trades[closed_trades["outcome"].isin(["WIN", "LOSS"])]
-        if len(resolved):
-            win_rate = (resolved["outcome"].eq("WIN").mean() * 100)
+        won_trades = int(closed_trades["outcome"].eq("WIN").sum()) if "outcome" in closed_trades.columns else 0
         with c1: metric_card("Total journaled", f"{len(trades):,}", "A+/A/B/C setups")
         with c2: metric_card("Open", f"{len(open_trades):,}", "Currently active")
         with c3: metric_card("Closed", f"{len(closed_trades):,}", "Resolved trades")
-        with c4: metric_card("Win rate", f"{win_rate:.2f}%", "No Trade excluded")
+        with c4: metric_card("Won", f"{won_trades:,}", "Winning trades")
 
         st.subheader("Account performance")
         render_performance_strip(trades, settings, prop_mode=False)
-        if len(resolved):
+        if len(closed_trades):
             st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
             st.subheader("User split analysis")
             ug1, ug2 = st.columns(2)
             with ug1:
-                grade_perf = resolved.groupby("grade", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").mean() * 100), trades=("signal_id", "count"))
+                grade_perf = closed_trades.groupby("grade", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100), trades=("signal_id", "count"))
                 st.markdown("**By grade**")
                 render_benzino_aggrid(grade_perf, key="journal_grade_perf", height=240, page_size=10, pinned=["grade"], badge_cols={"grade":"grade", "Grade":"grade"}, numeric_cols_right=[c for c in grade_perf.columns if c not in ["grade", "Grade"]], enable_search=False, show_footer=False, use_pagination=False)
             with ug2:
-                session_perf = resolved.groupby("session", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").mean() * 100), trades=("signal_id", "count"))
+                session_perf = closed_trades.groupby("session", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100), trades=("signal_id", "count"))
                 st.markdown("**By session**")
                 render_benzino_aggrid(session_perf, key="journal_session_perf", height=240, page_size=10, pinned=["session"], numeric_cols_right=[c for c in session_perf.columns if c not in ["session", "Session"]], enable_search=False, show_footer=False, use_pagination=False)
             ut1, ut2 = st.columns(2)
             with ut1:
-                timeframe_perf = resolved.groupby("timeframe", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").mean() * 100), trades=("signal_id", "count"))
+                timeframe_perf = closed_trades.groupby("timeframe", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100), trades=("signal_id", "count"))
                 st.markdown("**By timeframe**")
                 render_benzino_aggrid(timeframe_perf, key="journal_timeframe_perf", height=240, page_size=10, pinned=["timeframe"], numeric_cols_right=[c for c in timeframe_perf.columns if c != "timeframe"], enable_search=False, show_footer=False, use_pagination=False)
             with ut2:
-                asset_perf = resolved.groupby("asset", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").mean() * 100), trades=("signal_id", "count"))
+                asset_perf = closed_trades.groupby("asset", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100), trades=("signal_id", "count"))
                 st.markdown("**By asset**")
                 render_benzino_aggrid(asset_perf.sort_values("trades", ascending=False), key="journal_asset_perf", height=240, page_size=10, pinned=["asset"], numeric_cols_right=[c for c in asset_perf.columns if c != "asset"], enable_search=False, show_footer=False, use_pagination=False)
 
         def _render_journal_signal_grid(source_df: pd.DataFrame, table_title: str, key_prefix: str, cols: list[str], badge_map: dict, numeric_right: list[str]) -> None:
             prepared = prepare_signal_table(source_df[[c for c in cols if c in source_df.columns]].head(200))
-            title_col, sig_col, grade_col, search_col = st.columns([5.0, 1.15, 1.15, 2.4], vertical_alignment="center")
+            title_col, sig_col, grade_col, status_col, search_col = st.columns([4.4, 1.05, 1.05, 1.15, 2.35], vertical_alignment="center")
             with title_col:
                 st.markdown(f"<div class='benzino-panel-title'>{html.escape(table_title)}</div>", unsafe_allow_html=True)
             with sig_col:
                 signal_choice = st.selectbox("Signal", ["All", "BUY", "SELL", "HOLD", "NO TRADE"], label_visibility="collapsed", key=f"{key_prefix}_signal_filter")
             with grade_col:
                 grade_choice = st.selectbox("Grade", ["All", "A+", "A", "B", "C", "NO TRADE"], label_visibility="collapsed", key=f"{key_prefix}_grade_filter")
+            with status_col:
+                available_status = sorted(prepared["Status"].dropna().astype(str).unique().tolist()) if "Status" in prepared.columns else []
+                status_choice = st.selectbox("Status", ["All"] + available_status, label_visibility="collapsed", key=f"{key_prefix}_status_filter_top")
             with search_col:
                 search_choice = st.text_input(f"Search {table_title}", placeholder="Search…", label_visibility="collapsed", key=f"{key_prefix}_search")
             if signal_choice != "All" and "Signal" in prepared.columns:
                 prepared = prepared[prepared["Signal"].astype(str).str.upper().str.contains(signal_choice, na=False)]
             if grade_choice != "All" and "Grade" in prepared.columns:
                 prepared = prepared[prepared["Grade"].astype(str).str.upper().eq(grade_choice.upper())]
+            if status_choice != "All" and "Status" in prepared.columns:
+                prepared = prepared[prepared["Status"].astype(str).eq(status_choice)]
             if search_choice:
                 q = str(search_choice).lower().strip()
                 prepared = prepared[prepared.astype(str).apply(lambda col: col.str.lower().str.contains(q, na=False)).any(axis=1)]
@@ -4254,18 +4424,11 @@ def render_workflow(username: str, settings: dict) -> None:
             "Explain AI starts with closed outcomes by default because resolved trades provide the clearest lessons. "
             "You can also review open journal trades and blocked No Trade ideas to understand the full signal lifecycle."
         )
-        # AgGrid Review Queue: scan the latest blocked, open and closed candidates before selecting a narrative case.
+        # Review Outcomes table: closed trades only, because outcome review should
+        # not mix open trades or research-only No Trade ideas with resolved lessons.
         review_frames = []
-        if not no_trades.empty:
-            tmp = no_trades.sort_values("created_at", ascending=False).head(25).copy()
-            tmp["Review Case"] = "Blocked NO TRADE"
-            review_frames.append(tmp)
-        if not open_trades.empty:
-            tmp = open_trades.sort_values("created_at", ascending=False).head(25).copy()
-            tmp["Review Case"] = "Open Journal Trade"
-            review_frames.append(tmp)
         if not closed_trades.empty:
-            tmp = closed_trades.sort_values("created_at", ascending=False).head(25).copy()
+            tmp = closed_trades.sort_values("created_at", ascending=False).head(75).copy()
             tmp["Review Case"] = "Closed Outcome"
             review_frames.append(tmp)
         if review_frames:
@@ -4273,19 +4436,23 @@ def render_workflow(username: str, settings: dict) -> None:
             review_display = prepare_signal_table(review_queue, limit=75)
             cols = ["Review Case"] + [c for c in review_display.columns if c != "Review Case"]
             review_display = review_display[cols]
-            title_col, sig_col, grade_col, search_col = st.columns([5.0, 1.15, 1.15, 2.4], vertical_alignment="center")
+            title_col, sig_col, grade_col, status_col, search_col = st.columns([4.4, 1.05, 1.05, 1.15, 2.35], vertical_alignment="center")
             with title_col:
-                st.markdown("<div class='benzino-panel-title'>Review Queue</div>", unsafe_allow_html=True)
+                st.markdown("<div class='benzino-panel-title'>Review Outcomes</div>", unsafe_allow_html=True)
             with sig_col:
                 explain_signal_filter = st.selectbox("Signal", ["All", "BUY", "SELL", "HOLD", "NO TRADE"], label_visibility="collapsed", key="explain_review_signal_filter")
             with grade_col:
                 explain_grade_filter = st.selectbox("Grade", ["All", "A+", "A", "B", "C", "NO TRADE"], label_visibility="collapsed", key="explain_review_grade_filter")
+            with status_col:
+                explain_status_filter = st.selectbox("Status", ["All", "CLOSED_TP", "CLOSED_SL", "EXPIRED"], label_visibility="collapsed", key="explain_review_status_filter")
             with search_col:
                 explain_review_search = st.text_input("Search Explain AI review queue", placeholder="Search…", label_visibility="collapsed", key="explain_review_search")
             if explain_signal_filter != "All" and "Signal" in review_display.columns:
                 review_display = review_display[review_display["Signal"].astype(str).str.upper().str.contains(explain_signal_filter, na=False)]
             if explain_grade_filter != "All" and "Grade" in review_display.columns:
                 review_display = review_display[review_display["Grade"].astype(str).str.upper().eq(explain_grade_filter.upper())]
+            if explain_status_filter != "All" and "Status" in review_display.columns:
+                review_display = review_display[review_display["Status"].astype(str).str.upper().eq(explain_status_filter)]
             if explain_review_search:
                 q = str(explain_review_search).lower().strip()
                 review_display = review_display[review_display.astype(str).apply(lambda col: col.str.lower().str.contains(q, na=False)).any(axis=1)]
@@ -4373,6 +4540,25 @@ def render_settings(username: str, settings: dict) -> None:
                     for _, tr in telegram_rows.iterrows():
                         telegram_map[str(tr.get("scan_owner"))] = bool(tr.get("alerts_enabled"))
 
+                # Admin user win rates: per user, filtered to their saved watchlist and tracking start.
+                system_for_users = load_all_system_signals(settings)
+                user_win_rate_map = {}
+                if system_for_users is not None and not system_for_users.empty:
+                    system_for_users = system_for_users.copy()
+                    system_for_users["outcome"] = system_for_users.apply(outcome_label, axis=1)
+                    system_for_users = system_for_users[system_for_users["grade"].astype(str).isin(VALID_GRADES)].copy()
+                    sys_status = system_for_users["outcome"].astype(str)
+                    system_closed = system_for_users[sys_status.isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])].copy()
+                    for _u in all_users["username"].astype(str).tolist():
+                        _assets = [a.strip() for a in str(watch_map.get(_u, "")).split(",") if a.strip()]
+                        _u_df = system_closed.copy()
+                        if _assets:
+                            _u_df = _u_df[_u_df["asset"].astype(str).isin(_assets)]
+                        _start = settings_map.get(_u, {}).get("tracking_started_at", "")
+                        if _start and "created_at" in _u_df.columns:
+                            _u_df = _u_df[pd.to_datetime(_u_df["created_at"], errors="coerce", utc=True) >= pd.to_datetime(_start, errors="coerce", utc=True)]
+                        user_win_rate_map[_u] = (float(_u_df["outcome"].eq("WIN").sum() / len(_u_df) * 100) if len(_u_df) else 0.0)
+
                 all_users["watchlist"] = all_users["username"].astype(str).map(watch_map).fillna("")
                 all_users["watchlist_count"] = all_users["watchlist"].apply(lambda x: len([v for v in str(x).split(",") if v.strip()]))
                 all_users["account_size"] = all_users["username"].astype(str).map(lambda u: settings_map.get(u, {}).get("account_size", ""))
@@ -4382,11 +4568,12 @@ def render_settings(username: str, settings: dict) -> None:
                 all_users["preferred_timeframe"] = all_users["username"].astype(str).map(lambda u: settings_map.get(u, {}).get("preferred_timeframe", ""))
                 all_users["tracking_started_at"] = all_users["username"].astype(str).map(lambda u: settings_map.get(u, {}).get("tracking_started_at", ""))
                 all_users["telegram_activated"] = all_users["username"].astype(str).map(lambda u: "Yes" if telegram_map.get(u) else "No")
+                all_users["win_rate"] = all_users["username"].astype(str).map(lambda u: f"{user_win_rate_map.get(u, 0.0):.2f}%")
                 all_users["created_at"] = all_users["created_at"].apply(fmt_nairobi)
                 all_users["tracking_started_at"] = all_users["tracking_started_at"].apply(fmt_nairobi)
-                user_cols = ["username", "email", "role", "watchlist_count", "watchlist", "account_size", "risk_pct", "leverage", "preferred_timeframe", "telegram_activated", "created_at", "tracking_started_at"]
+                user_cols = ["username", "email", "role", "win_rate", "watchlist_count", "watchlist", "account_size", "risk_pct", "leverage", "preferred_timeframe", "telegram_activated", "created_at", "tracking_started_at"]
                 all_users = all_users[[c for c in user_cols if c in all_users.columns]]
-                render_benzino_aggrid(all_users, key="admin_user_management", title="User Management", height=360, page_size=10, pinned=["username"], numeric_cols_right=["watchlist_count", "account_size", "risk_pct", "leverage"], badge_cols={"telegram_activated": "status"})
+                render_benzino_aggrid(all_users, key="admin_user_management", title="User Management", height=360, page_size=10, pinned=["username"], numeric_cols_right=["watchlist_count", "account_size", "risk_pct", "leverage", "win_rate"], badge_cols={"telegram_activated": "status"})
 
 
         with st.expander("Profile email and password", expanded=False):
@@ -4475,12 +4662,12 @@ def render_settings(username: str, settings: dict) -> None:
             wl_system_df = wl_system_df.copy()
             wl_system_df["outcome"] = wl_system_df.apply(outcome_label, axis=1)
             wl_graded = wl_system_df[wl_system_df["grade"].astype(str).isin(VALID_GRADES)].copy()
-            wl_resolved_all = wl_graded[wl_graded["outcome"].isin(["WIN", "LOSS"])].copy()
-            system_win_rate = (wl_resolved_all["outcome"].eq("WIN").mean() * 100) if len(wl_resolved_all) else 0.0
+            wl_resolved_all = wl_graded[wl_graded["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])].copy()
+            system_win_rate = (wl_resolved_all["outcome"].eq("WIN").sum() / len(wl_resolved_all) * 100) if len(wl_resolved_all) else 0.0
 
             wl_user_df = wl_graded[wl_graded["asset"].astype(str).isin(current_set)].copy()
-            wl_resolved_user = wl_user_df[wl_user_df["outcome"].isin(["WIN", "LOSS"])].copy()
-            user_win_rate = (wl_resolved_user["outcome"].eq("WIN").mean() * 100) if len(wl_resolved_user) else 0.0
+            wl_resolved_user = wl_user_df[wl_user_df["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])].copy()
+            user_win_rate = (wl_resolved_user["outcome"].eq("WIN").sum() / len(wl_resolved_user) * 100) if len(wl_resolved_user) else 0.0
 
             wl_user_open = wl_user_df[wl_user_df["status"].astype(str).str.upper().eq("OPEN")]
             wl_user_avg_r = pd.to_numeric(wl_resolved_user.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean() if len(wl_resolved_user) else 0.0
@@ -4634,6 +4821,8 @@ def main() -> None:
         render_opportunity_board(username, settings)
     elif page == "Asset Deep Dive":
         render_asset_deep_dive(username, settings)
+    elif page == "Market News":
+        render_market_news(username, settings)
     elif page == "Workflow":
         render_workflow(username, settings)
     else:
