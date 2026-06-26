@@ -3352,9 +3352,17 @@ def render_opportunity_board(username: str, settings: dict) -> None:
     with right:
         with st.container(border=True, height=440):
             st.markdown("<div class='benzino-panel-title'>Performance by Grade</div>", unsafe_allow_html=True)
-            grade_order = ["A+", "A", "B", "C", "NO TRADE"]
-            grade_colors = {"A+": "#00D4A3", "A": "#4C8CFF", "B": "#D6A84E", "C": "#FF5D5D", "NO TRADE": "#7C5CFF"}
-            counts = df["grade"].astype(str).value_counts().reindex(grade_order).fillna(0).astype(int)
+            # Real performance only: exclude research / No Trade rows from grade analytics.
+            grade_order = ["A+", "A", "B", "C"]
+            grade_colors = {"A+": "#00D4A3", "A": "#4C8CFF", "B": "#D6A84E", "C": "#FF5D5D"}
+            counts = (
+                df[df["grade"].astype(str).isin(grade_order)]["grade"]
+                .astype(str)
+                .value_counts()
+                .reindex(grade_order)
+                .fillna(0)
+                .astype(int)
+            )
             counts = counts[counts > 0]
             if counts.empty:
                 st.markdown("<div class='benzino-empty-note'>No performance data yet for this watchlist/timeframe.</div>", unsafe_allow_html=True)
