@@ -2079,38 +2079,42 @@ def benzino_aggrid_css() -> dict:
 
 def format_market_price(value):
     """
-    Preserve market-specific precision instead of forcing every asset to 2dp.
-
-    Examples:
-        EURUSD  -> 1.156734
-        USDJPY  -> 145.32
-        XAUUSD  -> 3360.25
-        BTCUSD  -> 107842.50
-
-    Keeps up to 6 decimals and removes unnecessary trailing zeroes while
-    ensuring prices still look clean across all asset classes.
+    Display prices with market precision:
+    - Keeps up to 6 decimal places for FX / low-price assets.
+    - Removes unnecessary trailing zeroes.
+    - Keeps at least 2 decimals when there is a decimal.
     """
     try:
-        if pd.isna(value):
+        if value is None or pd.isna(value):
+            return ""
+        x = float(value)
+        if not np.isfinite(x):
             return ""
 
-        x = float(value)
-
-        # Integers stay as integers.
-        if float(x).is_integer():
-            return f"{int(x)}"
-
-        formatted = f"{x:.6f}".rstrip("0").rstrip(".")
-
-        # Keep at least two decimals for normal price displays.
-        if "." in formatted:
-            whole, frac = formatted.split(".", 1)
+        s = f"{x:.6f}".rstrip("0").rstrip(".")
+        if "." in s:
+            whole, frac = s.split(".", 1)
             if len(frac) == 1:
-                formatted += "0"
-
-        return formatted
+                s += "0"
+        return s
     except Exception:
-        return value
+        return "" if value is None else str(value)
+
+
+def is_price_display_column(col_name: str) -> bool:
+    c = str(col_name or "").strip().lower()
+    c = c.replace("_", " ").replace("-", " ")
+    c = re.sub(r"\s+", " ", c)
+
+    exact = {
+        "entry", "sl", "tp", "exit price", "exit", "price",
+        "hypothetical exit", "hypothetical entry", "hypothetical sl", "hypothetical tp",
+        "open", "high", "low", "close"
+    }
+    if c in exact:
+        return True
+
+    return any(token in c for token in ("entry", "sl", "tp", "exit price", "hypothetical exit"))
 
 
 def render_benzino_aggrid(
@@ -2150,14 +2154,11 @@ def render_benzino_aggrid(
         rest = [c for c in view.columns if c not in ordered]
         view = view[ordered + rest]
 
-    # Preserve instrument precision (e.g. EURUSD 1.156734 vs XAUUSD 3360.25)
-    # instead of forcing everything to two decimal places.
-    price_like_cols = {
-        "Entry", "SL", "TP", "Exit Price", "entry", "sl", "tp", "exit_price"
-    }
-
+    # Market-aware table formatting:
+    # Price columns keep up to 6 decimals where needed, while non-price metrics
+    # remain at 2 decimals for readability.
     for _col in view.columns:
-        if _col in price_like_cols and pd.api.types.is_numeric_dtype(view[_col]):
+        if is_price_display_column(_col):
             view[_col] = view[_col].apply(format_market_price)
         elif pd.api.types.is_numeric_dtype(view[_col]):
             view[_col] = view[_col].apply(
