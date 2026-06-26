@@ -3901,10 +3901,10 @@ def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
     no_trade = system_df[system_df["grade"].astype(str).eq("NO TRADE")].copy()
     open_trades = graded[graded["status"].astype(str).str.upper().eq("OPEN")].copy()
     closed = graded[graded["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])].copy()
-    resolved = closed[closed["outcome"].isin(["WIN", "LOSS"])].copy()
+    resolved = closed.copy()
 
-    win_rate = (resolved["outcome"].eq("WIN").mean() * 100) if len(resolved) else 0.0
-    avg_r = pd.to_numeric(resolved.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean() if len(resolved) else 0.0
+    win_rate = (closed["outcome"].eq("WIN").sum() / len(closed) * 100) if len(closed) else 0.0
+    avg_r = pd.to_numeric(closed.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean() if len(closed) else 0.0
 
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1: metric_card("All scanner rows", f"{len(system_df):,}", "Full Supabase history")
@@ -3922,8 +3922,8 @@ def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
 
     g1, g2 = st.columns(2)
     with g1:
-        grade_perf = resolved.groupby("grade", as_index=False).agg(
-            win_rate=("outcome", lambda x: (x == "WIN").mean() * 100),
+        grade_perf = closed.groupby("grade", as_index=False).agg(
+            win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100 if len(x) else 0),
             trades=("signal_id", "count"),
             avg_r=("r_multiple", "mean"),
         ).sort_values("grade")
@@ -3931,8 +3931,8 @@ def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
         render_benzino_aggrid(grade_perf, key="system_perf_grade", height=240, page_size=10, pinned=["grade"], badge_cols={"grade":"grade", "Grade":"grade"}, numeric_cols_right=[c for c in grade_perf.columns if c not in ["grade", "Grade"]], enable_search=False, show_footer=False, use_pagination=False)
 
     with g2:
-        session_perf = resolved.groupby("session", as_index=False).agg(
-            win_rate=("outcome", lambda x: (x == "WIN").mean() * 100),
+        session_perf = closed.groupby("session", as_index=False).agg(
+            win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100 if len(x) else 0),
             trades=("signal_id", "count"),
             avg_r=("r_multiple", "mean"),
         ).sort_values("trades", ascending=False)
@@ -3941,8 +3941,8 @@ def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
 
     a1, a2 = st.columns(2)
     with a1:
-        timeframe_perf = resolved.groupby("timeframe", as_index=False).agg(
-            win_rate=("outcome", lambda x: (x == "WIN").mean() * 100),
+        timeframe_perf = closed.groupby("timeframe", as_index=False).agg(
+            win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100 if len(x) else 0),
             trades=("signal_id", "count"),
             avg_r=("r_multiple", "mean"),
         ).sort_values("timeframe")
@@ -3950,8 +3950,8 @@ def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
         render_benzino_aggrid(timeframe_perf, key="system_perf_timeframe_split", height=240, page_size=10, pinned=["timeframe"], numeric_cols_right=[c for c in timeframe_perf.columns if c != "timeframe"], enable_search=False, show_footer=False, use_pagination=False)
 
     with a2:
-        asset_perf = resolved.groupby("asset", as_index=False).agg(
-            win_rate=("outcome", lambda x: (x == "WIN").mean() * 100),
+        asset_perf = closed.groupby("asset", as_index=False).agg(
+            win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100 if len(x) else 0),
             trades=("signal_id", "count"),
             avg_r=("r_multiple", "mean"),
         ).sort_values(["trades", "win_rate"], ascending=[False, False])
@@ -4202,20 +4202,20 @@ def render_workflow(username: str, settings: dict) -> None:
             st.subheader("User split analysis")
             ug1, ug2 = st.columns(2)
             with ug1:
-                grade_perf = resolved.groupby("grade", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").mean() * 100), trades=("signal_id", "count"))
+                grade_perf = resolved.groupby("grade", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100 if len(x) else 0), trades=("signal_id", "count"))
                 st.markdown("**By grade**")
                 render_benzino_aggrid(grade_perf, key="journal_grade_perf", height=240, page_size=10, pinned=["grade"], badge_cols={"grade":"grade", "Grade":"grade"}, numeric_cols_right=[c for c in grade_perf.columns if c not in ["grade", "Grade"]], enable_search=False, show_footer=False, use_pagination=False)
             with ug2:
-                session_perf = resolved.groupby("session", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").mean() * 100), trades=("signal_id", "count"))
+                session_perf = resolved.groupby("session", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100 if len(x) else 0), trades=("signal_id", "count"))
                 st.markdown("**By session**")
                 render_benzino_aggrid(session_perf, key="journal_session_perf", height=240, page_size=10, pinned=["session"], numeric_cols_right=[c for c in session_perf.columns if c not in ["session", "Session"]], enable_search=False, show_footer=False, use_pagination=False)
             ut1, ut2 = st.columns(2)
             with ut1:
-                timeframe_perf = resolved.groupby("timeframe", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").mean() * 100), trades=("signal_id", "count"))
+                timeframe_perf = resolved.groupby("timeframe", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100 if len(x) else 0), trades=("signal_id", "count"))
                 st.markdown("**By timeframe**")
                 render_benzino_aggrid(timeframe_perf, key="journal_timeframe_perf", height=240, page_size=10, pinned=["timeframe"], numeric_cols_right=[c for c in timeframe_perf.columns if c != "timeframe"], enable_search=False, show_footer=False, use_pagination=False)
             with ut2:
-                asset_perf = resolved.groupby("asset", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").mean() * 100), trades=("signal_id", "count"))
+                asset_perf = resolved.groupby("asset", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100 if len(x) else 0), trades=("signal_id", "count"))
                 st.markdown("**By asset**")
                 render_benzino_aggrid(asset_perf.sort_values("trades", ascending=False), key="journal_asset_perf", height=240, page_size=10, pinned=["asset"], numeric_cols_right=[c for c in asset_perf.columns if c != "asset"], enable_search=False, show_footer=False, use_pagination=False)
 
@@ -4365,9 +4365,7 @@ def render_workflow(username: str, settings: dict) -> None:
         with h2: metric_card("Hypothetically resolved", f"{len(no_trades_resolved):,}", "Scanner checked TP/SL/expiry")
         if not no_trades_resolved.empty:
             hyp_wins = no_trades_resolved["shadow_outcome"].astype(str).eq("SHADOW_TP")
-            hyp_losses = no_trades_resolved["shadow_outcome"].astype(str).eq("SHADOW_SL")
-            resolved_binary = hyp_wins | hyp_losses
-            hyp_win_rate = (hyp_wins.sum() / resolved_binary.sum() * 100) if resolved_binary.sum() else 0.0
+            hyp_win_rate = (hyp_wins.sum() / len(no_trades_resolved) * 100) if len(no_trades_resolved) else 0.0
             with h3: metric_card("Hypothetical win rate", f"{hyp_win_rate:.2f}%", "Not part of real journal win rate")
             with h4: metric_card("Hypothetical avg R", f"{pd.to_numeric(no_trades_resolved['shadow_r_multiple'], errors='coerce').mean():+.2f}R", "Across resolved blocked ideas")
             st.markdown(
@@ -4406,20 +4404,20 @@ def render_workflow(username: str, settings: dict) -> None:
                 "collecting data, but watch open exposure and avoid changing the rules too early."
             )
         else:
-            resolved = closed_trades[closed_trades["outcome"].isin(["WIN", "LOSS"])].copy()
+            resolved = closed_trades[closed_trades["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])].copy()
             notes = list(prop_notes)
             if not resolved.empty:
-                asset_perf = resolved.groupby("asset").agg(win_rate=("outcome", lambda x: (x == "WIN").mean()), trades=("signal_id", "count"), avg_r=("r_multiple", "mean")).reset_index()
+                asset_perf = resolved.groupby("asset").agg(win_rate=("outcome", lambda x: ((x == "WIN").sum() / len(x)) if len(x) else 0), trades=("signal_id", "count"), avg_r=("r_multiple", "mean")).reset_index()
                 asset_perf = asset_perf[asset_perf["trades"] >= 5].sort_values(["win_rate", "avg_r"], ascending=False)
                 if not asset_perf.empty:
                     best = asset_perf.iloc[0]
                     notes.append(f"Your strongest supported asset is **{best['asset']}**: {best['trades']} closed trades, {best['win_rate']*100:.2f}% win rate, average {best['avg_r']:+.2f}R. Treat this as the playbook to repeat, not just a lucky asset.")
-                weak = resolved.groupby("asset").agg(win_rate=("outcome", lambda x: (x == "WIN").mean()), trades=("signal_id", "count"), avg_r=("r_multiple", "mean")).reset_index()
+                weak = resolved.groupby("asset").agg(win_rate=("outcome", lambda x: ((x == "WIN").sum() / len(x)) if len(x) else 0), trades=("signal_id", "count"), avg_r=("r_multiple", "mean")).reset_index()
                 weak = weak[weak["trades"] >= 5].sort_values(["win_rate", "avg_r"], ascending=True)
                 if not weak.empty:
                     w = weak.iloc[0]
                     notes.append(f"Your weakest supported area is **{w['asset']}**: {w['trades']} closed trades and {w['win_rate']*100:.2f}% win rate. Reduce size or demand stronger MTF confirmation here until the numbers improve.")
-                session_perf = resolved.groupby("session").agg(win_rate=("outcome", lambda x: (x == "WIN").mean()), trades=("signal_id", "count"), avg_r=("r_multiple", "mean")).reset_index()
+                session_perf = resolved.groupby("session").agg(win_rate=("outcome", lambda x: ((x == "WIN").sum() / len(x)) if len(x) else 0), trades=("signal_id", "count"), avg_r=("r_multiple", "mean")).reset_index()
                 session_perf = session_perf[session_perf["trades"] >= 5].sort_values(["win_rate", "avg_r"], ascending=False)
                 if not session_perf.empty:
                     srow = session_perf.iloc[0]
@@ -4680,25 +4678,25 @@ def render_settings(username: str, settings: dict) -> None:
             wl_system_df = wl_system_df.copy()
             wl_system_df["outcome"] = wl_system_df.apply(outcome_label, axis=1)
             wl_graded = wl_system_df[wl_system_df["grade"].astype(str).isin(VALID_GRADES)].copy()
-            wl_resolved_all = wl_graded[wl_graded["outcome"].isin(["WIN", "LOSS"])].copy()
-            system_win_rate = (wl_resolved_all["outcome"].eq("WIN").mean() * 100) if len(wl_resolved_all) else 0.0
+            wl_resolved_all = wl_graded[wl_graded["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])].copy()
+            system_win_rate = (wl_resolved_all["outcome"].eq("WIN").sum() / len(wl_resolved_all) * 100) if len(wl_resolved_all) else 0.0
 
             wl_user_df = wl_graded[wl_graded["asset"].astype(str).isin(current_set)].copy()
-            wl_resolved_user = wl_user_df[wl_user_df["outcome"].isin(["WIN", "LOSS"])].copy()
-            user_win_rate = (wl_resolved_user["outcome"].eq("WIN").mean() * 100) if len(wl_resolved_user) else 0.0
+            wl_resolved_user = wl_user_df[wl_user_df["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])].copy()
+            user_win_rate = (wl_resolved_user["outcome"].eq("WIN").sum() / len(wl_resolved_user) * 100) if len(wl_resolved_user) else 0.0
 
             wl_user_open = wl_user_df[wl_user_df["status"].astype(str).str.upper().eq("OPEN")]
             wl_user_avg_r = pd.to_numeric(wl_resolved_user.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean() if len(wl_resolved_user) else 0.0
 
             wm1, wm2, wm3, wm4, wm5 = st.columns(5)
             with wm1:
-                metric_card("System win rate", f"{system_win_rate:.2f}%", f"{len(wl_resolved_all):,} resolved · all assets")
+                metric_card("System win rate", f"{system_win_rate:.2f}%", f"{len(wl_resolved_all):,} closed · all assets")
             with wm2:
-                metric_card("Watchlist win rate", f"{user_win_rate:.2f}%", f"{len(wl_resolved_user):,} resolved · your {len(current_set)} assets")
+                metric_card("Watchlist win rate", f"{user_win_rate:.2f}%", f"{len(wl_resolved_user):,} closed · your {len(current_set)} assets")
             with wm3:
                 metric_card("Watchlist open trades", f"{len(wl_user_open):,}", "Currently active")
             with wm4:
-                metric_card("Watchlist avg R", f"{wl_user_avg_r:+.2f}", "Resolved trades only")
+                metric_card("Watchlist avg R", f"{wl_user_avg_r:+.2f}", "Closed trades only")
             with wm5:
                 metric_card("Watchlist coverage", f"{len(current_set)}/{len(ASSET_UNIVERSE)}", "Assets enabled")
         else:
