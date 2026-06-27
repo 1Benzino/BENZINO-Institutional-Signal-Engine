@@ -3352,11 +3352,20 @@ def render_opportunity_board(username: str, settings: dict) -> None:
     with right:
         with st.container(border=True, height=440):
             st.markdown("<div class='benzino-panel-title'>Performance by Grade</div>", unsafe_allow_html=True)
-            # Real performance only: exclude research / No Trade rows from grade analytics.
+            # Match Workflow → User split analysis exactly:
+            # grade performance is based on CLOSED journal trades only, excluding No Trade.
             grade_order = ["A+", "A", "B", "C"]
             grade_colors = {"A+": "#00D4A3", "A": "#4C8CFF", "B": "#D6A84E", "C": "#FF5D5D"}
+
+            grade_source = df.copy()
+            grade_source["outcome"] = grade_source.apply(outcome_label, axis=1)
+            grade_source = grade_source[
+                grade_source["grade"].astype(str).isin(grade_order)
+                & grade_source["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])
+            ].copy()
+
             counts = (
-                df[df["grade"].astype(str).isin(grade_order)]["grade"]
+                grade_source["grade"]
                 .astype(str)
                 .value_counts()
                 .reindex(grade_order)
@@ -3365,7 +3374,7 @@ def render_opportunity_board(username: str, settings: dict) -> None:
             )
             counts = counts[counts > 0]
             if counts.empty:
-                st.markdown("<div class='benzino-empty-note'>No performance data yet for this watchlist/timeframe.</div>", unsafe_allow_html=True)
+                st.markdown("<div class='benzino-empty-note'>No closed performance data yet for this watchlist/timeframe.</div>", unsafe_allow_html=True)
             else:
                 total = int(counts.sum())
                 fig = go.Figure(data=[go.Pie(
@@ -3380,7 +3389,7 @@ def render_opportunity_board(username: str, settings: dict) -> None:
                 fig.update_layout(
                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                     showlegend=False, margin=dict(l=2, r=2, t=0, b=0), height=288,
-                    annotations=[dict(text=f"<b>{total}</b><br><span style='font-size:11px'>Total Trades</span>", x=0.5, y=0.5, font=dict(size=24, color="#E8EDF2"), showarrow=False)],
+                    annotations=[dict(text=f"<b>{total}</b><br><span style='font-size:11px'>Closed Trades</span>", x=0.5, y=0.5, font=dict(size=24, color="#E8EDF2"), showarrow=False)],
                 )
                 fig.update_traces(domain=dict(x=[0.07, 0.93], y=[0.03, 0.97]))
                 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
@@ -4101,6 +4110,8 @@ def fetch_news_for_watchlist(asset_list: tuple[str, ...], api_key: str) -> pd.Da
                 rows.append({
                     "Asset": asset,
                     "Headline": title,
+                    "Description": desc,
+                    "Content": item.get("content") or "",
                     "Source": (item.get("source") or {}).get("name", ""),
                     "Published": fmt_nairobi(item.get("publishedAt", "")),
                     "Sentiment": sentiment,
@@ -4120,6 +4131,87 @@ def fetch_news_for_watchlist(asset_list: tuple[str, ...], api_key: str) -> pd.Da
                 "URL": "",
             })
     return pd.DataFrame(rows)
+
+
+
+def news_why_it_matters(row: dict) -> str:
+    """Small deterministic explanation for the Market News detail popup."""
+    headline = str(row.get("Headline", "") or "")
+    desc = str(row.get("Description", "") or "")
+    blob = f"{headline} {desc}".lower()
+
+    reasons = []
+    if any(k in blob for k in ["fed", "fomc", "interest rate", "central bank", "cpi", "inflation", "nfp", "payrolls"]):
+        reasons.append("macro/rates language appears in the story, so it can affect broad risk sentiment, currencies, gold, indices, and crypto.")
+    if any(k in blob for k in ["earnings", "guidance", "revenue", "profit", "forecast"]):
+        reasons.append("company earnings or guidance language appears, so it may directly affect equity and index sentiment.")
+    if any(k in blob for k in ["war", "conflict", "sanction", "tariff", "geopolitical"]):
+        reasons.append("geopolitical risk language appears, which can move safe havens, oil, gold, and risk assets quickly.")
+    if any(k in blob for k in ["oil", "opec", "inventory", "crude", "gas"]):
+        reasons.append("energy-market language appears, so oil, Brent, natural gas, inflation expectations, and related FX can be sensitive.")
+    if any(k in blob for k in ["bitcoin", "btc", "ethereum", "eth", "crypto", "etf", "sec"]):
+        reasons.append("crypto-specific language appears, so BTC/ETH sentiment may react more directly.")
+
+    if not reasons:
+        reasons.append("the headline is relevant to the selected watchlist asset; check whether price is already reacting before treating it as trade evidence.")
+
+    return " ".join(reasons)
+
+
+def render_news_detail_popup(row: dict) -> None:
+    """Show a compact detail window for one selected Market News headline."""
+    if not row:
+        return
+
+    title = str(row.get("Headline", "Market News Detail") or "Market News Detail")
+    asset = str(row.get("Asset", "") or "")
+    source = str(row.get("Source", "") or "")
+    published = str(row.get("Published", "") or "")
+    impact = str(row.get("Impact", "") or "")
+    impact_score = str(row.get("Impact Score", "") or "")
+    sentiment = str(row.get("Sentiment", "") or "")
+    desc = str(row.get("Description", "") or "")
+    content = str(row.get("Content", "") or "")
+    url = str(row.get("URL", "") or "")
+
+    def _body():
+        st.markdown(f"### {html.escape(title)}")
+        st.caption(f"{asset} · {source} · {published}")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            metric_card("Impact", impact, f"Score {impact_score}/100")
+        with c2:
+            metric_card("Sentiment", sentiment, "Headline tone")
+        with c3:
+            metric_card("Asset", asset, "Watchlist match")
+
+        if desc:
+            st.markdown("#### Summary")
+            st.write(desc)
+        elif content:
+            st.markdown("#### Summary")
+            st.write(content)
+
+        st.markdown("#### Why this matters")
+        st.write(news_why_it_matters(row))
+
+        st.markdown("#### Trading note")
+        st.write(
+            "Treat this as market context, not an entry trigger by itself. Confirm whether the scanner signal, session, volatility, and price reaction support the same direction."
+        )
+
+        if url:
+            st.link_button("Open full article", url, use_container_width=True)
+
+    if hasattr(st, "dialog"):
+        @st.dialog("News Detail")
+        def _dialog():
+            _body()
+        _dialog()
+    else:
+        with st.expander("News Detail", expanded=True):
+            _body()
+
 
 
 def render_market_news(username: str, settings: dict) -> None:
@@ -4153,16 +4245,68 @@ def render_market_news(username: str, settings: dict) -> None:
     if sentiment_filter != "All":
         view = view[view["Sentiment"].astype(str).eq(sentiment_filter)]
 
-    render_benzino_aggrid(
-        view[["Asset", "Headline", "Source", "Published", "Sentiment", "Impact", "Impact Score"]],
-        key="market_news_table",
-        title="Watchlist News",
-        height=560,
-        page_size=12,
-        pinned=["Asset"],
-        badge_cols={"Sentiment": "status", "Impact": "grade"},
-        numeric_cols_right=["Impact Score"],
-    )
+    table_view = view[["Asset", "Headline", "Source", "Published", "Sentiment", "Impact", "Impact Score", "Description", "Content", "URL"]].copy()
+
+    st.markdown("<div class='benzino-panel-title'>Watchlist News</div>", unsafe_allow_html=True)
+    st.caption("Select a headline row to open a detail window with summary, impact reasoning, and the full-article link.")
+
+    if AgGrid is not None and GridOptionsBuilder is not None:
+        display_view = table_view[["Asset", "Headline", "Source", "Published", "Sentiment", "Impact", "Impact Score"]].copy()
+        gb = GridOptionsBuilder.from_dataframe(display_view)
+        gb.configure_default_column(sortable=True, filter=True, resizable=True, wrapText=True, autoHeight=True)
+        gb.configure_selection(selection_mode="single", use_checkbox=False)
+        gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=12)
+        gb.configure_grid_options(
+            rowHeight=52,
+            headerHeight=44,
+            suppressMenuHide=True,
+            domLayout="normal",
+            animateRows=True,
+            quickFilterText=None,
+        )
+        renderers = aggrid_badge_renderers()
+        if "Asset" in display_view.columns:
+            gb.configure_column("Asset", pinned="left")
+        if "Sentiment" in display_view.columns and "status" in renderers:
+            gb.configure_column("Sentiment", cellRenderer=renderers["status"])
+        if "Impact" in display_view.columns and "grade" in renderers:
+            gb.configure_column("Impact", cellRenderer=renderers["grade"])
+        if "Impact Score" in display_view.columns:
+            gb.configure_column("Impact Score", cellStyle={"textAlign": "right", "fontWeight": "700"})
+
+        news_response = AgGrid(
+            display_view,
+            gridOptions=gb.build(),
+            height=560,
+            fit_columns_on_grid_load=False,
+            theme="balham",
+            allow_unsafe_jscode=True,
+            custom_css=benzino_aggrid_css(),
+            key="market_news_table_selectable",
+        )
+
+        selected = news_response.get("selected_rows", [])
+        if isinstance(selected, pd.DataFrame):
+            selected_rows = selected.to_dict("records")
+        else:
+            selected_rows = selected or []
+
+        if selected_rows:
+            selected_headline = str(selected_rows[0].get("Headline", ""))
+            detail_rows = table_view[table_view["Headline"].astype(str).eq(selected_headline)].head(1)
+            if not detail_rows.empty:
+                render_news_detail_popup(detail_rows.iloc[0].to_dict())
+    else:
+        render_benzino_aggrid(
+            table_view[["Asset", "Headline", "Source", "Published", "Sentiment", "Impact", "Impact Score"]],
+            key="market_news_table",
+            title="Watchlist News",
+            height=560,
+            page_size=12,
+            pinned=["Asset"],
+            badge_cols={"Sentiment": "status", "Impact": "grade"},
+            numeric_cols_right=["Impact Score"],
+        )
 
 
 def render_workflow(username: str, settings: dict) -> None:
