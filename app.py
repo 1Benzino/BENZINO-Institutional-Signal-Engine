@@ -4666,24 +4666,46 @@ def render_workflow(username: str, settings: dict) -> None:
 
 
 
-def user_win_rate_for_admin(username: str, user_settings: dict | None = None) -> str:
-    """Closed-trade win rate for the admin user-management table."""
+def user_performance_for_admin(username: str, user_settings: dict | None = None) -> dict:
+    """Per-user admin metrics using each user's own watchlist, tracking date and preferred timeframe."""
+    settings = DEFAULT_SETTINGS.copy()
+    if isinstance(user_settings, dict):
+        settings.update(user_settings)
+
+    preferred_tf = str(settings.get("preferred_timeframe") or settings.get("view_timeframe") or "1h")
+    settings["view_timeframe"] = preferred_tf
+
+    starting_balance = float(settings.get("account_size", 10000) or 10000)
+
+    result = {
+        "win_rate": "0.00%",
+        "starting_balance": f"${starting_balance:,.2f}",
+        "current_balance": f"${starting_balance:,.2f}",
+    }
+
     try:
-        settings = DEFAULT_SETTINGS.copy()
-        if isinstance(user_settings, dict):
-            settings.update(user_settings)
         df = load_signals_for_user(username, settings)
-        if df.empty:
-            return "0.00%"
+        df = apply_timeframe_view(df, settings)
+        if df is None or df.empty:
+            return result
+
         df["outcome"] = df.apply(outcome_label, axis=1)
         trades = df[df["grade"].astype(str).isin(VALID_GRADES)].copy()
+        perf = compute_user_performance(trades, settings, prop_mode=False)
+
         closed = trades[trades["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])].copy()
-        if closed.empty:
-            return "0.00%"
-        wins = closed["outcome"].astype(str).eq("WIN").sum()
-        return f"{wins / len(closed) * 100:.2f}%"
+        wins = int(closed["outcome"].astype(str).eq("WIN").sum()) if not closed.empty else 0
+        result["win_rate"] = f"{(wins / len(closed) * 100):.2f}%" if len(closed) else "0.00%"
+        result["starting_balance"] = f"${float(perf.get('starting_balance', starting_balance)):,.2f}"
+        result["current_balance"] = f"${float(perf.get('current_balance', starting_balance)):,.2f}"
+        return result
     except Exception:
-        return "0.00%"
+        return result
+
+
+def user_win_rate_for_admin(username: str, user_settings: dict | None = None) -> str:
+    """Backward-compatible wrapper."""
+    return user_performance_for_admin(username, user_settings).get("win_rate", "0.00%")
 
 
 def render_settings(username: str, settings: dict) -> None:
@@ -4734,14 +4756,22 @@ def render_settings(username: str, settings: dict) -> None:
                 all_users["risk_pct"] = all_users["username"].astype(str).map(lambda u: settings_map.get(u, {}).get("risk_pct", ""))
                 all_users["leverage"] = all_users["username"].astype(str).map(lambda u: settings_map.get(u, {}).get("leverage", ""))
                 all_users["preferred_timeframe"] = all_users["username"].astype(str).map(lambda u: settings_map.get(u, {}).get("preferred_timeframe", ""))
-                all_users["win_rate"] = all_users["username"].astype(str).map(lambda u: user_win_rate_for_admin(u, settings_map.get(u, {})))
+
+                admin_perf_map = {
+                    str(u): user_performance_for_admin(str(u), settings_map.get(str(u), {}))
+                    for u in all_users["username"].astype(str).tolist()
+                }
+                all_users["win_rate"] = all_users["username"].astype(str).map(lambda u: admin_perf_map.get(u, {}).get("win_rate", "0.00%"))
+                all_users["starting_balance"] = all_users["username"].astype(str).map(lambda u: admin_perf_map.get(u, {}).get("starting_balance", "$0.00"))
+                all_users["current_balance"] = all_users["username"].astype(str).map(lambda u: admin_perf_map.get(u, {}).get("current_balance", "$0.00"))
+
                 all_users["tracking_started_at"] = all_users["username"].astype(str).map(lambda u: settings_map.get(u, {}).get("tracking_started_at", ""))
                 all_users["telegram_activated"] = all_users["username"].astype(str).map(lambda u: "Yes" if telegram_map.get(u) else "No")
                 all_users["created_at"] = all_users["created_at"].apply(fmt_nairobi)
                 all_users["tracking_started_at"] = all_users["tracking_started_at"].apply(fmt_nairobi)
-                user_cols = ["username", "email", "role", "win_rate", "watchlist_count", "watchlist", "account_size", "risk_pct", "leverage", "preferred_timeframe", "telegram_activated", "created_at", "tracking_started_at"]
+                user_cols = ["username", "email", "role", "win_rate", "starting_balance", "current_balance", "preferred_timeframe", "watchlist_count", "watchlist", "account_size", "risk_pct", "leverage", "telegram_activated", "created_at", "tracking_started_at"]
                 all_users = all_users[[c for c in user_cols if c in all_users.columns]]
-                render_benzino_aggrid(all_users, key="admin_user_management", title="User Management", height=360, page_size=10, pinned=["username"], numeric_cols_right=["win_rate", "watchlist_count", "account_size", "risk_pct", "leverage"], badge_cols={"telegram_activated": "status"})
+                render_benzino_aggrid(all_users, key="admin_user_management", title="User Management", height=420, page_size=10, pinned=["username"], numeric_cols_right=["watchlist_count", "account_size", "risk_pct", "leverage"], badge_cols={"telegram_activated": "status"})
 
 
         with st.expander("Profile email and password", expanded=False):
