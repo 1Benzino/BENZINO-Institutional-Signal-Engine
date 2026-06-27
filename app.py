@@ -1407,6 +1407,62 @@ def outcome_label(row) -> str:
     return "SHADOW"
 
 
+
+def resolved_outcome_masks(df: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    """Resolved outcome masks for win-rate calculations.
+
+    Win-rate denominator includes:
+    CLOSED_TP, CLOSED_SL, EXPIRED_WIN, EXPIRED_LOSS, BREAKEVEN and EXPIRED_BREAKEVEN.
+    Generic CLOSED/EXPIRED rows are classified using r_multiple where available.
+    """
+    if df is None or df.empty:
+        empty = pd.Series([], dtype=bool)
+        return empty, empty, empty, empty
+
+    status = df.get("status", pd.Series("", index=df.index)).astype(str).str.upper()
+    outcome = df.get("outcome", pd.Series("", index=df.index)).astype(str).str.upper()
+    r = pd.to_numeric(df.get("r_multiple", pd.Series(np.nan, index=df.index)), errors="coerce")
+
+    wins = (
+        status.isin(["CLOSED_TP", "EXPIRED_WIN"])
+        | outcome.isin(["WIN", "EXPIRED_WIN"])
+        | ((status.str.contains("TP", na=False) | status.str.contains("WIN", na=False)) & ~status.str.contains("SHADOW", na=False))
+    )
+
+    losses = (
+        status.isin(["CLOSED_SL", "EXPIRED_LOSS"])
+        | outcome.isin(["LOSS", "EXPIRED_LOSS"])
+        | ((status.str.contains("SL", na=False) | status.str.contains("LOSS", na=False)) & ~status.str.contains("SHADOW", na=False))
+    )
+
+    breakevens = (
+        status.isin(["BREAKEVEN", "EXPIRED_BREAKEVEN", "CLOSED_BE"])
+        | outcome.isin(["BREAKEVEN", "EXPIRED_BREAKEVEN"])
+    )
+
+    generic_resolved = (
+        (status.str.contains("EXPIRED", na=False) | status.eq("CLOSED"))
+        & ~(wins | losses | breakevens)
+        & r.notna()
+    )
+    wins = wins | (generic_resolved & (r > 0))
+    losses = losses | (generic_resolved & (r < 0))
+    breakevens = breakevens | (generic_resolved & (r == 0))
+
+    resolved = wins | losses | breakevens
+    return wins, losses, breakevens, resolved
+
+
+def win_rate_from_resolved(df: pd.DataFrame) -> float:
+    """Win rate = wins / resolved outcomes, including expired wins/losses."""
+    if df is None or df.empty:
+        return 0.0
+    wins, losses, breakevens, resolved = resolved_outcome_masks(df)
+    total = int(resolved.sum())
+    return float(wins.sum() / total * 100) if total else 0.0
+
+
+
 def compute_user_performance(df: pd.DataFrame, settings: dict, prop_mode: bool = False) -> dict:
     """Compute dynamic account performance from the user-filtered scanner journal.
 
@@ -1466,8 +1522,7 @@ def compute_user_performance(df: pd.DataFrame, settings: dict, prop_mode: bool =
         out["realised_pnl"] = realised
         out["current_balance"] = account + realised
         out["roi_pct"] = (realised / account) * 100 if account else 0.0
-        wins = closed["pnl_cash"] > 0
-        out["win_rate"] = float(wins.sum() / len(closed) * 100) if len(closed) else 0.0
+        out["win_rate"] = win_rate_from_resolved(closed)
         try:
             out["trading_days"] = int(pd.to_datetime(closed["created_at"], utc=True, errors="coerce").dt.date.nunique())
         except Exception:
@@ -1557,12 +1612,11 @@ def compute_dashboard_summary(df: pd.DataFrame, settings: dict) -> dict:
     closed = closed.sort_values("created_at")
     out["equity_series"] = closed[["created_at", "balance_after"]].dropna()
 
-    wins = closed["pnl_cash"] > 0
-    losses = closed["pnl_cash"] < 0
-    out["total_trades"] = int(len(closed))
+    wins, losses, breakevens, resolved = resolved_outcome_masks(closed)
+    out["total_trades"] = int(resolved.sum())
     out["winning_trades"] = int(wins.sum())
     out["losing_trades"] = int(losses.sum())
-    out["win_rate"] = float(wins.sum() / len(closed) * 100) if len(closed) else 0.0
+    out["win_rate"] = win_rate_from_resolved(closed)
 
     gross_profit = float(closed.loc[wins, "pnl_cash"].sum())
     gross_loss = float(-closed.loc[losses, "pnl_cash"].sum())
@@ -3940,7 +3994,7 @@ def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
     g1, g2 = st.columns(2)
     with g1:
         grade_perf = closed.groupby("grade", as_index=False).agg(
-            win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100 if len(x) else 0),
+            win_rate=("outcome", lambda x: (x.astype(str).str.upper().isin(["WIN", "EXPIRED_WIN"]).sum() / x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() * 100) if x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() else 0),
             trades=("signal_id", "count"),
             avg_r=("r_multiple", "mean"),
         ).sort_values("grade")
@@ -3949,7 +4003,7 @@ def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
 
     with g2:
         session_perf = closed.groupby("session", as_index=False).agg(
-            win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100 if len(x) else 0),
+            win_rate=("outcome", lambda x: (x.astype(str).str.upper().isin(["WIN", "EXPIRED_WIN"]).sum() / x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() * 100) if x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() else 0),
             trades=("signal_id", "count"),
             avg_r=("r_multiple", "mean"),
         ).sort_values("trades", ascending=False)
@@ -3959,7 +4013,7 @@ def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
     a1, a2 = st.columns(2)
     with a1:
         timeframe_perf = closed.groupby("timeframe", as_index=False).agg(
-            win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100 if len(x) else 0),
+            win_rate=("outcome", lambda x: (x.astype(str).str.upper().isin(["WIN", "EXPIRED_WIN"]).sum() / x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() * 100) if x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() else 0),
             trades=("signal_id", "count"),
             avg_r=("r_multiple", "mean"),
         ).sort_values("timeframe")
@@ -3968,7 +4022,7 @@ def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
 
     with a2:
         asset_perf = closed.groupby("asset", as_index=False).agg(
-            win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100 if len(x) else 0),
+            win_rate=("outcome", lambda x: (x.astype(str).str.upper().isin(["WIN", "EXPIRED_WIN"]).sum() / x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() * 100) if x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() else 0),
             trades=("signal_id", "count"),
             avg_r=("r_multiple", "mean"),
         ).sort_values(["trades", "win_rate"], ascending=[False, False])
@@ -4341,7 +4395,7 @@ def render_workflow(username: str, settings: dict) -> None:
     with t1:
         c1, c2, c3, c4 = st.columns(4)
         resolved = closed_trades[closed_trades["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])]
-        won_trades = int(closed_trades["outcome"].astype(str).eq("WIN").sum()) if not closed_trades.empty else 0
+        won_trades = int(resolved_outcome_masks(closed_trades)[0].sum()) if not closed_trades.empty else 0
         with c1: metric_card("Total journaled", f"{len(trades):,}", "A+/A/B/C setups")
         with c2: metric_card("Open", f"{len(open_trades):,}", "Currently active")
         with c3: metric_card("Closed", f"{len(closed_trades):,}", "Resolved trades")
@@ -4354,20 +4408,20 @@ def render_workflow(username: str, settings: dict) -> None:
             st.subheader("User split analysis")
             ug1, ug2 = st.columns(2)
             with ug1:
-                grade_perf = resolved.groupby("grade", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100 if len(x) else 0), trades=("signal_id", "count"))
+                grade_perf = resolved.groupby("grade", as_index=False).agg(win_rate=("outcome", lambda x: (x.astype(str).str.upper().isin(["WIN", "EXPIRED_WIN"]).sum() / x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() * 100) if x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() else 0), trades=("signal_id", "count"))
                 st.markdown("**By grade**")
                 render_benzino_aggrid(grade_perf, key="journal_grade_perf", height=240, page_size=10, pinned=["grade"], badge_cols={"grade":"grade", "Grade":"grade"}, numeric_cols_right=[c for c in grade_perf.columns if c not in ["grade", "Grade"]], enable_search=False, show_footer=False, use_pagination=False)
             with ug2:
-                session_perf = resolved.groupby("session", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100 if len(x) else 0), trades=("signal_id", "count"))
+                session_perf = resolved.groupby("session", as_index=False).agg(win_rate=("outcome", lambda x: (x.astype(str).str.upper().isin(["WIN", "EXPIRED_WIN"]).sum() / x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() * 100) if x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() else 0), trades=("signal_id", "count"))
                 st.markdown("**By session**")
                 render_benzino_aggrid(session_perf, key="journal_session_perf", height=240, page_size=10, pinned=["session"], numeric_cols_right=[c for c in session_perf.columns if c not in ["session", "Session"]], enable_search=False, show_footer=False, use_pagination=False)
             ut1, ut2 = st.columns(2)
             with ut1:
-                timeframe_perf = resolved.groupby("timeframe", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100 if len(x) else 0), trades=("signal_id", "count"))
+                timeframe_perf = resolved.groupby("timeframe", as_index=False).agg(win_rate=("outcome", lambda x: (x.astype(str).str.upper().isin(["WIN", "EXPIRED_WIN"]).sum() / x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() * 100) if x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() else 0), trades=("signal_id", "count"))
                 st.markdown("**By timeframe**")
                 render_benzino_aggrid(timeframe_perf, key="journal_timeframe_perf", height=240, page_size=10, pinned=["timeframe"], numeric_cols_right=[c for c in timeframe_perf.columns if c != "timeframe"], enable_search=False, show_footer=False, use_pagination=False)
             with ut2:
-                asset_perf = resolved.groupby("asset", as_index=False).agg(win_rate=("outcome", lambda x: (x == "WIN").sum() / len(x) * 100 if len(x) else 0), trades=("signal_id", "count"))
+                asset_perf = resolved.groupby("asset", as_index=False).agg(win_rate=("outcome", lambda x: (x.astype(str).str.upper().isin(["WIN", "EXPIRED_WIN"]).sum() / x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() * 100) if x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() else 0), trades=("signal_id", "count"))
                 st.markdown("**By asset**")
                 render_benzino_aggrid(asset_perf.sort_values("trades", ascending=False), key="journal_asset_perf", height=240, page_size=10, pinned=["asset"], numeric_cols_right=[c for c in asset_perf.columns if c != "asset"], enable_search=False, show_footer=False, use_pagination=False)
 
@@ -4694,8 +4748,7 @@ def user_performance_for_admin(username: str, user_settings: dict | None = None)
         perf = compute_user_performance(trades, settings, prop_mode=False)
 
         closed = trades[trades["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])].copy()
-        wins = int(closed["outcome"].astype(str).eq("WIN").sum()) if not closed.empty else 0
-        result["win_rate"] = f"{(wins / len(closed) * 100):.2f}%" if len(closed) else "0.00%"
+        result["win_rate"] = f"{win_rate_from_resolved(closed):.2f}%" if len(closed) else "0.00%"
         result["starting_balance"] = f"${float(perf.get('starting_balance', starting_balance)):,.2f}"
         result["current_balance"] = f"${float(perf.get('current_balance', starting_balance)):,.2f}"
         return result
