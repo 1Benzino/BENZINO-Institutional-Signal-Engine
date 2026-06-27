@@ -1462,6 +1462,19 @@ def win_rate_from_resolved(df: pd.DataFrame) -> float:
     return float(wins.sum() / total * 100) if total else 0.0
 
 
+def win_rate_group(group: pd.DataFrame) -> float:
+    """Groupby-safe win rate using the same app-wide resolved outcome logic."""
+    return win_rate_from_resolved(group)
+
+
+def closed_resolved_trades(df: pd.DataFrame) -> pd.DataFrame:
+    """Return rows that count as resolved for performance/win-rate analysis."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    wins, losses, breakevens, resolved = resolved_outcome_masks(df)
+    return df.loc[resolved].copy()
+
+
 
 def compute_user_performance(df: pd.DataFrame, settings: dict, prop_mode: bool = False) -> dict:
     """Compute dynamic account performance from the user-filtered scanner journal.
@@ -3971,10 +3984,10 @@ def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
     graded = system_df[system_df["grade"].astype(str).isin(VALID_GRADES)].copy()
     no_trade = system_df[system_df["grade"].astype(str).eq("NO TRADE")].copy()
     open_trades = graded[graded["status"].astype(str).str.upper().eq("OPEN")].copy()
-    closed = graded[graded["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])].copy()
-    resolved = closed.copy()
+    closed = graded[graded["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN"])].copy()
+    resolved = closed_resolved_trades(closed)
 
-    win_rate = (closed["outcome"].eq("WIN").sum() / len(closed) * 100) if len(closed) else 0.0
+    win_rate = win_rate_from_resolved(closed)
     avg_r = pd.to_numeric(closed.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean() if len(closed) else 0.0
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -3993,39 +4006,51 @@ def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
 
     g1, g2 = st.columns(2)
     with g1:
-        grade_perf = closed.groupby("grade", as_index=False).agg(
-            win_rate=("outcome", lambda x: (x.astype(str).str.upper().isin(["WIN", "EXPIRED_WIN"]).sum() / x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() * 100) if x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() else 0),
-            trades=("signal_id", "count"),
-            avg_r=("r_multiple", "mean"),
-        ).sort_values("grade")
+        grade_perf = closed.groupby("grade").apply(
+            lambda g: pd.Series({
+                "win_rate": win_rate_group(g),
+                "trades": len(closed_resolved_trades(g)),
+                "avg_r": pd.to_numeric(g.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean(),
+            }),
+            include_groups=False,
+        ).reset_index().sort_values("grade")
         st.markdown("**By grade**")
         render_benzino_aggrid(grade_perf, key="system_perf_grade", height=240, page_size=10, pinned=["grade"], badge_cols={"grade":"grade", "Grade":"grade"}, numeric_cols_right=[c for c in grade_perf.columns if c not in ["grade", "Grade"]], enable_search=False, show_footer=False, use_pagination=False)
 
     with g2:
-        session_perf = closed.groupby("session", as_index=False).agg(
-            win_rate=("outcome", lambda x: (x.astype(str).str.upper().isin(["WIN", "EXPIRED_WIN"]).sum() / x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() * 100) if x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() else 0),
-            trades=("signal_id", "count"),
-            avg_r=("r_multiple", "mean"),
-        ).sort_values("trades", ascending=False)
+        session_perf = closed.groupby("session").apply(
+            lambda g: pd.Series({
+                "win_rate": win_rate_group(g),
+                "trades": len(closed_resolved_trades(g)),
+                "avg_r": pd.to_numeric(g.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean(),
+            }),
+            include_groups=False,
+        ).reset_index().sort_values("trades", ascending=False)
         st.markdown("**By session**")
         render_benzino_aggrid(session_perf, key="system_perf_session", height=240, page_size=10, pinned=["session"], numeric_cols_right=[c for c in session_perf.columns if c not in ["session", "Session"]], enable_search=False, show_footer=False, use_pagination=False)
 
     a1, a2 = st.columns(2)
     with a1:
-        timeframe_perf = closed.groupby("timeframe", as_index=False).agg(
-            win_rate=("outcome", lambda x: (x.astype(str).str.upper().isin(["WIN", "EXPIRED_WIN"]).sum() / x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() * 100) if x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() else 0),
-            trades=("signal_id", "count"),
-            avg_r=("r_multiple", "mean"),
-        ).sort_values("timeframe")
+        timeframe_perf = closed.groupby("timeframe").apply(
+            lambda g: pd.Series({
+                "win_rate": win_rate_group(g),
+                "trades": len(closed_resolved_trades(g)),
+                "avg_r": pd.to_numeric(g.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean(),
+            }),
+            include_groups=False,
+        ).reset_index().sort_values("timeframe")
         st.markdown("**By timeframe**")
         render_benzino_aggrid(timeframe_perf, key="system_perf_timeframe_split", height=240, page_size=10, pinned=["timeframe"], numeric_cols_right=[c for c in timeframe_perf.columns if c != "timeframe"], enable_search=False, show_footer=False, use_pagination=False)
 
     with a2:
-        asset_perf = closed.groupby("asset", as_index=False).agg(
-            win_rate=("outcome", lambda x: (x.astype(str).str.upper().isin(["WIN", "EXPIRED_WIN"]).sum() / x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() * 100) if x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() else 0),
-            trades=("signal_id", "count"),
-            avg_r=("r_multiple", "mean"),
-        ).sort_values(["trades", "win_rate"], ascending=[False, False])
+        asset_perf = closed.groupby("asset").apply(
+            lambda g: pd.Series({
+                "win_rate": win_rate_group(g),
+                "trades": len(closed_resolved_trades(g)),
+                "avg_r": pd.to_numeric(g.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean(),
+            }),
+            include_groups=False,
+        ).reset_index().sort_values(["trades", "win_rate"], ascending=[False, False])
         st.markdown("**By asset**")
         render_benzino_aggrid(asset_perf.head(30), key="system_perf_asset", height=240, page_size=10, pinned=["asset"], numeric_cols_right=[c for c in asset_perf.columns if c != "asset"], enable_search=False, show_footer=False, use_pagination=False)
 
@@ -4394,7 +4419,7 @@ def render_workflow(username: str, settings: dict) -> None:
 
     with t1:
         c1, c2, c3, c4 = st.columns(4)
-        resolved = closed_trades[closed_trades["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])]
+        resolved = closed_resolved_trades(closed_trades)
         won_trades = int(resolved_outcome_masks(closed_trades)[0].sum()) if not closed_trades.empty else 0
         with c1: metric_card("Total journaled", f"{len(trades):,}", "A+/A/B/C setups")
         with c2: metric_card("Open", f"{len(open_trades):,}", "Currently active")
@@ -4408,20 +4433,20 @@ def render_workflow(username: str, settings: dict) -> None:
             st.subheader("User split analysis")
             ug1, ug2 = st.columns(2)
             with ug1:
-                grade_perf = resolved.groupby("grade", as_index=False).agg(win_rate=("outcome", lambda x: (x.astype(str).str.upper().isin(["WIN", "EXPIRED_WIN"]).sum() / x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() * 100) if x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() else 0), trades=("signal_id", "count"))
+                grade_perf = resolved.groupby("grade").apply(lambda g: pd.Series({"win_rate": win_rate_group(g), "trades": len(closed_resolved_trades(g))}), include_groups=False).reset_index()
                 st.markdown("**By grade**")
                 render_benzino_aggrid(grade_perf, key="journal_grade_perf", height=240, page_size=10, pinned=["grade"], badge_cols={"grade":"grade", "Grade":"grade"}, numeric_cols_right=[c for c in grade_perf.columns if c not in ["grade", "Grade"]], enable_search=False, show_footer=False, use_pagination=False)
             with ug2:
-                session_perf = resolved.groupby("session", as_index=False).agg(win_rate=("outcome", lambda x: (x.astype(str).str.upper().isin(["WIN", "EXPIRED_WIN"]).sum() / x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() * 100) if x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() else 0), trades=("signal_id", "count"))
+                session_perf = resolved.groupby("session").apply(lambda g: pd.Series({"win_rate": win_rate_group(g), "trades": len(closed_resolved_trades(g))}), include_groups=False).reset_index()
                 st.markdown("**By session**")
                 render_benzino_aggrid(session_perf, key="journal_session_perf", height=240, page_size=10, pinned=["session"], numeric_cols_right=[c for c in session_perf.columns if c not in ["session", "Session"]], enable_search=False, show_footer=False, use_pagination=False)
             ut1, ut2 = st.columns(2)
             with ut1:
-                timeframe_perf = resolved.groupby("timeframe", as_index=False).agg(win_rate=("outcome", lambda x: (x.astype(str).str.upper().isin(["WIN", "EXPIRED_WIN"]).sum() / x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() * 100) if x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() else 0), trades=("signal_id", "count"))
+                timeframe_perf = resolved.groupby("timeframe").apply(lambda g: pd.Series({"win_rate": win_rate_group(g), "trades": len(closed_resolved_trades(g))}), include_groups=False).reset_index()
                 st.markdown("**By timeframe**")
                 render_benzino_aggrid(timeframe_perf, key="journal_timeframe_perf", height=240, page_size=10, pinned=["timeframe"], numeric_cols_right=[c for c in timeframe_perf.columns if c != "timeframe"], enable_search=False, show_footer=False, use_pagination=False)
             with ut2:
-                asset_perf = resolved.groupby("asset", as_index=False).agg(win_rate=("outcome", lambda x: (x.astype(str).str.upper().isin(["WIN", "EXPIRED_WIN"]).sum() / x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() * 100) if x.astype(str).str.upper().isin(["WIN", "LOSS", "BREAKEVEN", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN", "CLOSED"]).sum() else 0), trades=("signal_id", "count"))
+                asset_perf = resolved.groupby("asset").apply(lambda g: pd.Series({"win_rate": win_rate_group(g), "trades": len(closed_resolved_trades(g))}), include_groups=False).reset_index()
                 st.markdown("**By asset**")
                 render_benzino_aggrid(asset_perf.sort_values("trades", ascending=False), key="journal_asset_perf", height=240, page_size=10, pinned=["asset"], numeric_cols_right=[c for c in asset_perf.columns if c != "asset"], enable_search=False, show_footer=False, use_pagination=False)
 
@@ -4610,20 +4635,20 @@ def render_workflow(username: str, settings: dict) -> None:
                 "collecting data, but watch open exposure and avoid changing the rules too early."
             )
         else:
-            resolved = closed_trades[closed_trades["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])].copy()
+            resolved = closed_resolved_trades(closed_trades)
             notes = list(prop_notes)
             if not resolved.empty:
-                asset_perf = resolved.groupby("asset").agg(win_rate=("outcome", lambda x: ((x == "WIN").sum() / len(x)) if len(x) else 0), trades=("signal_id", "count"), avg_r=("r_multiple", "mean")).reset_index()
+                asset_perf = resolved.groupby("asset").apply(lambda g: pd.Series({"win_rate": win_rate_group(g) / 100, "trades": len(closed_resolved_trades(g)), "avg_r": pd.to_numeric(g.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean()}), include_groups=False).reset_index()
                 asset_perf = asset_perf[asset_perf["trades"] >= 5].sort_values(["win_rate", "avg_r"], ascending=False)
                 if not asset_perf.empty:
                     best = asset_perf.iloc[0]
                     notes.append(f"Your strongest supported asset is **{best['asset']}**: {best['trades']} closed trades, {best['win_rate']*100:.2f}% win rate, average {best['avg_r']:+.2f}R. Treat this as the playbook to repeat, not just a lucky asset.")
-                weak = resolved.groupby("asset").agg(win_rate=("outcome", lambda x: ((x == "WIN").sum() / len(x)) if len(x) else 0), trades=("signal_id", "count"), avg_r=("r_multiple", "mean")).reset_index()
+                weak = resolved.groupby("asset").apply(lambda g: pd.Series({"win_rate": win_rate_group(g) / 100, "trades": len(closed_resolved_trades(g)), "avg_r": pd.to_numeric(g.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean()}), include_groups=False).reset_index()
                 weak = weak[weak["trades"] >= 5].sort_values(["win_rate", "avg_r"], ascending=True)
                 if not weak.empty:
                     w = weak.iloc[0]
                     notes.append(f"Your weakest supported area is **{w['asset']}**: {w['trades']} closed trades and {w['win_rate']*100:.2f}% win rate. Reduce size or demand stronger MTF confirmation here until the numbers improve.")
-                session_perf = resolved.groupby("session").agg(win_rate=("outcome", lambda x: ((x == "WIN").sum() / len(x)) if len(x) else 0), trades=("signal_id", "count"), avg_r=("r_multiple", "mean")).reset_index()
+                session_perf = resolved.groupby("session").apply(lambda g: pd.Series({"win_rate": win_rate_group(g) / 100, "trades": len(closed_resolved_trades(g)), "avg_r": pd.to_numeric(g.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean()}), include_groups=False).reset_index()
                 session_perf = session_perf[session_perf["trades"] >= 5].sort_values(["win_rate", "avg_r"], ascending=False)
                 if not session_perf.empty:
                     srow = session_perf.iloc[0]
@@ -4914,11 +4939,11 @@ def render_settings(username: str, settings: dict) -> None:
             wl_system_df["outcome"] = wl_system_df.apply(outcome_label, axis=1)
             wl_graded = wl_system_df[wl_system_df["grade"].astype(str).isin(VALID_GRADES)].copy()
             wl_resolved_all = wl_graded[wl_graded["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])].copy()
-            system_win_rate = (wl_resolved_all["outcome"].eq("WIN").sum() / len(wl_resolved_all) * 100) if len(wl_resolved_all) else 0.0
+            system_win_rate = win_rate_from_resolved(wl_resolved_all)
 
             wl_user_df = wl_graded[wl_graded["asset"].astype(str).isin(current_set)].copy()
             wl_resolved_user = wl_user_df[wl_user_df["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])].copy()
-            user_win_rate = (wl_resolved_user["outcome"].eq("WIN").sum() / len(wl_resolved_user) * 100) if len(wl_resolved_user) else 0.0
+            user_win_rate = win_rate_from_resolved(wl_resolved_user)
 
             wl_user_open = wl_user_df[wl_user_df["status"].astype(str).str.upper().eq("OPEN")]
             wl_user_avg_r = pd.to_numeric(wl_resolved_user.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean() if len(wl_resolved_user) else 0.0
