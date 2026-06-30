@@ -2195,8 +2195,11 @@ def price_decimals_for_asset(asset: str | None, value=None) -> int:
     """
     a = str(asset or "").strip().upper().replace("/", "").replace("-", "")
 
+    if a in {"OIL", "BRENT", "NATGAS"}:
+        return 3
+
     # Crypto, commodities, indices and equities normally trade visually at 2dp.
-    if a in {"BTCUSD", "ETHUSD", "OIL", "BRENT", "NATGAS", "COPPER", "XAUUSD", "XAGUSD", "SP500", "NAS100", "DOW30", "NVDA", "MU"}:
+    if a in {"BTCUSD", "ETHUSD", "COPPER", "XAUUSD", "XAGUSD", "SP500", "NAS100", "DOW30", "NVDA", "MU"}:
         return 2
 
     # JPY FX pairs use pipette-style 3dp on TradingView/broker displays.

@@ -1792,10 +1792,13 @@ def build_telegram_message(sig: ScanResult, display_id: str | None = None) -> st
         if asset.endswith("JPY"):
             return 3
 
+        if asset in {"OIL", "BRENT", "NATGAS"}:
+            return 3
+
         if asset in {
             "BTCUSD", "ETHUSD",
             "XAUUSD", "XAGUSD",
-            "OIL", "BRENT", "NATGAS", "COPPER",
+            "COPPER",
             "SP500", "NAS100", "DOW30",
             "NVDA", "MU",
         }:
