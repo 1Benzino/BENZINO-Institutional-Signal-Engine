@@ -1786,7 +1786,7 @@ def build_telegram_message(sig: ScanResult, display_id: str | None = None) -> st
         return html.escape(str(v if v is not None else ""))
 
     def fmt_price(x):
-        """Entry, SL, and TP keep extra precision when the value has it."""
+        """Entry, Stop Loss, and Take Profit keep extra precision when the value has it."""
         try:
             x = float(x)
             return f"{x:,.8f}".rstrip("0").rstrip(".")
@@ -1817,48 +1817,72 @@ def build_telegram_message(sig: ScanResult, display_id: str | None = None) -> st
             return "Bearish"
         return direction.title()
 
-    emoji = "🟢" if sig.signal == "BUY" else "🔴" if sig.signal == "SELL" else "⚪"
-    grade_emoji = {"A+": "🏆", "A": "⭐", "B": "🔹", "C": "▫️"}.get(sig.grade, "")
+    def grade_stars(grade: str) -> str:
+        return {"A+": "⭐⭐⭐⭐⭐", "A": "⭐⭐⭐⭐", "B": "⭐⭐⭐", "C": "⭐⭐"}.get(str(grade or "").upper(), "")
 
-    # Use the exact display_id saved with the scanner row, so Telegram matches the app table.
+    def vote_icon(direction: str) -> str:
+        direction = str(direction or "").upper()
+        if direction == "BULLISH":
+            return "🟩"
+        if direction == "BEARISH":
+            return "🟥"
+        return "⬜"
+
+    def vote_line(name: str, payload: dict) -> str:
+        direction = str(payload.get("direction", "NEUTRAL")).upper()
+        strength = fmt_metric(safe_number(payload.get("strength"), 0.0))
+        # Dotted spacing is fixed-width enough for Telegram while staying readable.
+        short_name = str(name or "").replace("MTFConfirmation", "MTFConfirm")
+        dots = "." * max(2, 14 - len(short_name))
+        return f"{vote_icon(direction)} {clean(short_name)} {dots} {clean(direction)} ({strength})"
+
+    emoji = "🟢" if sig.signal == "BUY" else "🔴" if sig.signal == "SELL" else "⚪"
+    tf_label = str(sig.timeframe or "").upper()
+    stars = grade_stars(sig.grade)
+    separator = "━━━━━━━━━━━━━━━━━━"
+
+    # Use the exact display_id saved with the scanner row, so Telegram matches Supabase and the app.
     shown_id = str(display_id or getattr(sig, "display_id", "") or "").strip() or "Benzino-00"
-    footer_rule = "─" * max(12, len(f"🆔 {shown_id}"))
 
     votes_lines = "\n".join(
-        f"{name}: {v['direction']} ({safe_number(v.get('strength'), 0.0):.2f})"
+        vote_line(name, v)
         for name, v in (sig.strategy_votes or {}).items()
+        if isinstance(v, dict)
     )
+    if not votes_lines:
+        votes_lines = "No strategy votes available"
 
     return f"""
-{emoji} <b>BENZINO {clean(sig.signal)} SIGNAL</b> {grade_emoji} Grade {clean(sig.grade)}
+{emoji} <b>BENZINO {clean(sig.signal)} SIGNAL</b>
+{stars} Grade {clean(sig.grade)} • {clean(sig.asset)} • {clean(tf_label)}
 
-<b>Asset:</b> {clean(sig.asset)}
-<b>Timeframe:</b> {clean(sig.timeframe)} signal
-<b>System Agreement:</b> {fmt_metric(sig.confidence)}%
-<b>Edge Score:</b> {fmt_metric(sig.edge_score)}
-<b>ML Prob:</b> {fmt_metric(sig.ml_prob)}
-<b>MTF Score:</b> {fmt_metric(sig.mtf_score)}%
+{separator}
 
-<b>Trade Plan:</b>
+📊 <b>Setup Quality</b>
+Agreement: {fmt_metric(sig.confidence)}%
+Edge Score: {fmt_metric(sig.edge_score)}
+ML Probability: {fmt_metric(float(sig.ml_prob) * 100 if safe_number(sig.ml_prob, 0.5) <= 1 else sig.ml_prob)}%
+MTF Score: {fmt_metric(sig.mtf_score)}%
+
+💰 <b>Trade Plan</b>
 Entry: <code>{fmt_price(sig.entry)}</code>
-SL: <code>{fmt_price(sig.sl)}</code>
-TP: <code>{fmt_price(sig.tp)}</code>
-RR: <code>{fmt_metric(sig.rr)}R</code>
+Stop Loss: <code>{fmt_price(sig.sl)}</code>
+Take Profit: <code>{fmt_price(sig.tp)}</code>
+Risk/Reward: <code>{fmt_metric(sig.rr)}R</code>
 
-<b>Strategy Confluence:</b>
+⚙️ <b>Strategy Confluence</b>
 {votes_lines}
 
-<b>Market Context:</b>
+🌍 <b>Market Context</b>
 1H Trend: {clean(compact_trend(sig.trend_1h))}
 15M Trend: {clean(compact_trend(sig.trend_15m))}
 4H Trend: {clean(mtf_trend("4h"))}
 Regime: {clean(sig.regime)}
 RSI: {fmt_metric(sig.rsi)}
 
-{footer_rule}
+{separator}
 🆔 <code>{clean(shown_id)}</code>
 """.strip()
-
 
 def send_telegram_to(message: str, chat_ids: list[str]) -> tuple[bool, str]:
     """Send one message to an explicit list of chat IDs."""
