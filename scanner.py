@@ -1771,28 +1771,38 @@ def next_benzino_display_id() -> str:
 
 
 def build_telegram_message(sig: ScanResult, display_id: str | None = None) -> str:
-    def clean(v): return html.escape(str(v if v is not None else ""))
+    def clean(v):
+        return html.escape(str(v if v is not None else ""))
 
     def fmt_price(x):
-        """Entry, SL, and TP may keep extra precision where needed."""
+        """Entry, SL, and TP keep extra precision when the value has it."""
         try:
             x = float(x)
-            if abs(x) >= 1000:
-                return f"{x:,.2f}"
-            if abs(x) >= 10:
-                return f"{x:,.4f}"
-            return f"{x:,.6f}"
+            return f"{x:,.8f}".rstrip("0").rstrip(".")
         except Exception:
             return str(x)
 
+    def fmt_metric(x, decimals: int = 2):
+        try:
+            return f"{float(x):.{decimals}f}"
+        except Exception:
+            return str(x)
+
+    def compact_trend(label: str) -> str:
+        label = str(label or "Unavailable").strip()
+        label = label.split("(", 1)[0].strip()
+        return label or "Unavailable"
+
     emoji = "🟢" if sig.signal == "BUY" else "🔴" if sig.signal == "SELL" else "⚪"
     grade_emoji = {"A+": "🏆", "A": "⭐", "B": "🔹", "C": "▫️"}.get(sig.grade, "")
-    shown_id = display_id or getattr(sig, "display_id", None) or "Benzino-00"
+
+    # Use the exact display_id saved with the scanner row, so Telegram matches the app table.
+    shown_id = str(display_id or getattr(sig, "display_id", "") or "").strip() or "Benzino-00"
     footer_rule = "─" * max(12, len(f"🆔 {shown_id}"))
 
     votes_lines = "\n".join(
-        f"{name}: {v['direction']} ({v['strength']:.2f})"
-        for name, v in sig.strategy_votes.items()
+        f"{name}: {v['direction']} ({safe_number(v.get('strength'), 0.0):.2f})"
+        for name, v in (sig.strategy_votes or {}).items()
     )
 
     return f"""
@@ -1800,25 +1810,25 @@ def build_telegram_message(sig: ScanResult, display_id: str | None = None) -> st
 
 <b>Asset:</b> {clean(sig.asset)}
 <b>Timeframe:</b> {clean(sig.timeframe)} signal
-<b>System Agreement:</b> {sig.confidence:.2f}%
-<b>Edge Score:</b> {sig.edge_score:.2f}
-<b>ML Prob:</b> {sig.ml_prob:.2f}
-<b>MTF Score:</b> {sig.mtf_score:.2f}%
+<b>System Agreement:</b> {fmt_metric(sig.confidence)}%
+<b>Edge Score:</b> {fmt_metric(sig.edge_score)}
+<b>ML Prob:</b> {fmt_metric(sig.ml_prob)}
+<b>MTF Score:</b> {fmt_metric(sig.mtf_score)}%
 
 <b>Trade Plan:</b>
 Entry: <code>{fmt_price(sig.entry)}</code>
 SL: <code>{fmt_price(sig.sl)}</code>
 TP: <code>{fmt_price(sig.tp)}</code>
-RR: <code>{sig.rr:.2f}R</code>
+RR: <code>{fmt_metric(sig.rr)}R</code>
 
 <b>Strategy Confluence:</b>
 {votes_lines}
 
 <b>Market Context:</b>
-1H Trend: {clean(sig.trend_1h)}
-15M Trend: {clean(sig.trend_15m)}
+1H Trend: {clean(compact_trend(sig.trend_1h))}
+15M Trend: {clean(compact_trend(sig.trend_15m))}
 Regime: {clean(sig.regime)}
-RSI: {sig.rsi:.2f}
+RSI: {fmt_metric(sig.rsi)}
 
 {footer_rule}
 🆔 <code>{clean(shown_id)}</code>
@@ -2181,7 +2191,7 @@ def run_scan() -> None:
                     block_reason = f"slot still open (signal {open_slot['signal_id'][:8]})"
 
             if can_alert:
-                message = build_telegram_message(result)
+                message = build_telegram_message(result, getattr(result, "display_id", None))
                 ok, info = send_telegram(message, asset, result.timeframe)
                 if ok:
                     result.alert_sent = True
