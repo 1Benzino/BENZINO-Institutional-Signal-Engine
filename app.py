@@ -2222,6 +2222,61 @@ def is_price_display_column(col_name: str) -> bool:
     return c in exact
 
 
+
+def benzino_id_number(value) -> float:
+    """Extract the numeric part from Benzino-123 style IDs for fallback sorting."""
+    try:
+        match = re.search(r"(\d+)", str(value or ""))
+        return float(match.group(1)) if match else np.nan
+    except Exception:
+        return np.nan
+
+
+def _parse_display_created_series(series: pd.Series) -> pd.Series:
+    """Parse either raw timestamps or display timestamps like '2026-06-30 15:44 EAT'."""
+    try:
+        raw = series.astype(str).str.replace(" EAT", "", regex=False).str.strip()
+        return pd.to_datetime(raw, errors="coerce", utc=True)
+    except Exception:
+        return pd.to_datetime(series, errors="coerce", utc=True)
+
+
+def sort_signal_rows_newest_first(df: pd.DataFrame) -> pd.DataFrame:
+    """Default-sort any table with Signal ID/display_id by newest generated signal first.
+
+    Primary sort is the signal creation time. If a table does not expose a
+    timestamp, fall back to the Benzino-XXX sequence number, which is generated
+    by the scanner at save time.
+    """
+    if df is None or df.empty:
+        return df
+    id_candidates = ["Signal ID", "signal_id", "display_id"]
+    if not any(c in df.columns for c in id_candidates):
+        return df
+
+    out = df.copy()
+    created_col = next((c for c in ["created_at", "Created At", "signal_created_at", "closed_at", "Closed At"] if c in out.columns), None)
+    id_col = next((c for c in ["Signal ID", "display_id", "signal_id"] if c in out.columns), None)
+
+    if created_col:
+        out["_benzino_sort_created"] = _parse_display_created_series(out[created_col])
+    else:
+        out["_benzino_sort_created"] = pd.NaT
+
+    if id_col:
+        out["_benzino_sort_id"] = out[id_col].apply(benzino_id_number)
+    else:
+        out["_benzino_sort_id"] = np.nan
+
+    out = out.sort_values(
+        ["_benzino_sort_created", "_benzino_sort_id"],
+        ascending=[False, False],
+        na_position="last",
+        kind="mergesort",
+    )
+    return out.drop(columns=["_benzino_sort_created", "_benzino_sort_id"], errors="ignore")
+
+
 def render_benzino_aggrid(
     df: pd.DataFrame,
     key: str,
@@ -2249,10 +2304,9 @@ def render_benzino_aggrid(
 
     view = df.copy()
 
-    # Auto-sort every table with an Age/Created At pair newest-first.
-    if "Age" in view.columns and "Created At" in view.columns:
-        _sort_created = pd.to_datetime(view["Created At"].astype(str).str.replace(" EAT", "", regex=False), errors="coerce")
-        view = view.assign(_benzino_sort_created=_sort_created).sort_values("_benzino_sort_created", ascending=False).drop(columns=["_benzino_sort_created"])
+    # Any table with a Signal ID should default to newest generated signal first.
+    # This uses created_at/Created At first, then Benzino-XXX number as a fallback.
+    view = sort_signal_rows_newest_first(view)
 
     if column_order:
         ordered = [c for c in column_order if c in view.columns]
@@ -2378,7 +2432,7 @@ def prepare_signal_table(df: pd.DataFrame, settings=None, limit: int = 300) -> p
         fallback = view["signal_id"].astype(str) if "signal_id" in view.columns else display
         view["signal_id"] = display.where(display.str.strip().ne(""), fallback)
 
-    view = view.head(limit)
+    view = sort_signal_rows_newest_first(view).head(limit)
     if "created_at" in view.columns:
         view["Age"] = view["created_at"].apply(age_ago)
         view["Created At"] = view["created_at"].apply(fmt_nairobi)
@@ -3480,17 +3534,29 @@ def render_opportunity_board(username: str, settings: dict) -> None:
                 .astype(int)
             )
             counts = counts[counts > 0]
+
+            # The donut slice size still shows trade distribution by grade, but
+            # the legend now shows the more useful metric: win rate per grade.
+            # This keeps Dashboard consistent with Workflow → User split analysis,
+            # where the table already reports A/B/C win_rate + trade count.
+            win_rates_by_grade = {}
+            for g in counts.index:
+                g_rows = grade_source[grade_source["grade"].astype(str).eq(str(g))].copy()
+                win_rates_by_grade[g] = win_rate_from_resolved(g_rows)
+
             if counts.empty:
                 st.markdown("<div class='benzino-empty-note'>No closed performance data yet for this watchlist/timeframe.</div>", unsafe_allow_html=True)
             else:
                 total = int(counts.sum())
+                customdata = [[win_rates_by_grade.get(g, 0.0)] for g in counts.index]
                 fig = go.Figure(data=[go.Pie(
                     labels=counts.index.tolist(),
                     values=counts.values.tolist(),
+                    customdata=customdata,
                     hole=0.54,
                     marker=dict(colors=[grade_colors.get(g, "#8BAAB8") for g in counts.index]),
                     textinfo="none",
-                    hovertemplate="%{label}<br>%{value} trade(s)<br>%{percent}<extra></extra>",
+                    hovertemplate="%{label}<br>%{value} trade(s)<br>Win rate: %{customdata[0]:.2f}%<extra></extra>",
                     sort=False,
                 )])
                 fig.update_layout(
@@ -3502,13 +3568,13 @@ def render_opportunity_board(username: str, settings: dict) -> None:
                 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
                 legend_parts = ["<div class='grade-legend-grid'>"]
                 for g in counts.index:
-                    pct = counts[g] / total * 100 if total else 0
+                    win_rate = win_rates_by_grade.get(g, 0.0)
                     safe_g = html.escape(str(g))
                     safe_color = grade_colors.get(g, "#8BAAB8")
                     legend_parts.append(
                         f"<div class='grade-legend-item'>"
                         f"<span class='grade-legend-name'><span style='color:{safe_color};font-size:16px;'>■</span>{safe_g}</span>"
-                        f"<span class='grade-legend-value'>{pct:.2f}% ({int(counts[g])})</span>"
+                        f"<span class='grade-legend-value'>{win_rate:.2f}% ({int(counts[g])})</span>"
                         f"</div>"
                     )
                 legend_parts.append("</div>")
@@ -3636,6 +3702,7 @@ def render_opportunity_board(username: str, settings: dict) -> None:
                 "scan_owner": "Scan Owner",
             }
             display_df = display_df.rename(columns=rename_map)
+            display_df = sort_signal_rows_newest_first(display_df)
 
             # Search across the final display table.
             if table_search:
