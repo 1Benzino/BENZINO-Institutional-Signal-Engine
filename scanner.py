@@ -712,11 +712,11 @@ def save_signal(sig: ScanResult) -> bool:
                 cur.execute(sql, (
                     sig.signal_id, sig.display_id, sig.created_at, SCAN_OWNER, sig.asset, sig.ticker,
                     sig.timeframe, sig.signal, sig.grade,
-                    round(safe_number(sig.confidence), 4), round(safe_number(sig.edge_score), 4), round(safe_number(sig.ml_prob, 0.5), 6),
-                    round(safe_number(sig.entry), 8), round(safe_number(sig.sl), 8), round(safe_number(sig.tp), 8), round(safe_number(sig.rr), 4),
-                    sig.regime, round(safe_number(sig.rsi, 50.0), 2), round(safe_number(sig.atr), 8),
+                    round(safe_number(sig.confidence), 2), round(safe_number(sig.edge_score), 2), round(safe_number(sig.ml_prob, 0.5), 2),
+                    round(safe_number(sig.entry), 8), round(safe_number(sig.sl), 8), round(safe_number(sig.tp), 8), round(safe_number(sig.rr), 2),
+                    sig.regime, round(safe_number(sig.rsi, 50.0), 2), round(safe_number(sig.atr), 2),
                     sig.trend_1h, sig.trend_15m, sig.reason, sig.candle_close,
-                    json.dumps(sanitize_for_json(sig.strategy_votes), allow_nan=False), round(safe_number(sig.mtf_score), 4),
+                    json.dumps(sanitize_for_json(sig.strategy_votes), allow_nan=False), round(safe_number(sig.mtf_score), 2),
                     json.dumps(sanitize_for_json(sig.mtf_context or {}), allow_nan=False), sig.alert_sent, status,
                 ))
         conn.close()
@@ -1189,7 +1189,7 @@ def mtf_confirmation(ticker: str, dominant_direction: str) -> tuple[dict, float,
     for tf in MTF_CONFIRMATION_TIMEFRAMES:
         df_tf = get_timeframe_df(ticker, tf)
         direction, strength = trend_direction_from_df(df_tf)
-        context[tf] = {"direction": direction, "strength": round(float(strength), 3)}
+        context[tf] = {"direction": direction, "strength": round(float(strength), 2)}
         if direction in ("BULLISH", "BEARISH"):
             checked += 1
             if direction == dominant_direction:
@@ -1553,14 +1553,14 @@ def strategy_confluence(df: pd.DataFrame, mtf_vote: tuple[str, float] | None = N
     rsi2_dir,  rsi2_str  = strategy_rsi2_meanreversion(df)
 
     votes = {
-        "TSMOM"      : {"direction": tsmom_dir, "strength": round(tsmom_str, 3)},
-        "Donchian"   : {"direction": donch_dir, "strength": round(donch_str, 3)},
-        "RSI2"       : {"direction": rsi2_dir,  "strength": round(rsi2_str, 3)},
-        "MLEnsemble" : {"direction": ml_dir,    "strength": round(ml_strength, 3)},
+        "TSMOM"      : {"direction": tsmom_dir, "strength": round(tsmom_str, 2)},
+        "Donchian"   : {"direction": donch_dir, "strength": round(donch_str, 2)},
+        "RSI2"       : {"direction": rsi2_dir,  "strength": round(rsi2_str, 2)},
+        "MLEnsemble" : {"direction": ml_dir,    "strength": round(ml_strength, 2)},
     }
     if mtf_vote is not None:
         mtf_dir, mtf_strength = mtf_vote
-        votes["MTFConfirmation"] = {"direction": mtf_dir, "strength": round(float(mtf_strength), 3)}
+        votes["MTFConfirmation"] = {"direction": mtf_dir, "strength": round(float(mtf_strength), 2)}
 
     bull_votes = [v for v in votes.values() if v["direction"] == "BULLISH"]
     bear_votes = [v for v in votes.values() if v["direction"] == "BEARISH"]
@@ -1583,7 +1583,7 @@ def strategy_confluence(df: pd.DataFrame, mtf_vote: tuple[str, float] | None = N
         "dominant": dominant,
         "agree_count": agree_count,
         "total_systems": len(votes),
-        "avg_strength": round(avg_strength, 3),
+        "avg_strength": round(avg_strength, 2),
         "ml_prob": ml_prob,
     }
 
@@ -1599,11 +1599,11 @@ def grade_signal(confluence: dict, rr: float) -> tuple[str, str]:
     if rr < 1.2:
         return "NO TRADE", f"RR too thin ({rr:.2f}R) regardless of confluence."
     if agree >= max(4, total - 1) and rr >= 2.5 and strength >= 0.50:
-        return "A+", f"{agree}/{total} systems agree {dominant.lower()}, strong conviction ({strength:.2f}), RR {rr:.1f}R."
+        return "A+", f"{agree}/{total} systems agree {dominant.lower()}, strong conviction ({strength:.2f}), RR {rr:.2f}R."
     if agree >= 3 and rr >= 2.0 and strength >= 0.35:
-        return "A", f"{agree}/{total} systems agree {dominant.lower()}, RR {rr:.1f}R."
+        return "A", f"{agree}/{total} systems agree {dominant.lower()}, RR {rr:.2f}R."
     if agree >= 2 and rr >= 1.5:
-        return "B", f"{agree}/{total} systems agree {dominant.lower()}, moderate RR {rr:.1f}R."
+        return "B", f"{agree}/{total} systems agree {dominant.lower()}, moderate RR {rr:.2f}R."
     if agree >= 1 and rr >= 1.2:
         return "C", f"Only {agree}/{total} systems agree {dominant.lower()} — weak edge."
     return "NO TRADE", "Confluence and risk/reward both too weak."
@@ -1737,7 +1737,7 @@ def scan_asset(asset: str, ticker: str, timeframe: str = "15m") -> ScanResult | 
             mtf_score=mtf_score, mtf_context=mtf_context, strategy_votes=confluence["votes"],
         )
         tag = "✅" if grade != "NO TRADE" else "👻"
-        print(f"  [{asset} {timeframe}] {tag} {signal} | Grade {grade} | Agreement {confidence:.1f}% | Edge {edge_score:.1f} | RR {plan['rr']:.2f} | MTF {mtf_score:.0f}% | {confluence['agree_count']}/{confluence['total_systems']} agree")
+        print(f"  [{asset} {timeframe}] {tag} {signal} | Grade {grade} | Agreement {confidence:.1f}% | Edge {edge_score:.1f} | RR {plan['rr']:.2f} | MTF {mtf_score:.2f}% | {confluence['agree_count']}/{confluence['total_systems']} agree")
         return result
     except Exception as e:
         print(f"  [{asset} {timeframe}] ERROR: {e}")
@@ -1794,10 +1794,10 @@ def build_telegram_message(sig: ScanResult, display_id: str | None = None) -> st
 
 <b>Asset:</b> {clean(sig.asset)}
 <b>Timeframe:</b> {clean(sig.timeframe)}
-<b>System Agreement:</b> {sig.confidence:.1f}%
-<b>Edge Score:</b> {sig.edge_score:.1f}
-<b>ML Prob:</b> {sig.ml_prob:.3f}
-<b>MTF Confirmation:</b> {sig.mtf_score:.0f}%
+<b>System Agreement:</b> {sig.confidence:.2f}%
+<b>Edge Score:</b> {sig.edge_score:.2f}
+<b>ML Prob:</b> {sig.ml_prob:.2f}
+<b>MTF Confirmation:</b> {sig.mtf_score:.2f}%
 
 <b>Trade Plan</b>
 Entry: <code>{fmt(sig.entry)}</code>

@@ -2192,26 +2192,16 @@ def format_market_price(value):
 
 
 def is_price_display_column(col_name: str) -> bool:
-    """Detect price columns everywhere in the app: Entry, SL, TP, exits, OHLC, etc."""
+    """Only Entry, SL, and TP are allowed to keep market-price precision."""
     c = str(col_name or "").strip().lower()
     c = c.replace("_", " ").replace("-", " ")
     c = re.sub(r"\s+", " ", c)
 
     exact = {
-        "entry", "sl", "tp", "stop loss", "take profit",
-        "exit", "exit price", "price",
-        "hypothetical entry", "hypothetical sl", "hypothetical tp", "hypothetical exit",
-        "shadow exit price", "open", "high", "low", "close",
+        "entry", "sl", "tp",
+        "hypothetical entry", "hypothetical sl", "hypothetical tp",
     }
-    if c in exact:
-        return True
-
-    price_tokens = (
-        "entry", " sl", "sl ", " tp", "tp ", "stop loss", "take profit",
-        "exit price", "hypothetical exit", "hypothetical entry", "hypothetical sl", "hypothetical tp",
-    )
-    non_price_tokens = ("score", "rate", "ratio", "confidence", "r multiple", "win", "loss", "risk", "margin", "pnl", "balance")
-    return any(tok in f" {c} " for tok in price_tokens) and not any(tok in c for tok in non_price_tokens)
+    return c in exact
 
 
 def render_benzino_aggrid(
@@ -2251,11 +2241,9 @@ def render_benzino_aggrid(
         rest = [c for c in view.columns if c not in ordered]
         view = view[ordered + rest]
 
-    # Market-aware table formatting:
-    # Price columns (Entry, SL, TP, etc.) get full dynamic precision via format_market_price.
-    # Other numeric columns also get dynamic precision when their values look price-like
-    # (i.e. they have meaningful decimal places beyond 2dp — e.g. EURUSD at 1.08432),
-    # falling back to 2dp only for genuinely non-price numbers like percentages and counts.
+    # Decimal policy:
+    # Only Entry, SL and TP keep market-price precision. Every other numeric
+    # decimal is rounded to 2dp so tables do not show noisy precision.
     for _col in view.columns:
         if is_price_display_column(_col):
             view[_col] = view[_col].apply(format_market_price)
@@ -2267,11 +2255,6 @@ def render_benzino_aggrid(
                     v = float(x)
                     if not np.isfinite(v):
                         return ""
-                    # Use dynamic precision if the value has meaningful sub-cent decimals
-                    # (e.g. FX prices like 1.08432, crypto like 0.00045)
-                    rounded_2 = round(v, 2)
-                    if abs(v - rounded_2) > 1e-8:
-                        return format_market_price(v)
                     return f"{v:.2f}"
                 except Exception:
                     return str(x) if x is not None else ""
@@ -3646,12 +3629,12 @@ def render_opportunity_board(username: str, settings: dict) -> None:
                 ).any(axis=1)
                 display_df = display_df[mask].copy()
 
-            def _fmt_money(x):
+            def _fmt_entry_sl_tp(x):
                 if pd.isna(x) or str(x).strip() == "":
                     return "—"
                 n = pd.to_numeric(x, errors="coerce")
                 if pd.notna(n):
-                    return f"{float(n):,.2f}"
+                    return format_market_price(float(n))
                 return str(x)
 
             def _fmt_pct(x):
@@ -3673,7 +3656,7 @@ def render_opportunity_board(username: str, settings: dict) -> None:
 
             for money_col in ["Entry", "SL", "TP"]:
                 if money_col in display_df.columns:
-                    display_df[money_col] = display_df[money_col].apply(_fmt_money)
+                    display_df[money_col] = display_df[money_col].apply(_fmt_entry_sl_tp)
             for pct_col in ["Confidence", "Decayed Confidence"]:
                 if pct_col in display_df.columns:
                     display_df[pct_col] = display_df[pct_col].apply(_fmt_pct)
