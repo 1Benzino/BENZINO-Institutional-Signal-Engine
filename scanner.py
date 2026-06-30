@@ -841,10 +841,19 @@ def open_trade_for_slot(asset: str, timeframe: str) -> dict | None:
 
 
 def close_trade(signal_id: str, exit_price: float, exit_reason: str, r_multiple: float) -> None:
+    """Close an OPEN trade exactly once.
+
+    Historical outcomes must be immutable. The old update matched only signal_id,
+    which was safe in normal flow because evaluate_open_trades() fetches OPEN
+    rows, but adding the status guard prevents any future accidental rerun or
+    helper call from rewriting an already-closed TP/SL/expiry result.
+    """
     sql = """
     UPDATE scanner_signals
     SET status = %s, exit_price = %s, exit_reason = %s, exit_at = NOW(), r_multiple = %s
-    WHERE signal_id = %s;
+    WHERE signal_id = %s
+      AND UPPER(TRIM(COALESCE(status, ''))) = 'OPEN'
+      AND exit_at IS NULL;
     """
     status = {"TP": "CLOSED_TP", "SL": "CLOSED_SL", "EXPIRY": "EXPIRED"}.get(exit_reason, "CLOSED")
     try:
@@ -852,6 +861,8 @@ def close_trade(signal_id: str, exit_price: float, exit_reason: str, r_multiple:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(sql, (status, exit_price, exit_reason, r_multiple, signal_id))
+                if cur.rowcount == 0:
+                    print(f"[DB] close_trade skipped for {signal_id}: trade is no longer OPEN or already has exit_at.")
         conn.close()
     except Exception as e:
         print(f"[DB] close_trade failed: {e}")

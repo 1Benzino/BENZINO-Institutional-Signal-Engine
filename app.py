@@ -379,6 +379,7 @@ def init_tables() -> None:
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_r_multiple NUMERIC")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_outcome TEXT")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS trade_notes TEXT")
+                cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS display_id TEXT")
                 # Migration/fix: Telegram delivery must never control journal status.
                 # A+/A/B/C BUY/SELL setups are active journal trades; NO TRADE/HOLD stays SHADOW.
                 cur.execute(
@@ -1294,22 +1295,39 @@ def session_name(ts) -> str:
 
 
 def load_signals_for_user(username: str, settings: dict, include_all_admin: bool = False) -> pd.DataFrame:
+    """Load the logged-in user's journal rows from Supabase.
+
+    Important: filter by the user's watchlist inside SQL BEFORE applying LIMIT.
+    The previous version loaded the latest 5,000 scanner rows from the whole
+    system first, then filtered the user watchlist in pandas. As the full
+    master scanner universe grew, older user trades could fall outside that
+    global 5,000-row window even though they still belonged in the user
+    journal. That made totals, wins, balance, and realised PnL appear to move
+    backwards.
+    """
     tracking_started = settings.get("tracking_started_at") or "1970-01-01T00:00:00Z"
-    df = read_df(
-        """
+    params: list = [tracking_started]
+    where = ["created_at >= %s"]
+
+    if not include_all_admin:
+        watchlist_assets = sorted(set(load_user_watchlist(username).keys()))
+        if watchlist_assets:
+            where.append("asset = ANY(%s)")
+            params.append(watchlist_assets)
+
+    # This limit is now applied AFTER the user/watchlist filter, not before it.
+    # 50k is intentionally high so journal history remains stable while still
+    # preventing accidental unbounded reads on very large databases.
+    params.append(50000)
+    sql = f"""
         SELECT * FROM scanner_signals
-        WHERE created_at >= %s
+        WHERE {' AND '.join(where)}
         ORDER BY created_at DESC
-        LIMIT 5000
-        """,
-        (tracking_started,),
-    )
+        LIMIT %s
+        """
+    df = read_df(sql, tuple(params))
     if df.empty:
         return df
-    if not include_all_admin:
-        watchlist_assets = set(load_user_watchlist(username).keys())
-        if watchlist_assets:
-            df = df[df["asset"].astype(str).isin(watchlist_assets)]
     df = numeric_cols(df, ["confidence", "edge_score", "ml_prob", "entry", "sl", "tp", "rr", "rsi", "atr", "exit_price", "r_multiple", "bars_open", "mtf_score", "shadow_r_multiple"])
     df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce", utc=True)
     df["created_at_eat"] = df["created_at"].apply(fmt_nairobi)
@@ -2353,15 +2371,12 @@ def prepare_signal_table(df: pd.DataFrame, settings=None, limit: int = 300) -> p
         return pd.DataFrame()
     view = df.copy()
 
-    # Friendly sequential display ID. The database ID remains untouched;
-    # this only changes how Signal ID is shown in the app.
-    if "signal_id" in view.columns and "created_at" in view.columns:
-        _ranked = view[["signal_id", "created_at"]].drop_duplicates("signal_id").copy()
-        _ranked["_created_sort"] = pd.to_datetime(_ranked["created_at"], errors="coerce", utc=True)
-        _ranked = _ranked.sort_values(["_created_sort", "signal_id"], ascending=[True, True]).reset_index(drop=True)
-        _ranked["Signal ID Display"] = [f"Benzino-{i:02d}" for i in range(1, len(_ranked) + 1)]
-        _id_map = dict(zip(_ranked["signal_id"].astype(str), _ranked["Signal ID Display"]))
-        view["signal_id"] = view["signal_id"].astype(str).map(_id_map).fillna(view["signal_id"].astype(str))
+    # Use the database display_id so the app matches Telegram and Supabase exactly.
+    # Do NOT recalculate Benzino IDs in the app, otherwise Signal ID changes with filters/limits.
+    if "display_id" in view.columns:
+        display = view["display_id"].astype(str).replace({"nan": "", "None": "", "NaT": ""})
+        fallback = view["signal_id"].astype(str) if "signal_id" in view.columns else display
+        view["signal_id"] = display.where(display.str.strip().ne(""), fallback)
 
     view = view.head(limit)
     if "created_at" in view.columns:
@@ -3505,13 +3520,13 @@ def render_opportunity_board(username: str, settings: dict) -> None:
     # ---- Generated signals: full Supabase table, ordered and styled for trading readability ----
     with st.container(border=True):
         generated = df.copy()
-        if "signal_id" in generated.columns and "created_at" in generated.columns:
-            _sig_rank = generated[["signal_id", "created_at"]].drop_duplicates("signal_id").copy()
-            _sig_rank["_created_sort"] = pd.to_datetime(_sig_rank["created_at"], errors="coerce", utc=True)
-            _sig_rank = _sig_rank.sort_values(["_created_sort", "signal_id"], ascending=[True, True]).reset_index(drop=True)
-            _sig_rank["display_signal_id"] = [f"Benzino-{i:02d}" for i in range(1, len(_sig_rank) + 1)]
-            _sig_map = dict(zip(_sig_rank["signal_id"].astype(str), _sig_rank["display_signal_id"]))
-            generated["signal_id"] = generated["signal_id"].astype(str).map(_sig_map).fillna(generated["signal_id"].astype(str))
+        # Use database display_id so this table matches Telegram and Supabase exactly.
+        # The previous app-side re-numbering produced wrong IDs such as Benzino-365
+        # while Telegram/Supabase correctly showed Benzino-258.
+        if "display_id" in generated.columns:
+            display = generated["display_id"].astype(str).replace({"nan": "", "None": "", "NaT": ""})
+            fallback = generated["signal_id"].astype(str) if "signal_id" in generated.columns else display
+            generated["signal_id"] = display.where(display.str.strip().ne(""), fallback)
         if "created_at" in generated.columns:
             generated = generated.sort_values("created_at", ascending=False)
         generated = generated.head(100).copy()
