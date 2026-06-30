@@ -2321,6 +2321,7 @@ def render_benzino_aggrid(
     show_filter_button: bool = False,
     show_footer: bool = True,
     use_pagination: bool = True,
+    show_status_filter: bool = True,
 ):
     """Shared Benzino AgGrid renderer.
 
@@ -2368,8 +2369,8 @@ def render_benzino_aggrid(
 
     search_value = ""
     status_col_name = next((c for c in view.columns if str(c).strip().lower() == "status"), None)
-    if title or enable_search or show_filter_button or status_col_name:
-        if status_col_name:
+    if title or enable_search or show_filter_button or (status_col_name and show_status_filter):
+        if status_col_name and show_status_filter:
             left, status_col, search_col = st.columns([0.58, 0.18, 0.24], vertical_alignment="center")
             with left:
                 if title:
@@ -2530,7 +2531,7 @@ def apply_theme() -> None:
     .green { color:#00D4A3; }
     .red { color:#FF5D5D; }
     .muted { color:#8BAAB8; }
-    .section-gap { height:22px; }
+    .section-gap { height:32px; }
     .strategy-table-wrap { background:#0F2235; border:1px solid #1E3050; border-radius:16px; overflow:hidden; margin-top:10px; }
     table.strategy-table { width:100%; border-collapse:collapse; font-size:15px; }
     table.strategy-table th { text-align:left; color:#8BAAB8; background:#111A2A; padding:12px 14px; font-weight:850; }
@@ -3099,15 +3100,14 @@ def apply_theme() -> None:
         background: linear-gradient(145deg,#10263A 0%,#0B1A2B 100%);
         border: 1px solid #203A59;
         border-radius: 18px;
-        padding: 18px 52px 16px 18px;
-        height: 118px;
-        min-height: 118px;
-        max-height: 118px;
+        padding: 18px 22px 18px 18px;
+        min-height: 136px;
+        height: auto;
         position: relative;
         display: flex;
         align-items: center;
         justify-content: flex-start;
-        overflow: hidden;
+        overflow: visible;
     }
     .benzino-stat-card > div:first-child {
         width: calc(100% - 6px);
@@ -3127,19 +3127,20 @@ def apply_theme() -> None:
     }
     .benzino-stat-value {
         color:#E8EDF2;
-        font-size:clamp(24px, 1.75vw, 32px);
+        font-size:clamp(22px, 1.55vw, 30px);
         font-weight:950;
         margin-top:8px;
-        line-height:1.05;
-        white-space:nowrap;
+        line-height:1.08;
+        white-space:normal;
+        overflow-wrap:anywhere;
         letter-spacing:-.5px;
     }
     .benzino-stat-note {
         font-size:clamp(10px, .68vw, 12px);
         font-weight:800;
         margin-top:8px;
-        line-height:1.16;
-        max-width: 160px;
+        line-height:1.2;
+        max-width: 100%;
         white-space:normal;
     }
     .benzino-stat-note.up { color:#00D4A3; }
@@ -4677,16 +4678,41 @@ def render_workflow(username: str, settings: dict) -> None:
         max_loss_floor = starting * 0.90
         target_balance = starting * 1.10
 
+        # Allow each user to restart the visible prop challenge without deleting history.
+        # Restarting stores a per-timeframe start timestamp and the Prop Firm tab
+        # ignores older A+/A rows for this view only.
+        prop_start_map = settings.get("prop_challenge_started_at_by_tf", {})
+        if not isinstance(prop_start_map, dict):
+            prop_start_map = {}
+        prop_started_at_raw = str(prop_start_map.get(challenge_tf, "") or settings.get("tracking_started_at", "") or "")
+
+        prop_header_left, prop_header_right = st.columns([0.78, 0.22], vertical_alignment="center")
+        with prop_header_left:
+            st.caption(
+                f"This tab recalculates the FTMO-style challenge from your current watchlist and selected timeframe "
+                f"({challenge_tf}). It uses only A+/A closed trades, fixed $10,000 account size, 1% risk per trade, "
+                f"10% profit target, 5% max daily loss, 10% max total loss, and minimum 4 trading days."
+            )
+        with prop_header_right:
+            if st.button("Restart challenge", key=f"restart_prop_challenge_{challenge_tf}", width="stretch"):
+                prop_start_map[challenge_tf] = datetime.now(timezone.utc).isoformat()
+                settings["prop_challenge_started_at_by_tf"] = prop_start_map
+                save_settings(username, settings)
+                st.success(f"{challenge_tf} prop challenge restarted.")
+                st.rerun()
+
         prop_source = trades[
             trades.get("grade", pd.Series(dtype=str)).astype(str).isin(["A+", "A"])
         ].copy() if trades is not None and not trades.empty else pd.DataFrame()
+        if not prop_source.empty and prop_started_at_raw:
+            try:
+                prop_start_ts = pd.to_datetime(prop_started_at_raw, errors="coerce", utc=True)
+                if pd.notna(prop_start_ts):
+                    created_scope = pd.to_datetime(prop_source.get("created_at", pd.Series(pd.NaT, index=prop_source.index)), errors="coerce", utc=True)
+                    prop_source = prop_source[created_scope >= prop_start_ts].copy()
+            except Exception:
+                pass
         prop_closed = closed_resolved_trades(prop_source) if not prop_source.empty else pd.DataFrame()
-
-        st.caption(
-            f"This tab recalculates the FTMO-style challenge from your current watchlist and selected timeframe "
-            f"({challenge_tf}). It uses only A+/A closed trades, fixed $10,000 account size, 1% risk per trade, "
-            f"10% profit target, 5% max daily loss, 10% max total loss, and minimum 4 trading days."
-        )
 
         status = "ACTIVE"
         fail_reason = ""
@@ -4894,6 +4920,7 @@ def render_workflow(username: str, settings: dict) -> None:
         funded_status = "ACTIVE" if phase2.get("status") == "PASSED" else "LOCKED"
         funded_note = "Eligible after Phase 2 is passed" if funded_status == "LOCKED" else "Funded account rules active: unlimited target, 5% daily loss, 10% max loss, up to 90% profit split."
         status_color = "green" if status == "PASSED" else "red" if status == "FAILED" else ""
+        mc = prop_firm_monte_carlo(prop_curve, {"starting_balance": starting, "current_equity": current}, runs=2000)
         c1, c2, c3, c4, c5 = st.columns(5)
         with c1: metric_card("Challenge equity", f"${current:,.2f}", f"Start ${starting:,.0f}")
         with c2: metric_card("ROI to target", f"{roi_pct:+.2f}%", "Target +10.00%")
@@ -4901,6 +4928,7 @@ def render_workflow(username: str, settings: dict) -> None:
         with c4: metric_card("Trading days", f"{trading_days}", "Minimum 4 required")
         with c5: metric_card("Challenge status", status, fail_reason or (f"Passed {pass_date}" if pass_date else ""))
 
+        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         i1, i2, i3, i4, i5 = st.columns(5)
         with i1: metric_card("Challenge started", challenge_started_at or "—", "First eligible A+/A setup")
         with i2: metric_card("Passed on", pass_date or "—", "When target + min days were met")
@@ -4908,6 +4936,15 @@ def render_workflow(username: str, settings: dict) -> None:
         with i4: metric_card("Closed / Open", f"{closed_count} / {open_count}", "A+/A trades only")
         with i5: metric_card("Max drawdown", f"${max_drawdown_cash:,.2f}", f"{max_drawdown_pct:.2f}% from peak")
 
+        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
+        p1, p2, p3 = st.columns(3)
+        with p1: metric_card("Pass probability", f"{mc['pass_pct']:.2f}%", f"From current equity · {mc['sample_size']} closed")
+        with p2: metric_card("Breach probability", f"{mc['fail_pct']:.2f}%", "Within next 60 simulated trades")
+        with p3: metric_card("Unresolved", f"{mc['unresolved_pct']:.2f}%", "Neither hit in 60 trades")
+        if mc["used_placeholder"]:
+            st.caption("Fewer than 10 real closed A+/A trades exist, so this uses a conservative placeholder R-distribution until more trade history is available.")
+
+        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         status_line = f"<b class='{status_color}'>{html.escape(status)}</b> · Progress to 10% target: {progress_to_target*100:.0f}%"
         if fail_reason:
             status_line += f" · {html.escape(fail_reason)}"
@@ -4931,6 +4968,7 @@ def render_workflow(username: str, settings: dict) -> None:
         with r3:
             metric_card("Funded Account", funded_status, "Unlimited target · 90% split")
 
+        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         rule_rows = [
             {"Rule": "Profit Target", "Phase 1": "$1,000", "Phase 2": "$500", "Funded Account": "Unlimited"},
             {"Rule": "Max Daily Loss", "Phase 1": "$500", "Phase 2": "$500", "Funded Account": "$500"},
@@ -4951,6 +4989,7 @@ def render_workflow(username: str, settings: dict) -> None:
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         st.subheader("Phase analytics")
+        st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
         phase_rows = []
         for ph in [phase1, phase2]:
             phase_rows.append({
@@ -4999,6 +5038,7 @@ def render_workflow(username: str, settings: dict) -> None:
             badge_cols={"Status": "status"},
             numeric_cols_right=["Equity", "P/L", "ROI %", "Progress %", "Trading Days", "Closed Trades", "Best Day", "Worst Day", "Max Drawdown", "Max DD %"],
             enable_search=False,
+            show_status_filter=False,
         )
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
@@ -5018,15 +5058,14 @@ def render_workflow(username: str, settings: dict) -> None:
                 pinned=["Asset", "Signal", "Grade"],
                 badge_cols={"Signal":"signal", "Grade":"grade", "Status":"status", "Outcome":"outcome"},
                 numeric_cols_right=["R Multiple", "pnl_cash", "balance_after", "Entry", "SL", "TP"],
+                show_status_filter=False,
             )
 
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=prop_curve["prop_event_time"], y=prop_curve["balance_after"], mode="lines+markers", name="Challenge equity"))
+            fig = px.line(prop_curve, x="prop_event_time", y="balance_after", title="Prop-firm equity curve")
             fig.add_hline(y=starting, line_dash="dot", annotation_text="Starting balance")
             fig.add_hline(y=target_balance, line_dash="dot", line_color="#00D4A3", annotation_text="10% target")
             fig.add_hline(y=max_loss_floor, line_dash="dot", line_color="#FF5D5D", annotation_text="10% max loss")
-            fig.update_layout(template="plotly_dark", paper_bgcolor="#0F2235", plot_bgcolor="#0F2235",
-                             height=360, margin=dict(t=30, b=20), title="Prop-firm equity curve")
+            fig.update_layout(height=360, margin=dict(t=50, b=20))
             st.plotly_chart(fig, use_container_width=True)
 
             if not day_summary.empty:
@@ -5041,21 +5080,8 @@ def render_workflow(username: str, settings: dict) -> None:
                     badge_cols={"Daily Breach":"status", "Target Hit":"status", "Day Result":"outcome"},
                     numeric_cols_right=["Opening Balance", "Daily P/L", "Closing Balance", "Trades"],
                     enable_search=False,
+                    show_status_filter=False,
                 )
-
-        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-        st.subheader("Pass / fail probability")
-        mc = prop_firm_monte_carlo(prop_curve, {"starting_balance": starting, "current_equity": current}, runs=2000)
-        m1, m2, m3 = st.columns(3)
-        with m1: metric_card("Pass probability", f"{mc['pass_pct']:.2f}%", f"From current equity, {mc['sample_size']} real closed trade(s)")
-        with m2: metric_card("Breach probability", f"{mc['fail_pct']:.2f}%", "Within next 60 simulated trades")
-        with m3: metric_card("Unresolved", f"{mc['unresolved_pct']:.2f}%", "Neither hit in 60 trades")
-        if mc["used_placeholder"]:
-            st.caption("Fewer than 10 real closed A+/A trades exist, so this uses a conservative placeholder R-distribution. It will automatically switch to your real trade history once enough A+/A trades close.")
-
-        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-        with st.expander("Rule note", expanded=False):
-            st.caption("This view is now calculated from scanner_signals for the logged-in user scope. It no longer reads the old global prop_firm_state cards, so the cards, table, equity curve, and selected timeframe all refer to the same data.")
 
     with t4:
         st.caption("All signals the scanner blocked from being journaled as real trades. Includes two types: (1) directional ideas (BUY/SELL) where the grade was too weak or R:R too thin — these are hypothetically tracked against TP/SL/expiry to see if they'd have worked. (2) HOLD rows where the systems genuinely split with no directional consensus — these have no hypothetical outcome since there's no entry thesis, but they're recorded so you can see how often the scanner truly sees no edge.")
