@@ -1772,11 +1772,15 @@ def next_benzino_display_id() -> str:
 
 def build_telegram_message(sig: ScanResult, display_id: str | None = None) -> str:
     def clean(v): return html.escape(str(v if v is not None else ""))
-    def fmt(x):
+
+    def fmt_price(x):
+        """Entry, SL, and TP may keep extra precision where needed."""
         try:
             x = float(x)
-            if abs(x) >= 1000: return f"{x:,.2f}"
-            if abs(x) >= 10:   return f"{x:,.4f}"
+            if abs(x) >= 1000:
+                return f"{x:,.2f}"
+            if abs(x) >= 10:
+                return f"{x:,.4f}"
             return f"{x:,.6f}"
         except Exception:
             return str(x)
@@ -1784,37 +1788,39 @@ def build_telegram_message(sig: ScanResult, display_id: str | None = None) -> st
     emoji = "🟢" if sig.signal == "BUY" else "🔴" if sig.signal == "SELL" else "⚪"
     grade_emoji = {"A+": "🏆", "A": "⭐", "B": "🔹", "C": "▫️"}.get(sig.grade, "")
     shown_id = display_id or getattr(sig, "display_id", None) or "Benzino-00"
+    footer_rule = "─" * max(12, len(f"🆔 {shown_id}"))
 
     votes_lines = "\n".join(
-        f"  {name}: {v['direction']} ({v['strength']:.2f})" for name, v in sig.strategy_votes.items()
+        f"{name}: {v['direction']} ({v['strength']:.2f})"
+        for name, v in sig.strategy_votes.items()
     )
 
     return f"""
 {emoji} <b>BENZINO {clean(sig.signal)} SIGNAL</b> {grade_emoji} Grade {clean(sig.grade)}
 
 <b>Asset:</b> {clean(sig.asset)}
-<b>Timeframe:</b> {clean(sig.timeframe)}
+<b>Timeframe:</b> {clean(sig.timeframe)} signal
 <b>System Agreement:</b> {sig.confidence:.2f}%
 <b>Edge Score:</b> {sig.edge_score:.2f}
 <b>ML Prob:</b> {sig.ml_prob:.2f}
-<b>MTF Confirmation:</b> {sig.mtf_score:.2f}%
+<b>MTF Score:</b> {sig.mtf_score:.2f}%
 
-<b>Trade Plan</b>
-Entry: <code>{fmt(sig.entry)}</code>
-SL: <code>{fmt(sig.sl)}</code>
-TP: <code>{fmt(sig.tp)}</code>
+<b>Trade Plan:</b>
+Entry: <code>{fmt_price(sig.entry)}</code>
+SL: <code>{fmt_price(sig.sl)}</code>
+TP: <code>{fmt_price(sig.tp)}</code>
 RR: <code>{sig.rr:.2f}R</code>
 
-<b>Strategy Confluence</b>
+<b>Strategy Confluence:</b>
 {votes_lines}
 
-<b>Market Context</b>
+<b>Market Context:</b>
 1H Trend: {clean(sig.trend_1h)}
 15M Trend: {clean(sig.trend_15m)}
 Regime: {clean(sig.regime)}
-RSI: {sig.rsi:.1f}
+RSI: {sig.rsi:.2f}
 
-➖➖➖➖➖➖➖➖➖➖
+{footer_rule}
 🆔 <code>{clean(shown_id)}</code>
 """.strip()
 
