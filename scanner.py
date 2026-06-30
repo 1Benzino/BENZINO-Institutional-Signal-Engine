@@ -69,7 +69,10 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 MASTER_WATCHLIST = {
-    "XAUUSD": "GC=F", "XAGUSD": "SI=F", "OIL": "CL=F", "BRENT": "BZ=F",
+    # Commodities — using spot/CFD-equivalent tickers so prices match TradingView XAUUSD/XAGUSD.
+    # GC=F (Gold Futures) and SI=F (Silver Futures) trade $20-50 above spot due to contango;
+    # switching to the =X forex-pair form gives prices consistent with broker spot charts.
+    "XAUUSD": "XAUUSD=X", "XAGUSD": "XAGUSD=X", "OIL": "CL=F", "BRENT": "BZ=F",
     "NATGAS": "NG=F", "COPPER": "HG=F",
     "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "JPY=X",
     "USDCHF": "CHF=X", "USDCAD": "CAD=X", "AUDUSD": "AUDUSD=X", "NZDUSD": "NZDUSD=X",
@@ -91,7 +94,7 @@ def load_user_watchlist(username: str) -> dict[str, str]:
     Load one user's enabled watchlist from Supabase.
 
     Returns:
-        {"XAUUSD": "GC=F", "BTCUSD": "BTC-USD"}
+        {"XAUUSD": "XAUUSD=X", "BTCUSD": "BTC-USD"}
 
     If the user has no saved watchlist yet, this returns an empty dict.
     The scanner still scans MASTER_WATCHLIST; this helper is for user-specific
@@ -137,7 +140,7 @@ def get_all_user_watchlists() -> dict[str, dict[str, str]]:
 
     Returns:
         {
-            "ben": {"XAUUSD": "GC=F", "BTCUSD": "BTC-USD"},
+            "ben": {"XAUUSD": "XAUUSD=X", "BTCUSD": "BTC-USD"},
             "brother": {"EURUSD": "EURUSD=X"}
         }
 
@@ -613,6 +616,12 @@ def init_tables() -> None:
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_prop_firm_trades_signal_id
         ON prop_firm_trades (signal_id);
+
+    CREATE TABLE IF NOT EXISTS benzino_signal_counter (
+        id      INTEGER PRIMARY KEY DEFAULT 1,
+        counter BIGINT NOT NULL DEFAULT 0,
+        CONSTRAINT single_row CHECK (id = 1)
+    );
     """
     try:
         conn = db_connect()
@@ -625,10 +634,12 @@ def init_tables() -> None:
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_r_multiple NUMERIC")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_exit_price NUMERIC")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_closed_at TIMESTAMPTZ")
+                cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS display_id TEXT")
                 cur.execute("ALTER TABLE user_telegram_settings ADD COLUMN IF NOT EXISTS alerts_enabled BOOLEAN DEFAULT FALSE")
                 cur.execute("ALTER TABLE user_telegram_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()")
                 cur.execute("ALTER TABLE scanner_runtime_log ADD COLUMN IF NOT EXISTS open_trades INTEGER DEFAULT 0")
                 cur.execute("ALTER TABLE scanner_runtime_log ADD COLUMN IF NOT EXISTS alerted INTEGER DEFAULT 0")
+                cur.execute("INSERT INTO benzino_signal_counter (id, counter) VALUES (1, 0) ON CONFLICT (id) DO NOTHING")
                 # Migration/fix: a journaled A+/A/B/C BUY/SELL setup must be OPEN even when Telegram is disabled.
                 # Older runs incorrectly left graded setups as SHADOW when no alert was sent.
                 cur.execute(
@@ -681,23 +692,25 @@ def sanitize_for_json(value):
 def save_signal(sig: ScanResult) -> bool:
     sql = """
     INSERT INTO scanner_signals
-        (signal_id, created_at, scan_owner, asset, ticker, timeframe, signal, grade,
+        (signal_id, display_id, created_at, scan_owner, asset, ticker, timeframe, signal, grade,
          confidence, edge_score, ml_prob, entry, sl, tp, rr, regime, rsi, atr,
          trend_1h, trend_15m, reason, candle_close, strategy_votes, mtf_score, mtf_context, alert_sent, status)
     VALUES
-        (%s,%s,%s,%s,%s,%s,%s,%s, %s,%s,%s,%s,%s,%s,%s,%s,%s,%s, %s,%s,%s,%s,%s,%s,%s,%s,%s)
+        (%s,%s,%s,%s,%s,%s,%s,%s,%s, %s,%s,%s,%s,%s,%s,%s,%s,%s,%s, %s,%s,%s,%s,%s,%s,%s,%s,%s)
     ON CONFLICT (signal_id) DO NOTHING;
     """
     import json
     grade_norm = str(sig.grade or "").strip().upper()
     signal_norm = str(sig.signal or "").strip().upper()
     status = "OPEN" if (grade_norm in ("A+", "A", "B", "C") and signal_norm in ("BUY", "SELL")) else "SHADOW"
+    if not getattr(sig, "display_id", None):
+        sig.display_id = next_benzino_display_id()
     try:
         conn = db_connect()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(sql, (
-                    sig.signal_id, sig.created_at, SCAN_OWNER, sig.asset, sig.ticker,
+                    sig.signal_id, sig.display_id, sig.created_at, SCAN_OWNER, sig.asset, sig.ticker,
                     sig.timeframe, sig.signal, sig.grade,
                     round(safe_number(sig.confidence), 4), round(safe_number(sig.edge_score), 4), round(safe_number(sig.ml_prob, 0.5), 6),
                     round(safe_number(sig.entry), 8), round(safe_number(sig.sl), 8), round(safe_number(sig.tp), 8), round(safe_number(sig.rr), 4),
@@ -1736,7 +1749,28 @@ def scan_asset(asset: str, ticker: str, timeframe: str = "15m") -> ScanResult | 
 #  TELEGRAM
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def build_telegram_message(sig: ScanResult) -> str:
+def next_benzino_display_id() -> str:
+    """Atomically increment the persistent sequential display counter.
+    Returns strings like 'Benzino-01', 'Benzino-02', ... 'Benzino-137', etc.
+    Backed by a single counter row — survives admin resets that delete scanner_signals.
+    """
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE benzino_signal_counter SET counter = counter + 1 WHERE id = 1 RETURNING counter"
+                )
+                row = cur.fetchone()
+                n = int(row["counter"]) if row else 1
+        conn.close()
+        return f"Benzino-{n:02d}"
+    except Exception as e:
+        print(f"[DB] next_benzino_display_id failed: {e}")
+        return "Benzino-00"
+
+
+def build_telegram_message(sig: ScanResult, display_id: str | None = None) -> str:
     def clean(v): return html.escape(str(v if v is not None else ""))
     def fmt(x):
         try:
@@ -1749,12 +1783,7 @@ def build_telegram_message(sig: ScanResult) -> str:
 
     emoji = "🟢" if sig.signal == "BUY" else "🔴" if sig.signal == "SELL" else "⚪"
     grade_emoji = {"A+": "🏆", "A": "⭐", "B": "🔹", "C": "▫️"}.get(sig.grade, "")
-    short_id = sig.signal_id[:8].upper()
-
-    try:
-        signal_time = pd.to_datetime(sig.created_at).tz_convert("UTC").strftime("%d %b %Y • %H:%M UTC")
-    except Exception:
-        signal_time = clean(sig.created_at)
+    shown_id = display_id or getattr(sig, "display_id", None) or "Benzino-00"
 
     votes_lines = "\n".join(
         f"  {name}: {v['direction']} ({v['strength']:.2f})" for name, v in sig.strategy_votes.items()
@@ -1764,10 +1793,11 @@ def build_telegram_message(sig: ScanResult) -> str:
 {emoji} <b>BENZINO {clean(sig.signal)} SIGNAL</b> {grade_emoji} Grade {clean(sig.grade)}
 
 <b>Asset:</b> {clean(sig.asset)}
-<b>Timeframe:</b> {clean(sig.timeframe)} signal / MTF confirmation
+<b>Timeframe:</b> {clean(sig.timeframe)}
 <b>System Agreement:</b> {sig.confidence:.1f}%
 <b>Edge Score:</b> {sig.edge_score:.1f}
 <b>ML Prob:</b> {sig.ml_prob:.3f}
+<b>MTF Confirmation:</b> {sig.mtf_score:.0f}%
 
 <b>Trade Plan</b>
 Entry: <code>{fmt(sig.entry)}</code>
@@ -1784,11 +1814,8 @@ RR: <code>{sig.rr:.2f}R</code>
 Regime: {clean(sig.regime)}
 RSI: {sig.rsi:.1f}
 
-<b>Reason</b>
-{clean(sig.reason)}
-
 ➖➖➖➖➖➖➖➖➖➖
-🆔 <code>{short_id}</code> | 🕒 {signal_time}
+🆔 <code>{clean(shown_id)}</code>
 """.strip()
 
 

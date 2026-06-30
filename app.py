@@ -378,6 +378,7 @@ def init_tables() -> None:
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_exit_price NUMERIC")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_r_multiple NUMERIC")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_outcome TEXT")
+                cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS trade_notes TEXT")
                 # Migration/fix: Telegram delivery must never control journal status.
                 # A+/A/B/C BUY/SELL setups are active journal trades; NO TRADE/HOLD stays SHADOW.
                 cur.execute(
@@ -1902,17 +1903,35 @@ def rich_closed_trade_explanation(row: pd.Series) -> str:
     r_mult = float(pd.to_numeric(row.get("r_multiple"), errors="coerce") or 0)
     exit_reason = str(row.get("exit_reason", ""))
     reason = str(row.get("reason", ""))
+    trade_note = str(row.get("trade_notes") or "").strip()
+
     if outcome == "WIN":
         lesson = "The market rewarded the confluence. Coach should look for whether the winning pattern came from timeframe alignment, grade quality, session timing, or asset behaviour, then prioritise repeating that condition."
     elif outcome == "LOSS":
         lesson = "The setup failed after entry. This should be reviewed for timing risk, volatility expansion, weak MTF confirmation, or a strategy vote that was not strong enough. Losses are not ignored; they become filters for the next version of the playbook."
     else:
         lesson = "The trade closed without a clean TP/SL lesson. Treat it as a timing and expiry-management review rather than a pure win/loss signal."
+
+    note_section = ""
+    if trade_note:
+        note_section = (
+            f"\n\n**Trader's note:** {trade_note}  \n"
+            f"**Explain AI context:** The trader flagged an external factor on this trade. "
+            f"This is important context: if the note describes a news spike, data release, "
+            f"or other exogenous event that drove the stop loss, the system's strategy should not be "
+            f"adjusted based on this outcome alone — the signal logic was correct, but the market "
+            f"environment was exceptional. Instead, the lesson here is around timing: understanding "
+            f"key economic calendar events before entry, and considering tighter initial risk on "
+            f"high-impact news days for this asset and session. One event-driven loss, properly "
+            f"noted and understood, is more valuable to the playbook than ten unexplained ones."
+        )
+
     return (
         f"**{asset} · {tf} · {signal} · Grade {grade}**  \n\n"
         f"This trade closed as **{outcome}** via **{exit_reason or 'recorded close'}** with **{r_mult:+.2f}R**. "
         f"The original reason was: {reason}\n\n"
         f"**What Explain AI learns:** {lesson}"
+        f"{note_section}"
     )
 
 
@@ -2233,17 +2252,30 @@ def render_benzino_aggrid(
         view = view[ordered + rest]
 
     # Market-aware table formatting:
-    # Price columns keep up to 6 decimals where needed, while non-price metrics
-    # remain at 2 decimals for readability.
+    # Price columns (Entry, SL, TP, etc.) get full dynamic precision via format_market_price.
+    # Other numeric columns also get dynamic precision when their values look price-like
+    # (i.e. they have meaningful decimal places beyond 2dp — e.g. EURUSD at 1.08432),
+    # falling back to 2dp only for genuinely non-price numbers like percentages and counts.
     for _col in view.columns:
         if is_price_display_column(_col):
             view[_col] = view[_col].apply(format_market_price)
         elif pd.api.types.is_numeric_dtype(view[_col]):
-            view[_col] = view[_col].apply(
-                lambda x: "" if pd.isna(x) else (
-                    f"{float(x):.2f}" if isinstance(x, (int, float, np.integer, np.floating)) else x
-                )
-            )
+            def _fmt_numeric(x, _col=_col):
+                if pd.isna(x):
+                    return ""
+                try:
+                    v = float(x)
+                    if not np.isfinite(v):
+                        return ""
+                    # Use dynamic precision if the value has meaningful sub-cent decimals
+                    # (e.g. FX prices like 1.08432, crypto like 0.00045)
+                    rounded_2 = round(v, 2)
+                    if abs(v - rounded_2) > 1e-8:
+                        return format_market_price(v)
+                    return f"{v:.2f}"
+                except Exception:
+                    return str(x) if x is not None else ""
+            view[_col] = view[_col].apply(_fmt_numeric)
 
     search_value = ""
     status_col_name = next((c for c in view.columns if str(c).strip().lower() == "status"), None)
@@ -2516,6 +2548,14 @@ def apply_theme() -> None:
         color: #FFFFFF !important;
         box-shadow: 0 0 0 1px rgba(0,200,150,.35) inset !important;
         outline: none !important;
+    }
+    button[kind="segmented_controlActive"] p,
+    button[kind="segmented_controlActive"] span,
+    button[kind="segmented_controlActive"] div,
+    [data-testid="stBaseButton-segmented_controlActive"] p,
+    [data-testid="stBaseButton-segmented_controlActive"] span,
+    [data-testid="stBaseButton-segmented_controlActive"] div {
+        color: #FFFFFF !important;
     }
 
     button[kind="segmented_controlActive"]:focus,
@@ -2991,20 +3031,22 @@ def apply_theme() -> None:
     .benzino-stat-card-no-icon .benzino-stat-label { max-width:100% !important; text-transform:uppercase; letter-spacing:.5px; }
     .benzino-stat-label {
         color:#8BAAB8;
-        font-size:clamp(11px, .72vw, 13px);
+        font-size:clamp(11px, .78vw, 14px);
         font-weight:850;
         line-height:1.16;
-        white-space:normal;
-        max-width: 135px;
+        white-space:nowrap;
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
     }
     .benzino-stat-value {
         color:#E8EDF2;
-        font-size:clamp(21px, 1.45vw, 27px);
+        font-size:clamp(24px, 1.75vw, 32px);
         font-weight:950;
-        margin-top:10px;
+        margin-top:8px;
         line-height:1.05;
         white-space:nowrap;
-        letter-spacing:-.4px;
+        letter-spacing:-.5px;
     }
     .benzino-stat-note {
         font-size:clamp(10px, .68vw, 12px);
@@ -4402,16 +4444,21 @@ def render_workflow(username: str, settings: dict) -> None:
         df = pd.DataFrame(columns=raw_df.columns if raw_df is not None else [])
     df["outcome"] = df.apply(outcome_label, axis=1)
     trades = df[df["grade"].astype(str).isin(VALID_GRADES)].copy()
-    no_trade_source = df.copy()
-    if no_trade_source.empty and raw_df is not None and not raw_df.empty:
-        no_trade_source = raw_df.copy()
-        if "outcome" not in no_trade_source.columns:
-            no_trade_source["outcome"] = no_trade_source.apply(outcome_label, axis=1)
-
-    no_trades = no_trade_source[
-        no_trade_source["grade"].astype(str).str.upper().eq("NO TRADE")
-        & no_trade_source["signal"].astype(str).str.upper().isin(["BUY", "SELL"])
-    ].copy()
+    # No Trade Tracker source: always use raw_df (pre-timeframe-filter) so that
+    # the page shows all SHADOW rows regardless of the user's preferred timeframe
+    # view, since a user viewing "1h" shouldn't see an empty No Trade tab just
+    # because most SHADOW signals happened on "15m". status == "SHADOW" is the
+    # single authoritative source of truth — save_signal() writes SHADOW for
+    # every row that isn't a graded A+/A/B/C BUY/SELL.
+    #
+    # The previous filter (grade=="NO TRADE" AND signal IN ["BUY","SELL"]) was
+    # wrong because it silently excluded the majority of no-trade rows: signal=="HOLD"
+    # rows, which are generated whenever systems genuinely split (dominant=="SPLIT")
+    # and are by far the most common class of shadow signal.
+    _nt_source = raw_df.copy() if raw_df is not None and not raw_df.empty else df.copy()
+    if "outcome" not in _nt_source.columns:
+        _nt_source["outcome"] = _nt_source.apply(outcome_label, axis=1)
+    no_trades = _nt_source[_nt_source["status"].astype(str).str.upper().eq("SHADOW")].copy()
     open_trades = trades[trades["status"].astype(str).str.upper().eq("OPEN")]
     closed_trades = trades[trades["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])]
 
@@ -4588,26 +4635,44 @@ def render_workflow(username: str, settings: dict) -> None:
             prop_source = trades[trades["grade"].astype(str).isin(["A+", "A"])].copy()
             render_performance_strip(prop_source, settings, prop_mode=True)
 
+        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
+        st.markdown("<div class='benzino-panel-title'>Restart Challenge</div>", unsafe_allow_html=True)
+        st.caption("Use this to wipe the current prop firm ledger and start a fresh challenge. This deletes all prop firm trade history and resets the state — your scanner signals and journal are not affected.")
+        restart_confirm = st.checkbox("I understand this will permanently delete my current challenge progress", key="prop_restart_confirm")
+        st.markdown("<div class='danger-button'>", unsafe_allow_html=True)
+        restart_clicked = st.button("🔄 Restart Challenge", disabled=not restart_confirm, key="prop_restart_btn")
+        st.markdown("</div>", unsafe_allow_html=True)
+        if restart_clicked and restart_confirm:
+            try:
+                execute("DELETE FROM prop_firm_trades")
+                execute("DELETE FROM prop_firm_state")
+                st.success("Challenge restarted. The prop firm ledger has been cleared. The next A+/A trade close will initialise a fresh state.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Restart failed: {exc}")
+
     with t4:
-        st.write("These are blocked Buy/Sell ideas that were rejected as No Trade because risk/reward or agreement was too weak to journal as real trades. HOLD rows are excluded because they have no trade direction, entry thesis, TP/SL path, or meaningful hypothetical outcome.")
-        no_trades_resolved = no_trades[no_trades["shadow_outcome"].notna()].copy() if "shadow_outcome" in no_trades.columns else pd.DataFrame()
+        st.caption("All signals the scanner blocked from being journaled as real trades. Includes two types: (1) directional ideas (BUY/SELL) where the grade was too weak or R:R too thin — these are hypothetically tracked against TP/SL/expiry to see if they'd have worked. (2) HOLD rows where the systems genuinely split with no directional consensus — these have no hypothetical outcome since there's no entry thesis, but they're recorded so you can see how often the scanner truly sees no edge.")
+        no_trades_directional = no_trades[no_trades["signal"].astype(str).str.upper().isin(["BUY", "SELL"])].copy() if not no_trades.empty else pd.DataFrame()
+        no_trades_hold = no_trades[no_trades["signal"].astype(str).str.upper().eq("HOLD")].copy() if not no_trades.empty else pd.DataFrame()
+        no_trades_resolved = no_trades_directional[no_trades_directional["shadow_outcome"].notna()].copy() if "shadow_outcome" in no_trades_directional.columns and not no_trades_directional.empty else pd.DataFrame()
         h1, h2, h3, h4 = st.columns(4)
-        with h1: metric_card("Total No Trade ideas", f"{len(no_trades):,}", "Never alerted, never journaled")
-        with h2: metric_card("Hypothetically resolved", f"{len(no_trades_resolved):,}", "Scanner checked TP/SL/expiry")
+        with h1: metric_card("Total shadow rows", f"{len(no_trades):,}", "Never alerted, never journaled")
+        with h2: metric_card("Directional ideas", f"{len(no_trades_directional):,}", "BUY/SELL blocked by grade or R:R")
+        with h3: metric_card("HOLD (no consensus)", f"{len(no_trades_hold):,}", "Systems genuinely split, no direction")
+        with h4: metric_card("Hypothetically resolved", f"{len(no_trades_resolved):,}", "Scanner checked TP/SL/expiry")
         if not no_trades_resolved.empty:
             hyp_wins = no_trades_resolved["shadow_outcome"].astype(str).eq("SHADOW_TP")
             hyp_win_rate = (hyp_wins.sum() / len(no_trades_resolved) * 100) if len(no_trades_resolved) else 0.0
-            with h3: metric_card("Hypothetical win rate", f"{hyp_win_rate:.2f}%", "Not part of real journal win rate")
-            with h4: metric_card("Hypothetical avg R", f"{pd.to_numeric(no_trades_resolved['shadow_r_multiple'], errors='coerce').mean():+.2f}R", "Across resolved blocked ideas")
+            r5, r6 = st.columns(2)
+            with r5: metric_card("Hypothetical win rate", f"{hyp_win_rate:.2f}%", "Not part of real journal win rate")
+            with r6: metric_card("Hypothetical avg R", f"{pd.to_numeric(no_trades_resolved['shadow_r_multiple'], errors='coerce').mean():+.2f}R", "Across resolved blocked ideas")
             st.markdown(
-                "<div class='grey-note'>⚠️ These figures describe what would have happened if every blocked idea "
+                "<div class='grey-note'>⚠️ These figures describe what would have happened if every blocked directional idea "
                 "had been taken anyway. They are shadow research only and are <b>excluded</b> from the real "
                 "User Journal and Prop Firm win rates above, by design.</div>",
                 unsafe_allow_html=True,
             )
-        else:
-            with h3: metric_card("Hypothetical win rate", "—", "Waiting for candles to resolve")
-            with h4: metric_card("Hypothetical avg R", "—", "")
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         no_trade_cols = ["created_at_eat", "asset", "timeframe", "signal", "grade", "status", "entry", "sl", "tp", "rr", "confidence", "edge_score", "shadow_outcome", "shadow_r_multiple", "shadow_exit_price", "reason", "session"]
         render_benzino_aggrid(prepare_signal_table(no_trades[[c for c in no_trade_cols if c in no_trades.columns]].head(300)), key="no_trade_tracker", title="Research Queue", height=460, page_size=10, pinned=["Asset", "Signal", "Grade", "Age"], badge_cols={"Signal":"signal", "Grade":"grade", "Status":"status", "Hypothetical Outcome":"outcome"}, numeric_cols_right=["Entry", "SL", "TP", "Confidence", "Decayed Confidence", "RR", "Edge Score", "Hypothetical R", "Hypothetical Exit", "R Multiple"])
@@ -4740,6 +4805,38 @@ def render_workflow(username: str, settings: dict) -> None:
                 choice = st.selectbox("Choose one of the last 8 closed trades", options, key="explain_closed")
                 sid = choice.split(" · ")[-1]
                 row = closed_latest[closed_latest["signal_id"].astype(str).eq(sid)].iloc[0]
+
+                existing_note = str(row.get("trade_notes") or "").strip()
+                note_key = f"trade_note_{sid}"
+                if note_key not in st.session_state:
+                    st.session_state[note_key] = existing_note
+
+                st.markdown("<div class='benzino-panel-title' style='margin-top:12px'>Trade Note</div>", unsafe_allow_html=True)
+                st.caption("Add context for Explain AI — e.g. 'news spike caused SL', 'entered during high-impact NFP release', 'manual close due to regime shift'. This note is saved to Supabase and incorporated into the AI explanation below.")
+                note_text = st.text_area(
+                    "Note (optional)",
+                    value=st.session_state[note_key],
+                    placeholder="e.g. Sharp spike caused by CPI data release — institutional stop hunt above previous high before reversal.",
+                    height=90,
+                    key=f"note_input_{sid}",
+                    label_visibility="collapsed",
+                )
+                if st.button("Save note", key=f"save_note_{sid}", type="primary"):
+                    try:
+                        execute(
+                            "UPDATE scanner_signals SET trade_notes = %s WHERE signal_id = %s",
+                            (note_text.strip() or None, sid),
+                        )
+                        st.session_state[note_key] = note_text.strip()
+                        row = row.copy()
+                        row["trade_notes"] = note_text.strip()
+                        st.success("Note saved.")
+                    except Exception as exc:
+                        st.error(f"Failed to save note: {exc}")
+                else:
+                    row = row.copy()
+                    row["trade_notes"] = st.session_state[note_key]
+
                 render_ai_card("Closed Trade Lesson", rich_closed_trade_explanation(row))
 
 
@@ -4847,7 +4944,7 @@ def render_settings(username: str, settings: dict) -> None:
                 all_users["telegram_activated"] = all_users["username"].astype(str).map(lambda u: "Yes" if telegram_map.get(u) else "No")
                 all_users["created_at"] = all_users["created_at"].apply(fmt_nairobi)
                 all_users["tracking_started_at"] = all_users["tracking_started_at"].apply(fmt_nairobi)
-                user_cols = ["username", "email", "role", "win_rate", "starting_balance", "current_balance", "preferred_timeframe", "watchlist_count", "watchlist", "account_size", "risk_pct", "leverage", "telegram_activated", "created_at", "tracking_started_at"]
+                user_cols = ["username", "role", "preferred_timeframe", "win_rate", "watchlist_count", "watchlist", "current_balance", "starting_balance", "account_size", "risk_pct", "leverage", "telegram_activated", "email", "created_at", "tracking_started_at"]
                 all_users = all_users[[c for c in user_cols if c in all_users.columns]]
                 render_benzino_aggrid(all_users, key="admin_user_management", title="User Management", height=420, page_size=10, pinned=["username"], numeric_cols_right=["watchlist_count", "account_size", "risk_pct", "leverage"], badge_cols={"telegram_activated": "status"})
 
@@ -4964,22 +5061,50 @@ def render_settings(username: str, settings: dict) -> None:
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         watchlist_rows = []
+
+        asset_perf: dict = {}
+        if wl_system_df is not None and not wl_system_df.empty:
+            graded = wl_system_df[wl_system_df["grade"].astype(str).isin(VALID_GRADES)].copy()
+            graded["outcome"] = graded.apply(outcome_label, axis=1)
+            for asset_key, grp in graded.groupby("asset"):
+                resolved = grp[grp["outcome"].isin(["WIN", "LOSS"])]
+                wins = (resolved["outcome"] == "WIN").sum()
+                total_res = len(resolved)
+                avg_r = pd.to_numeric(resolved.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean() if total_res else float("nan")
+                open_cnt = (grp["status"].astype(str).str.upper() == "OPEN").sum()
+                best_grade = grp["grade"].value_counts().idxmax() if len(grp) else "—"
+                asset_perf[str(asset_key)] = {
+                    "win_rate": f"{wins / total_res * 100:.1f}%" if total_res else "—",
+                    "total_signals": len(grp),
+                    "resolved": total_res,
+                    "avg_r": f"{avg_r:+.2f}R" if not (avg_r != avg_r) else "—",
+                    "open_trades": open_cnt,
+                    "top_grade": best_grade,
+                }
+
         for key, meta in ASSET_UNIVERSE.items():
+            perf = asset_perf.get(key, {})
             watchlist_rows.append({
                 "Status": "Enabled" if key in current_set else "Disabled",
                 "Asset": key,
-                "Ticker": meta.get("ticker"),
                 "Group": meta.get("group"),
+                "Signals": perf.get("total_signals", 0),
+                "Resolved": perf.get("resolved", 0),
+                "Win Rate": perf.get("win_rate", "—"),
+                "Avg R": perf.get("avg_r", "—"),
+                "Open": perf.get("open_trades", 0),
+                "Top Grade": perf.get("top_grade", "—"),
             })
 
         render_benzino_aggrid(
             pd.DataFrame(watchlist_rows),
             key="watchlist_editor_table",
             title="Available Assets",
-            height=430,
-            page_size=12,
-            pinned=["Asset"],
+            height=480,
+            page_size=15,
+            pinned=["Status", "Asset"],
             badge_cols={"Status": "status"},
+            numeric_cols_right=["Signals", "Resolved", "Open"],
             enable_search=True,
         )
 
