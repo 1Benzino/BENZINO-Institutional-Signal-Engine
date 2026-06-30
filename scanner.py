@@ -1793,6 +1793,19 @@ def build_telegram_message(sig: ScanResult, display_id: str | None = None) -> st
         label = label.split("(", 1)[0].strip()
         return label or "Unavailable"
 
+    def mtf_trend(tf: str) -> str:
+        """Return the stored MTF trend direction for a timeframe, including 4H."""
+        ctx = sig.mtf_context or {}
+        row = ctx.get(tf) or ctx.get(tf.lower()) or ctx.get(tf.upper()) or {}
+        direction = str(row.get("direction", "Unavailable")).strip()
+        if not direction or direction.upper() == "NEUTRAL":
+            return "Neutral"
+        if direction.upper() == "BULLISH":
+            return "Bullish"
+        if direction.upper() == "BEARISH":
+            return "Bearish"
+        return direction.title()
+
     emoji = "🟢" if sig.signal == "BUY" else "🔴" if sig.signal == "SELL" else "⚪"
     grade_emoji = {"A+": "🏆", "A": "⭐", "B": "🔹", "C": "▫️"}.get(sig.grade, "")
 
@@ -1827,6 +1840,7 @@ RR: <code>{fmt_metric(sig.rr)}R</code>
 <b>Market Context:</b>
 1H Trend: {clean(compact_trend(sig.trend_1h))}
 15M Trend: {clean(compact_trend(sig.trend_15m))}
+4H Trend: {clean(mtf_trend("4h"))}
 Regime: {clean(sig.regime)}
 RSI: {fmt_metric(sig.rsi)}
 
