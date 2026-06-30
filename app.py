@@ -4664,8 +4664,7 @@ def render_workflow(username: str, settings: dict) -> None:
 
         starting = 10000.0
         risk_cash = starting * 0.01
-        hard_daily_floor = -starting * 0.05      # FTMO hard rule: -$500
-        soft_daily_floor = -starting * 0.04      # Benzino operating guard: pause at -$400
+        daily_floor = -starting * 0.05          # FTMO hard rule: -$500
         max_loss_floor = starting * 0.90
         phase1_target_cash = starting * 0.10
         phase2_target_cash = starting * 0.05
@@ -4674,7 +4673,7 @@ def render_workflow(username: str, settings: dict) -> None:
         st.caption(
             f"This tab automatically recalculates FTMO-style attempts from your current watchlist and selected timeframe "
             f"({challenge_tf}). It uses only A+/A closed trades, fixed $10,000 account size, 1% risk per trade, "
-            f"a $400 soft daily stop, $500 FTMO max daily loss, $1,000 max loss, and 4 minimum trading days. "
+            f"$500 FTMO max daily loss, $1,000 max loss, and 4 minimum trading days. "
             f"When Phase 2 passes or any phase fails, the attempt is archived and the next challenge starts automatically."
         )
 
@@ -4751,8 +4750,7 @@ def render_workflow(username: str, settings: dict) -> None:
             day_summary["Opening Balance"] = starting + day_summary["Daily P/L"].cumsum().shift(1).fillna(0.0)
             day_summary["Closing Balance"] = starting + day_summary["Daily P/L"].cumsum()
             day_summary["Day Result"] = day_summary["Daily P/L"].apply(lambda x: "WIN" if float(x) > 0 else "LOSS" if float(x) < 0 else "BREAKEVEN")
-            day_summary["Soft Stop Hit"] = day_summary["Daily P/L"].apply(lambda x: "YES" if float(x) <= soft_daily_floor else "NO")
-            day_summary["Daily Breach"] = day_summary["Daily P/L"].apply(lambda x: "YES" if float(x) <= hard_daily_floor else "NO")
+            day_summary["Daily Breach"] = day_summary["Daily P/L"].apply(lambda x: "YES" if float(x) <= daily_floor else "NO")
             day_summary["Target Hit"] = day_summary["Closing Balance"].apply(lambda x: "YES" if float(x) >= starting + phase1_target_cash else "NO")
             running_peak = df["balance_after"].cummax()
             dd = df["balance_after"] - running_peak
@@ -4777,7 +4775,6 @@ def render_workflow(username: str, settings: dict) -> None:
             equity = starting
             counted_rows: list[dict] = []
             day_pnl: dict = {}
-            skipped_after_soft = 0
             status = "ACTIVE"
             pass_date = ""
             breach_date = ""
@@ -4789,10 +4786,6 @@ def render_workflow(username: str, settings: dict) -> None:
                 row = source.iloc[i]
                 day = row["prop_day"]
                 current_day_pnl = float(day_pnl.get(day, 0.0))
-                if current_day_pnl <= soft_daily_floor:
-                    skipped_after_soft += 1
-                    continue
-
                 pnl = float(row.get("pnl_cash", 0.0) or 0.0)
                 equity += pnl
                 day_pnl[day] = current_day_pnl + pnl
@@ -4803,7 +4796,7 @@ def render_workflow(username: str, settings: dict) -> None:
                 counted_rows.append(rec)
 
                 phase_days = len(day_pnl)
-                if day_pnl[day] <= hard_daily_floor:
+                if day_pnl[day] <= daily_floor:
                     status = "FAILED"
                     breach_date = _dt(row["prop_event_time"])
                     breach_reason = "5% max daily loss breached"
@@ -4829,7 +4822,6 @@ def render_workflow(username: str, settings: dict) -> None:
                 "breach_date": breach_date,
                 "breach_reason": breach_reason,
                 "progress": max(0.0, min(1.0, stats["pnl"] / target_cash)) if target_cash else 0.0,
-                "soft_stopped_trades": skipped_after_soft,
             })
             return stats, end_idx, counted_rows
 
@@ -4838,8 +4830,8 @@ def render_workflow(username: str, settings: dict) -> None:
             all_counted_rows: list[dict] = []
             active = {
                 "challenge_no": 1,
-                "phase1": {"phase": "Phase 1 Challenge", "status": "ACTIVE", "started": _dt(activation_raw), "equity": starting, "pnl": 0.0, "trading_days": 0, "closed": 0, "progress": 0.0, "daily": pd.DataFrame(), "curve": pd.DataFrame(), "passed_on": "", "breach_date": "", "breach_reason": "", "max_dd_cash": 0.0, "max_dd_pct": 0.0, "worst_day": 0.0, "best_day": 0.0, "last_closed": "", "soft_stopped_trades": 0},
-                "phase2": {"phase": "Phase 2 Verification", "status": "LOCKED", "started": "After Phase 1 passes", "equity": starting, "pnl": 0.0, "trading_days": 0, "closed": 0, "progress": 0.0, "daily": pd.DataFrame(), "curve": pd.DataFrame(), "passed_on": "", "breach_date": "", "breach_reason": "", "max_dd_cash": 0.0, "max_dd_pct": 0.0, "worst_day": 0.0, "best_day": 0.0, "last_closed": "", "soft_stopped_trades": 0},
+                "phase1": {"phase": "Phase 1 Challenge", "status": "ACTIVE", "started": _dt(activation_raw), "equity": starting, "pnl": 0.0, "trading_days": 0, "closed": 0, "progress": 0.0, "daily": pd.DataFrame(), "curve": pd.DataFrame(), "passed_on": "", "breach_date": "", "breach_reason": "", "max_dd_cash": 0.0, "max_dd_pct": 0.0, "worst_day": 0.0, "best_day": 0.0, "last_closed": ""},
+                "phase2": {"phase": "Phase 2 Verification", "status": "LOCKED", "started": "After Phase 1 passes", "equity": starting, "pnl": 0.0, "trading_days": 0, "closed": 0, "progress": 0.0, "daily": pd.DataFrame(), "curve": pd.DataFrame(), "passed_on": "", "breach_date": "", "breach_reason": "", "max_dd_cash": 0.0, "max_dd_pct": 0.0, "worst_day": 0.0, "best_day": 0.0, "last_closed": ""},
                 "funded_status": "LOCKED",
             }
             idx = 0
@@ -4872,7 +4864,7 @@ def render_workflow(username: str, settings: dict) -> None:
                     continue
 
                 if phase1["status"] == "ACTIVE":
-                    active = {"challenge_no": challenge_no, "phase1": phase1, "phase2": {"phase": "Phase 2 Verification", "status": "LOCKED", "started": "After Phase 1 passes", "equity": starting, "pnl": 0.0, "trading_days": 0, "closed": 0, "progress": 0.0, "daily": pd.DataFrame(), "curve": pd.DataFrame(), "passed_on": "", "breach_date": "", "breach_reason": "", "max_dd_cash": 0.0, "max_dd_pct": 0.0, "worst_day": 0.0, "best_day": 0.0, "last_closed": "", "soft_stopped_trades": 0}, "funded_status": "LOCKED"}
+                    active = {"challenge_no": challenge_no, "phase1": phase1, "phase2": {"phase": "Phase 2 Verification", "status": "LOCKED", "started": "After Phase 1 passes", "equity": starting, "pnl": 0.0, "trading_days": 0, "closed": 0, "progress": 0.0, "daily": pd.DataFrame(), "curve": pd.DataFrame(), "passed_on": "", "breach_date": "", "breach_reason": "", "max_dd_cash": 0.0, "max_dd_pct": 0.0, "worst_day": 0.0, "best_day": 0.0, "last_closed": ""}, "funded_status": "LOCKED"}
                     return {"completed": completed, "active": active, "all_counted_rows": all_counted_rows}
 
                 phase2, idx_after_p2, p2_rows = _run_phase(source, idx_after_p1, "Phase 2 Verification", phase2_target_cash)
@@ -4924,8 +4916,8 @@ def render_workflow(username: str, settings: dict) -> None:
             start_label = _dt(prop_curve_all["prop_event_time"].max()) if not prop_curve_all.empty else _dt(activation_raw)
             active = {
                 "challenge_no": challenge_no,
-                "phase1": {"phase": "Phase 1 Challenge", "status": "ACTIVE", "started": start_label, "equity": starting, "pnl": 0.0, "trading_days": 0, "closed": 0, "progress": 0.0, "daily": pd.DataFrame(), "curve": pd.DataFrame(), "passed_on": "", "breach_date": "", "breach_reason": "", "max_dd_cash": 0.0, "max_dd_pct": 0.0, "worst_day": 0.0, "best_day": 0.0, "last_closed": "", "soft_stopped_trades": 0},
-                "phase2": {"phase": "Phase 2 Verification", "status": "LOCKED", "started": "After Phase 1 passes", "equity": starting, "pnl": 0.0, "trading_days": 0, "closed": 0, "progress": 0.0, "daily": pd.DataFrame(), "curve": pd.DataFrame(), "passed_on": "", "breach_date": "", "breach_reason": "", "max_dd_cash": 0.0, "max_dd_pct": 0.0, "worst_day": 0.0, "best_day": 0.0, "last_closed": "", "soft_stopped_trades": 0},
+                "phase1": {"phase": "Phase 1 Challenge", "status": "ACTIVE", "started": start_label, "equity": starting, "pnl": 0.0, "trading_days": 0, "closed": 0, "progress": 0.0, "daily": pd.DataFrame(), "curve": pd.DataFrame(), "passed_on": "", "breach_date": "", "breach_reason": "", "max_dd_cash": 0.0, "max_dd_pct": 0.0, "worst_day": 0.0, "best_day": 0.0, "last_closed": ""},
+                "phase2": {"phase": "Phase 2 Verification", "status": "LOCKED", "started": "After Phase 1 passes", "equity": starting, "pnl": 0.0, "trading_days": 0, "closed": 0, "progress": 0.0, "daily": pd.DataFrame(), "curve": pd.DataFrame(), "passed_on": "", "breach_date": "", "breach_reason": "", "max_dd_cash": 0.0, "max_dd_pct": 0.0, "worst_day": 0.0, "best_day": 0.0, "last_closed": ""},
                 "funded_status": "LOCKED",
             }
             return {"completed": completed, "active": active, "all_counted_rows": all_counted_rows}
@@ -4957,13 +4949,12 @@ def render_workflow(username: str, settings: dict) -> None:
         day_summary = active_phase.get("daily", pd.DataFrame())
         prop_curve = active_phase.get("curve", pd.DataFrame())
         pass_probability = 0.0 if status == "FAILED" else 100.0 if status == "PASSED" else max(0.0, min(100.0, progress_to_target * 100))
-        breach_probability = 100.0 if status == "FAILED" else max(0.0, min(100.0, abs(worst_day_pnl / hard_daily_floor * 100))) if hard_daily_floor else 0.0
-        soft_stopped_trades = int(active_phase.get("soft_stopped_trades", 0) or 0)
+        breach_probability = 100.0 if status == "FAILED" else max(0.0, min(100.0, abs(worst_day_pnl / daily_floor * 100))) if daily_floor else 0.0
 
         c1, c2, c3, c4, c5 = st.columns(5)
         with c1: metric_card("Challenge equity", _money(current), "Start $10,000")
         with c2: metric_card("ROI to target", f"{roi_pct:+.2f}%", "Target +10.00%" if active_phase.get("phase") == "Phase 1 Challenge" else "Target +5.00%")
-        with c3: metric_card("Worst day P/L", _money(worst_day_pnl), "Soft stop -$400 · hard floor -$500")
+        with c3: metric_card("Worst day P/L", _money(worst_day_pnl), "Daily floor -$500")
         with c4: metric_card("Trading days", f"{trading_days:,}", "Minimum 4 required")
         with c5: metric_card("Challenge status", status, f"Challenge #{active_challenge.get('challenge_no', 1)}")
 
@@ -4974,10 +4965,9 @@ def render_workflow(username: str, settings: dict) -> None:
         with c9: metric_card("Closed / open", f"{closed_count:,} / {open_count:,}", "A+/A trades only")
         with c10: metric_card("Max drawdown", _money(max_drawdown_cash), f"{max_drawdown_pct:.2f}% from peak")
 
-        c11, c12, c13 = st.columns(3)
+        c11, c12 = st.columns(2)
         with c11: metric_card("Pass progress", f"{pass_probability:.2f}%", "Current active phase")
         with c12: metric_card("Daily risk used", f"{breach_probability:.2f}%", "Based on worst active day")
-        with c13: metric_card("Soft-stop skips", f"{soft_stopped_trades:,}", "Trades skipped after -$400 day")
 
         st.markdown(
             f"<div class='status-bar'><b>{html.escape(status)}</b> · Active phase: {html.escape(active_phase.get('phase', 'Phase 1 Challenge'))} · "
@@ -4989,10 +4979,8 @@ def render_workflow(username: str, settings: dict) -> None:
             st.error(f"This active challenge failed: {fail_reason or 'loss rule breached'}{(' on ' + breach_date) if breach_date else ''}. A new challenge will begin automatically from the next eligible A+/A trade.")
         elif status == "PASSED":
             st.success("This phase has reached its target with the minimum trading days satisfied. The next phase/challenge starts automatically from the next eligible trade.")
-        elif soft_stopped_trades:
-            st.warning(f"The $400 soft daily stop protected this challenge by skipping {soft_stopped_trades:,} later same-day trade(s).")
         else:
-            st.info("Challenge is active. New A+/A trades are evaluated automatically under the $400 soft daily stop and FTMO hard limits.")
+            st.info("Challenge is active. New A+/A trades are evaluated automatically under FTMO hard limits.")
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         st.subheader("FTMO rule coverage")
@@ -5003,7 +4991,6 @@ def render_workflow(username: str, settings: dict) -> None:
 
         rule_table = pd.DataFrame([
             {"Rule": "Profit Target", "Phase 1": "$1,000", "Phase 2": "$500", "Funded Account": "Unlimited"},
-            {"Rule": "Soft Daily Stop", "Phase 1": "$400", "Phase 2": "$400", "Funded Account": "$400 operating guard"},
             {"Rule": "Max Daily Loss", "Phase 1": "$500", "Phase 2": "$500", "Funded Account": "$500"},
             {"Rule": "Max Loss", "Phase 1": "$1,000", "Phase 2": "$1,000", "Funded Account": "$1,000"},
             {"Rule": "Min Trading Days", "Phase 1": "4 days", "Phase 2": "4 days", "Funded Account": "Unlimited"},
@@ -5032,7 +5019,6 @@ def render_workflow(username: str, settings: dict) -> None:
                 "Closed Trades": ph.get("closed", 0),
                 "Best Day": _money(ph.get("best_day", 0.0)),
                 "Worst Day": _money(ph.get("worst_day", 0.0)),
-                "Soft Skips": ph.get("soft_stopped_trades", 0),
                 "Max Drawdown": _money(ph.get("max_dd_cash", 0.0)),
                 "Max DD %": _pct(ph.get("max_dd_pct", 0.0)),
             })
@@ -5051,11 +5037,10 @@ def render_workflow(username: str, settings: dict) -> None:
             "Closed Trades": 0,
             "Best Day": _money(0.0),
             "Worst Day": _money(0.0),
-            "Soft Skips": 0,
             "Max Drawdown": _money(0.0),
             "Max DD %": _pct(0.0),
         })
-        render_benzino_aggrid(pd.DataFrame(phase_rows), key="ftmo_phase_analytics", height=280, page_size=10, pinned=["Phase", "Status"], badge_cols={"Status": "status"}, numeric_cols_right=["Trading Days", "Closed Trades", "Soft Skips"], enable_search=False, show_status_filter=False)
+        render_benzino_aggrid(pd.DataFrame(phase_rows), key="ftmo_phase_analytics", height=280, page_size=10, pinned=["Phase", "Status"], badge_cols={"Status": "status"}, numeric_cols_right=["Trading Days", "Closed Trades"], enable_search=False, show_status_filter=False)
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         if not prop_curve.empty:
@@ -5077,7 +5062,7 @@ def render_workflow(username: str, settings: dict) -> None:
                     daily_view[_money_col] = pd.to_numeric(daily_view[_money_col], errors="coerce").map(lambda x: f"{x:,.2f}" if pd.notna(x) else "")
             if "Trades" in daily_view.columns:
                 daily_view["Trades"] = pd.to_numeric(daily_view["Trades"], errors="coerce").map(lambda x: f"{int(x):,}" if pd.notna(x) else "")
-            render_benzino_aggrid(daily_view, key="challenge_daily_loss_check", height=320, page_size=10, pinned=["Day"], badge_cols={"Daily Breach":"status", "Soft Stop Hit":"status", "Target Hit":"status", "Day Result":"outcome"}, numeric_cols_right=["Opening Balance", "Daily P/L", "Closing Balance", "Trades"], enable_search=False, show_status_filter=False)
+            render_benzino_aggrid(daily_view, key="challenge_daily_loss_check", height=320, page_size=10, pinned=["Day"], badge_cols={"Daily Breach":"status", "Target Hit":"status", "Day Result":"outcome"}, numeric_cols_right=["Opening Balance", "Daily P/L", "Closing Balance", "Trades"], enable_search=False, show_status_filter=False)
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         st.subheader("Challenge history")
