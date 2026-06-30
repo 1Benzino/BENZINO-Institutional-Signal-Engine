@@ -2187,24 +2187,54 @@ def benzino_aggrid_css() -> dict:
 
 
 
-def format_market_price(value):
+def price_decimals_for_asset(asset: str | None, value=None) -> int:
+    """TradingView-style display precision for Entry, SL and TP.
+
+    The database keeps raw precision, but the app should display the same
+    practical quote precision a trader sees on TradingView/broker charts.
     """
-    Display market prices with the precision the instrument needs.
-    Keeps up to 6 decimals for FX / low-price assets and removes unnecessary
-    trailing zeroes without forcing every asset to 2dp.
-    """
+    a = str(asset or "").strip().upper().replace("/", "").replace("-", "")
+
+    # Crypto, commodities, indices and equities normally trade visually at 2dp.
+    if a in {"BTCUSD", "ETHUSD", "OIL", "BRENT", "NATGAS", "COPPER", "XAUUSD", "XAGUSD", "SP500", "NAS100", "DOW30", "NVDA", "MU"}:
+        return 2
+
+    # JPY FX pairs use pipette-style 3dp on TradingView/broker displays.
+    if a.endswith("JPY") or "JPY" in a:
+        return 3
+
+    # Most non-JPY FX pairs use 5dp.
+    known_fx = {
+        "EURUSD", "GBPUSD", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD",
+        "EURGBP", "EURAUD", "EURNZD", "EURCAD", "EURCHF",
+        "GBPAUD", "GBPNZD", "GBPCAD", "GBPCHF",
+        "AUDCAD", "AUDNZD", "AUDCHF", "NZDCAD", "NZDCHF",
+    }
+    if a in known_fx:
+        return 5
+
+    # Fallback from price scale when an asset label is unavailable.
+    try:
+        x = abs(float(str(value).replace(",", "")))
+        if x >= 10:
+            return 2
+        if x >= 1:
+            return 5
+        return 5
+    except Exception:
+        return 2
+
+
+def format_market_price(value, asset: str | None = None):
+    """Format Entry, SL and TP using asset-specific TradingView precision."""
     try:
         if value is None or pd.isna(value):
             return ""
         x = float(str(value).replace(",", ""))
         if not np.isfinite(x):
             return ""
-        s = f"{x:.6f}".rstrip("0").rstrip(".")
-        if "." in s:
-            whole, frac = s.split(".", 1)
-            if len(frac) == 1:
-                s += "0"
-        return s
+        decimals = price_decimals_for_asset(asset, x)
+        return f"{x:,.{decimals}f}"
     except Exception:
         return "" if value is None else str(value)
 
@@ -2316,9 +2346,13 @@ def render_benzino_aggrid(
     # Decimal policy:
     # Only Entry, SL and TP keep market-price precision. Every other numeric
     # decimal is rounded to 2dp so tables do not show noisy precision.
+    asset_col_for_precision = next((c for c in ["Asset", "asset", "Instrument", "symbol", "Symbol"] if c in view.columns), None)
     for _col in view.columns:
         if is_price_display_column(_col):
-            view[_col] = view[_col].apply(format_market_price)
+            if asset_col_for_precision:
+                view[_col] = view.apply(lambda r, c=_col: format_market_price(r.get(c), r.get(asset_col_for_precision)), axis=1)
+            else:
+                view[_col] = view[_col].apply(format_market_price)
         elif pd.api.types.is_numeric_dtype(view[_col]):
             def _fmt_numeric(x, _col=_col):
                 if pd.isna(x):
@@ -3711,12 +3745,12 @@ def render_opportunity_board(username: str, settings: dict) -> None:
                 ).any(axis=1)
                 display_df = display_df[mask].copy()
 
-            def _fmt_entry_sl_tp(x):
+            def _fmt_entry_sl_tp(x, asset=None):
                 if pd.isna(x) or str(x).strip() == "":
                     return "—"
                 n = pd.to_numeric(x, errors="coerce")
                 if pd.notna(n):
-                    return format_market_price(float(n))
+                    return format_market_price(float(n), asset)
                 return str(x)
 
             def _fmt_pct(x):
@@ -3738,7 +3772,10 @@ def render_opportunity_board(username: str, settings: dict) -> None:
 
             for money_col in ["Entry", "SL", "TP"]:
                 if money_col in display_df.columns:
-                    display_df[money_col] = display_df[money_col].apply(_fmt_entry_sl_tp)
+                    if "Asset" in display_df.columns:
+                        display_df[money_col] = display_df.apply(lambda r, c=money_col: _fmt_entry_sl_tp(r.get(c), r.get("Asset")), axis=1)
+                    else:
+                        display_df[money_col] = display_df[money_col].apply(_fmt_entry_sl_tp)
             for pct_col in ["Confidence", "Decayed Confidence"]:
                 if pct_col in display_df.columns:
                     display_df[pct_col] = display_df[pct_col].apply(_fmt_pct)

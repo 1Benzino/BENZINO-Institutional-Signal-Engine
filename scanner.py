@@ -1785,11 +1785,34 @@ def build_telegram_message(sig: ScanResult, display_id: str | None = None) -> st
     def clean(v):
         return html.escape(str(v if v is not None else ""))
 
+    def price_decimals_for_asset(asset: str) -> int:
+        """TradingView-style display precision for Entry, Stop Loss, and Take Profit."""
+        asset = str(asset or "").upper().strip()
+
+        if asset.endswith("JPY"):
+            return 3
+
+        if asset in {
+            "BTCUSD", "ETHUSD",
+            "XAUUSD", "XAGUSD",
+            "OIL", "BRENT", "NATGAS", "COPPER",
+            "SP500", "NAS100", "DOW30",
+            "NVDA", "MU",
+        }:
+            return 2
+
+        # Non-JPY FX pairs normally display 5 decimals on TradingView/broker charts.
+        if len(asset) == 6 and asset.isalpha():
+            return 5
+
+        return 2
+
     def fmt_price(x):
-        """Entry, Stop Loss, and Take Profit keep extra precision when the value has it."""
+        """Format Entry, Stop Loss, and Take Profit using TradingView-style asset precision."""
         try:
             x = float(x)
-            return f"{x:,.8f}".rstrip("0").rstrip(".")
+            decimals = price_decimals_for_asset(sig.asset)
+            return f"{x:,.{decimals}f}"
         except Exception:
             return str(x)
 
