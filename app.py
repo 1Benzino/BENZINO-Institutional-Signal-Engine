@@ -4734,13 +4734,15 @@ def render_workflow(username: str, settings: dict) -> None:
         day_summary = pd.DataFrame()
         prop_curve = pd.DataFrame()
 
+        # The challenge start is the user activation/restart timestamp, not the
+        # first trade found in the filtered data. This lets each user restart
+        # a failed challenge without deleting old scanner history.
+        try:
+            challenge_started_at = fmt_nairobi(prop_started_at_raw) if prop_started_at_raw else ""
+        except Exception:
+            challenge_started_at = ""
+
         if not prop_source.empty:
-            try:
-                src_created = pd.to_datetime(prop_source.get("created_at", pd.Series(pd.NaT, index=prop_source.index)), errors="coerce", utc=True).dropna()
-                if not src_created.empty:
-                    challenge_started_at = fmt_nairobi(src_created.min())
-            except Exception:
-                challenge_started_at = ""
             try:
                 open_count = int(prop_source.get("status", pd.Series("", index=prop_source.index)).astype(str).str.upper().eq("OPEN").sum())
             except Exception:
@@ -4821,7 +4823,7 @@ def render_workflow(username: str, settings: dict) -> None:
         # Phase 1: 10% target, 5% max daily loss, 10% max total loss, 4 min trading days.
         # Phase 2: 5% target, same loss rules, 4 min trading days.
         # Funded: no profit target, same loss rules, refund/profit-split metadata only.
-        def _evaluate_ftmo_phase(curve: pd.DataFrame, start_pos: int, target_profit: float, phase_name: str) -> dict:
+        def _evaluate_ftmo_phase(curve: pd.DataFrame, start_pos: int, target_profit: float, phase_name: str, start_label: str = "") -> dict:
             result = {
                 "phase": phase_name,
                 "status": "LOCKED" if start_pos is None else "ACTIVE",
@@ -4849,7 +4851,7 @@ def render_workflow(username: str, settings: dict) -> None:
             phase_curve = curve.iloc[int(start_pos):].copy().reset_index(drop=True)
             if phase_curve.empty:
                 return result
-            result["start_date"] = fmt_nairobi(phase_curve["prop_event_time"].iloc[0]) if "prop_event_time" in phase_curve.columns else ""
+            result["start_date"] = start_label or (fmt_nairobi(phase_curve["prop_event_time"].iloc[0]) if "prop_event_time" in phase_curve.columns else "")
             phase_curve["phase_balance_after"] = starting + pd.to_numeric(phase_curve["pnl_cash"], errors="coerce").fillna(0.0).cumsum()
             phase_curve["phase_day"] = phase_curve["prop_event_time"].dt.tz_convert(NAIROBI_TZ).dt.date
             phase_day = phase_curve.groupby("phase_day").agg(
@@ -4884,22 +4886,27 @@ def render_workflow(username: str, settings: dict) -> None:
                 day = drow["Day"]
                 day_rows = phase_curve[phase_curve["phase_day"].eq(day)]
                 day_last_local_pos = int(day_rows.index.max()) if not day_rows.empty else 0
+                event_label = ""
+                try:
+                    event_label = fmt_nairobi(phase_curve.loc[day_last_local_pos, "prop_event_time"])
+                except Exception:
+                    event_label = str(day)
                 if float(drow["Closing Balance"]) <= max_loss_floor:
                     status_local = "FAILED"
                     result["breach_reason"] = "10% max total loss breached"
-                    result["breach_date"] = str(day)
+                    result["breach_date"] = event_label
                     pass_pos = day_last_local_pos
                     break
                 if float(drow["Daily P/L"]) <= daily_floor:
                     status_local = "FAILED"
                     result["breach_reason"] = "5% max daily loss breached"
-                    result["breach_date"] = str(day)
+                    result["breach_date"] = event_label
                     pass_pos = day_last_local_pos
                     break
                 days_so_far = int(phase_day[phase_day["Day"] <= day]["Day"].nunique())
                 if float(drow["Closing Balance"]) >= starting + target_profit and days_so_far >= 4:
                     status_local = "PASSED"
-                    pass_day = str(day)
+                    pass_day = event_label
                     pass_pos = day_last_local_pos
                     break
             result["status"] = status_local
@@ -4908,10 +4915,10 @@ def render_workflow(username: str, settings: dict) -> None:
                 result["end_pos"] = int(start_pos) + int(pass_pos)
             return result
 
-        phase1 = _evaluate_ftmo_phase(prop_curve, 0 if not prop_curve.empty else None, starting * 0.10, "Phase 1 Challenge")
+        phase1 = _evaluate_ftmo_phase(prop_curve, 0 if not prop_curve.empty else None, starting * 0.10, "Phase 1 Challenge", challenge_started_at)
         if phase1.get("status") == "PASSED" and phase1.get("end_pos") is not None:
             phase2_start = int(phase1["end_pos"]) + 1
-            phase2 = _evaluate_ftmo_phase(prop_curve, phase2_start if phase2_start < len(prop_curve) else None, starting * 0.05, "Phase 2 Verification")
+            phase2 = _evaluate_ftmo_phase(prop_curve, phase2_start if phase2_start < len(prop_curve) else None, starting * 0.05, "Phase 2 Verification", phase1.get("pass_date", ""))
             if phase2.get("status") == "LOCKED":
                 phase2["status"] = "ACTIVE"
                 phase2["start_date"] = "Waiting for next eligible trade"
@@ -4930,7 +4937,7 @@ def render_workflow(username: str, settings: dict) -> None:
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         i1, i2, i3, i4, i5 = st.columns(5)
-        with i1: metric_card("Challenge started", challenge_started_at or "—", "First eligible A+/A setup")
+        with i1: metric_card("Challenge started", challenge_started_at or "—", "User activation / last restart")
         with i2: metric_card("Passed on", pass_date or "—", "When target + min days were met")
         with i3: metric_card("Last closed", last_closed_at or "—", "Most recent resolved A+/A trade")
         with i4: metric_card("Closed / Open", f"{closed_count} / {open_count}", "A+/A trades only")
@@ -4990,6 +4997,19 @@ def render_workflow(username: str, settings: dict) -> None:
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         st.subheader("Phase analytics")
         st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+
+        def _money(v) -> str:
+            try:
+                return f"${float(v):,.2f}"
+            except Exception:
+                return "$0.00"
+
+        def _pct(v) -> str:
+            try:
+                return f"{float(v):,.2f}%"
+            except Exception:
+                return "0.00%"
+
         phase_rows = []
         for ph in [phase1, phase2]:
             phase_rows.append({
@@ -4999,16 +5019,16 @@ def render_workflow(username: str, settings: dict) -> None:
                 "Passed On": ph.get("pass_date", ""),
                 "Breach Date": ph.get("breach_date", ""),
                 "Breach Reason": ph.get("breach_reason", ""),
-                "Equity": ph.get("equity", starting),
-                "P/L": ph.get("pnl", 0.0),
-                "ROI %": ph.get("roi_pct", 0.0),
-                "Progress %": ph.get("progress", 0.0) * 100,
+                "Equity": _money(ph.get("equity", starting)),
+                "P/L": _money(ph.get("pnl", 0.0)),
+                "ROI %": _pct(ph.get("roi_pct", 0.0)),
+                "Progress %": _pct(float(ph.get("progress", 0.0) or 0.0) * 100),
                 "Trading Days": ph.get("trading_days", 0),
                 "Closed Trades": ph.get("closed_trades", 0),
-                "Best Day": ph.get("best_day", 0.0),
-                "Worst Day": ph.get("worst_day", 0.0),
-                "Max Drawdown": ph.get("max_drawdown_cash", 0.0),
-                "Max DD %": ph.get("max_drawdown_pct", 0.0),
+                "Best Day": _money(ph.get("best_day", 0.0)),
+                "Worst Day": _money(ph.get("worst_day", 0.0)),
+                "Max Drawdown": _money(ph.get("max_drawdown_cash", 0.0)),
+                "Max DD %": _pct(ph.get("max_drawdown_pct", 0.0)),
             })
         phase_rows.append({
             "Phase": "Funded Account",
@@ -5017,16 +5037,16 @@ def render_workflow(username: str, settings: dict) -> None:
             "Passed On": "—",
             "Breach Date": "",
             "Breach Reason": funded_note,
-            "Equity": phase2.get("equity", starting) if funded_status == "ACTIVE" else starting,
-            "P/L": 0.0,
-            "ROI %": 0.0,
-            "Progress %": 0.0,
+            "Equity": _money(phase2.get("equity", starting) if funded_status == "ACTIVE" else starting),
+            "P/L": _money(0.0),
+            "ROI %": _pct(0.0),
+            "Progress %": _pct(0.0),
             "Trading Days": 0,
             "Closed Trades": 0,
-            "Best Day": 0.0,
-            "Worst Day": 0.0,
-            "Max Drawdown": 0.0,
-            "Max DD %": 0.0,
+            "Best Day": _money(0.0),
+            "Worst Day": _money(0.0),
+            "Max Drawdown": _money(0.0),
+            "Max DD %": _pct(0.0),
         })
         phase_view = pd.DataFrame(phase_rows)
         render_benzino_aggrid(
@@ -5036,7 +5056,7 @@ def render_workflow(username: str, settings: dict) -> None:
             page_size=10,
             pinned=["Phase", "Status"],
             badge_cols={"Status": "status"},
-            numeric_cols_right=["Equity", "P/L", "ROI %", "Progress %", "Trading Days", "Closed Trades", "Best Day", "Worst Day", "Max Drawdown", "Max DD %"],
+            numeric_cols_right=["Trading Days", "Closed Trades"],
             enable_search=False,
             show_status_filter=False,
         )
