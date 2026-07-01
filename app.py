@@ -1668,11 +1668,16 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
                 "Phase Target": ("phase_target", "first"),
             }
         ).reset_index().rename(columns={"challenge_number": "Challenge", "challenge_phase": "Phase", "prop_day": "Day"})
+        all_daily["_challenge_order"] = pd.to_numeric(all_daily["Challenge"], errors="coerce").fillna(0).astype(int)
+        all_daily["_phase_order"] = all_daily["Phase"].astype(str).str.extract(r"(\d+)")[0].fillna("0").astype(int)
         all_daily["Challenge"] = all_daily["Challenge"].apply(lambda x: f"#{int(x)}" if pd.notna(x) else "—")
         all_daily["Day Result"] = all_daily["Daily P/L"].apply(lambda x: "WIN" if float(x) > 0 else "LOSS" if float(x) < 0 else "BREAKEVEN")
         all_daily["Daily Breach"] = all_daily.apply(lambda r: "YES" if float(r["Intraday Low"]) < float(r["Daily Loss Floor"]) else "NO", axis=1)
         all_daily["Target Hit"] = all_daily.apply(lambda r: "YES" if float(r["Closing Balance"]) >= float(r["Phase Target"]) else "NO", axis=1)
-        all_daily = all_daily.sort_values(["Challenge", "Day", "Phase"], ascending=[False, False, True])
+        # Latest challenge first, latest day first, then latest phase first.
+        # This keeps Phase 2 above Phase 1 inside the same challenge/day because
+        # Phase 2 can only happen after Phase 1 in the replay sequence.
+        all_daily = all_daily.sort_values(["_challenge_order", "Day", "_phase_order"], ascending=[False, False, False]).drop(columns=["_challenge_order", "_phase_order"])
     return {"history": histories, "active": active, "active_curve": active_curve, "active_daily": active_daily, "all_daily": all_daily, "all_trades": all_trades}
 
 def prop_firm_monte_carlo(trades_df: pd.DataFrame, state: dict, runs: int = 2000) -> dict:
@@ -2164,7 +2169,7 @@ def render_balance_curve(df: pd.DataFrame, settings: dict, title: str = "Balance
         if chart_df.empty:
             return
         fig = px.line(chart_df, x="created_at", y="grade_balance_after", color="Grade Group", title=title)
-        fig.update_layout(yaxis_title="Balance after", xaxis_title="created_at")
+        fig.update_layout(yaxis_title="Balance after", xaxis_title="created_at", height=380, margin=dict(l=20, r=20, t=20, b=35))
     else:
         fig = px.line(closed, x="created_at", y="balance_after", color="timeframe" if "timeframe" in closed.columns else None, title=title)
 
@@ -4111,7 +4116,7 @@ def render_opportunity_board(username: str, settings: dict) -> None:
     # ---- Equity curve + Signals by grade donut: equal-height bordered cards ----
     left, right = st.columns([1.55, 1])
     with left:
-        with st.container(border=True, height=440):
+        with st.container(border=True):
             st.markdown("<div class='benzino-panel-title'>Balance Curve by Grade</div>", unsafe_allow_html=True)
             render_balance_curve(df, settings, title="", split_by_grade=True, include_overall=True)
 
