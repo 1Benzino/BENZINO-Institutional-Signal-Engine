@@ -362,6 +362,17 @@ def init_tables() -> None:
         finished_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS explain_ai_lessons (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        signal_id TEXT REFERENCES scanner_signals(signal_id),
+        scan_owner TEXT,
+        lesson_type TEXT,
+        lesson_text TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_explain_ai_lessons_signal_type
+        ON explain_ai_lessons(signal_id, lesson_type, updated_at DESC);
     """
     conn = db_connect()
     try:
@@ -2028,45 +2039,157 @@ def rich_open_trade_explanation(row: pd.Series) -> str:
     )
 
 
+
 def rich_closed_trade_explanation(row: pd.Series) -> str:
-    asset = str(row.get("asset", ""))
+    """Build a proper closed-trade lesson, not a bullet summary.
+
+    This stays deterministic for now: it explains and stores the lesson, but it
+    does not fine-tune scanner weights. The adaptive layer will come later.
+    """
+    asset = str(row.get("asset", "")).upper()
     tf = str(row.get("timeframe", ""))
-    signal = str(row.get("signal", ""))
+    signal = str(row.get("signal", "")).upper()
     grade = str(row.get("grade", ""))
     outcome = outcome_label(row)
     r_mult = float(pd.to_numeric(row.get("r_multiple"), errors="coerce") or 0)
-    exit_reason = str(row.get("exit_reason", ""))
-    reason = str(row.get("reason", ""))
+    exit_reason = str(row.get("exit_reason", "") or "recorded close")
+    reason = str(row.get("reason", "") or "No original reason was stored.")
+    regime = str(row.get("regime", "") or "unknown regime")
+    rsi = float(pd.to_numeric(row.get("rsi"), errors="coerce") or 0)
+    rr = float(pd.to_numeric(row.get("rr"), errors="coerce") or 0)
+    ml_prob = float(pd.to_numeric(row.get("ml_prob"), errors="coerce") or 0)
+    mtf_score = float(pd.to_numeric(row.get("mtf_score"), errors="coerce") or 0)
+    votes = parse_jsonish(row.get("strategy_votes"))
+    mtf = parse_jsonish(row.get("mtf_context"))
     trade_note = str(row.get("trade_notes") or "").strip()
 
+    vote_text = format_votes(votes)
+    mtf_bits = []
+    if isinstance(mtf, dict):
+        for k, v in mtf.items():
+            if isinstance(v, dict):
+                mtf_bits.append(f"{k}: {v.get('direction', 'NEUTRAL')} ({float(v.get('strength') or 0):.2f})")
+    mtf_text = "; ".join(mtf_bits) if mtf_bits else "No detailed multi-timeframe breakdown was stored for this trade."
+
+    stretched = rsi >= 75 if signal == "BUY" else rsi <= 25
+    exhaustion_sentence = ""
+    if stretched:
+        exhaustion_sentence = (
+            f" One warning sign was the RSI reading of {rsi:.1f}. For a {signal} setup this suggests the move may already have been extended, "
+            "so confirmation needed to be balanced against the risk of entering late in the impulse."
+        )
+    elif rsi:
+        exhaustion_sentence = f" The RSI reading of {rsi:.1f} did not, by itself, show an extreme exhaustion condition."
+
     if outcome == "WIN":
-        lesson = "The market rewarded the confluence. Coach should look for whether the winning pattern came from timeframe alignment, grade quality, session timing, or asset behaviour, then prioritise repeating that condition."
+        outcome_lesson = (
+            f"The result confirms that the original confluence translated into follow-through. A {r_mult:+.2f}R close means the trade did more than look good at entry; "
+            "it also survived live market movement and reached the intended reward side of the plan. The lesson is not simply that this asset won. "
+            "The more useful lesson is to identify the conditions that made the win repeatable: the grade quality, the timeframe agreement, the market regime, "
+            "and the strategy votes that were present before entry."
+        )
+        playbook = (
+            "For the playbook, this trade should strengthen confidence in similar setups only when the same ingredients are present again. "
+            "A future trade should not be upgraded just because the asset name matches; it should be upgraded only if the structure, regime, confirmation, and risk-reward profile resemble this winning case."
+        )
     elif outcome == "LOSS":
-        lesson = "The setup failed after entry. This should be reviewed for timing risk, volatility expansion, weak MTF confirmation, or a strategy vote that was not strong enough. Losses are not ignored; they become filters for the next version of the playbook."
+        outcome_lesson = (
+            f"The trade closed as a loss at {r_mult:+.2f}R, so the key lesson is about the difference between a valid setup and a well-timed setup. "
+            "The entry may have satisfied the engine's confluence rules, but the market did not give enough continuation before invalidating the idea. "
+            "That makes this a timing and filtering lesson rather than a reason to discard the entire strategy."
+        )
+        playbook = (
+            "For the playbook, one loss should not rewrite the strategy. However, if future losses cluster around the same conditions — the same asset, timeframe, regime, extreme RSI area, weak volatility expansion, or similar strategy-vote mix — "
+            "then this pattern should become a filter when the adaptive learning layer is built. Until then, this lesson should be treated as evidence to review, not an automatic rule change."
+        )
     else:
-        lesson = "The trade closed without a clean TP/SL lesson. Treat it as a timing and expiry-management review rather than a pure win/loss signal."
+        outcome_lesson = (
+            f"This trade did not produce a clean win-or-loss lesson because it closed through {exit_reason}. The most useful review is therefore about opportunity cost and timing. "
+            "When a setup cannot reach either side of the plan within its expected life, the engine should ask whether the signal had enough volatility, urgency, and follow-through potential at entry."
+        )
+        playbook = (
+            "For the playbook, expiry-style outcomes should be used to study slow trades. A setup that repeatedly stalls may still be directionally reasonable, but it may need a better entry trigger, a different timeframe, or a stricter volatility requirement."
+        )
 
     note_section = ""
     if trade_note:
         note_section = (
-            f"\n\n**Trader's note:** {trade_note}  \n"
-            f"**Explain AI context:** The trader flagged an external factor on this trade. "
-            f"This is important context: if the note describes a news spike, data release, "
-            f"or other exogenous event that drove the stop loss, the system's strategy should not be "
-            f"adjusted based on this outcome alone — the signal logic was correct, but the market "
-            f"environment was exceptional. Instead, the lesson here is around timing: understanding "
-            f"key economic calendar events before entry, and considering tighter initial risk on "
-            f"high-impact news days for this asset and session. One event-driven loss, properly "
-            f"noted and understood, is more valuable to the playbook than ten unexplained ones."
+            f"\n\n**Trader context**\n\nYou added the following note: _{trade_note}_. Explain AI should treat this as important context rather than noise. "
+            "If the note points to a news spike, abnormal liquidity event, manual override, or broker-specific price move, then the lesson should not be blamed entirely on the strategy logic. "
+            "Those events belong in the execution and risk-management review, especially around whether the trade should have been avoided during high-impact conditions."
         )
 
     return (
-        f"**{asset} · {tf} · {signal} · Grade {grade}**  \n\n"
-        f"This trade closed as **{outcome}** via **{exit_reason or 'recorded close'}** with **{r_mult:+.2f}R**. "
-        f"The original reason was: {reason}\n\n"
-        f"**What Explain AI learns:** {lesson}"
+        f"**{asset} · {tf} · {signal} · Grade {grade}**\n\n"
+        f"This trade closed via **{exit_reason}** with a final result of **{r_mult:+.2f}R**. At entry, the engine accepted the setup because: {reason} "
+        f"The planned reward-to-risk was **{rr:.2f}R**, the stored market regime was **{regime}**, multi-timeframe alignment was **{mtf_score:.0f}%**, and ML probability was **{ml_prob:.2f}**."
+        f"{exhaustion_sentence}\n\n"
+        f"**Why the trade made sense at the time**\n\n"
+        f"The setup was not random. It came from the engine finding enough evidence to justify a {grade} grade: {vote_text}. "
+        f"The multi-timeframe picture was: {mtf_text}. That means the lesson should begin from the quality of the decision at entry, not only from the final result.\n\n"
+        f"**Why the trade closed the way it did**\n\n"
+        f"{outcome_lesson}\n\n"
+        f"**What the playbook should learn**\n\n"
+        f"{playbook}\n\n"
+        f"**What would improve the next version of this setup**\n\n"
+        f"A stronger future version would need cleaner confirmation at the moment of entry: less evidence of exhaustion, clearer volatility expansion, stronger higher-timeframe support, or a pullback that improves risk placement before the trade is triggered. "
+        f"This is exactly the kind of closed-outcome evidence that will later feed the adaptive learning layer, but for now it is stored as an Explain AI lesson rather than used to change scanner behaviour automatically."
         f"{note_section}"
     )
+
+
+def save_explain_ai_lesson(signal_id: str, scan_owner: str, lesson_text: str, lesson_type: str = "CLOSED_TRADE") -> None:
+    signal_id = str(signal_id or "").strip()
+    scan_owner = str(scan_owner or "").strip()
+    lesson_text = str(lesson_text or "").strip()
+    if not signal_id or not lesson_text:
+        return
+    existing = read_df(
+        """
+        SELECT id
+        FROM explain_ai_lessons
+        WHERE signal_id = %s AND lesson_type = %s
+        ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+        LIMIT 1
+        """,
+        (signal_id, lesson_type),
+    )
+    if existing.empty:
+        execute(
+            """
+            INSERT INTO explain_ai_lessons(signal_id, scan_owner, lesson_type, lesson_text, created_at, updated_at)
+            VALUES (%s,%s,%s,%s,NOW(),NOW())
+            """,
+            (signal_id, scan_owner, lesson_type, lesson_text),
+        )
+    else:
+        execute(
+            """
+            UPDATE explain_ai_lessons
+            SET scan_owner = %s, lesson_text = %s, updated_at = NOW()
+            WHERE id = %s
+            """,
+            (scan_owner, lesson_text, str(existing.iloc[0]["id"])),
+        )
+
+
+def load_explain_ai_lesson(signal_id: str, lesson_type: str = "CLOSED_TRADE") -> str:
+    signal_id = str(signal_id or "").strip()
+    if not signal_id:
+        return ""
+    df = read_df(
+        """
+        SELECT lesson_text
+        FROM explain_ai_lessons
+        WHERE signal_id = %s AND lesson_type = %s
+        ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+        LIMIT 1
+        """,
+        (signal_id, lesson_type),
+    )
+    if df.empty:
+        return ""
+    return str(df.iloc[0].get("lesson_text") or "")
 
 
 def render_ai_card(title: str, body: str) -> None:
@@ -5335,76 +5458,94 @@ def render_workflow(username: str, settings: dict) -> None:
 
     with t5:
         st.subheader("Coach AI")
-        st.caption("Coach AI reviews your journal patterns and translates trade history into practical behaviour, risk, and execution guidance.")
+        st.caption("Coach AI reviews your journal patterns and turns trade history into practical behaviour, risk, and execution guidance.")
         prop_state = load_prop_firm_state()
-        prop_status = str(prop_state.get("status") or "ACTIVE")
-        prop_notes = []
-        if prop_status == "FAILED":
-            prop_notes.append("🚨 The **official prop challenge has FAILED** (daily or max loss breached). Coach AI strongly recommends pausing new A+/A entries until the ledger is reviewed — continuing to risk capital against a failed challenge defeats the purpose of grading by confluence in the first place.")
-        elif prop_status == "PASSED":
-            prop_notes.append("🏆 The **official prop challenge has PASSED** its 10% target with the minimum trading days met. Coach AI suggests locking in this result rather than continuing to risk it on the same ledger.")
-        else:
-            roi_now = (float(prop_state.get("current_equity") or 0) / float(prop_state.get("starting_balance") or 1) - 1) * 100
-            prop_notes.append(f"Official challenge status: **ACTIVE**, currently at **{roi_now:+.2f}%** toward the 10% target. Coach AI will flag this immediately if it ever moves to FAILED or PASSED.")
+        prop_status = str(prop_state.get("status") or "ACTIVE").upper()
 
-        if len(closed_trades) < 10:
-            render_ai_card(
-                "Building Evidence",
-                "\n\n".join([f"- {n}" for n in prop_notes]) +
-                f"\n\n- Coach has **{len(closed_trades)}** closed journal trades. It will avoid declaring a best "
-                "asset/session until there is enough evidence (minimum 5 closed trades per group). Keep "
-                "collecting data, but watch open exposure and avoid changing the rules too early."
+        resolved = closed_resolved_trades(closed_trades) if not closed_trades.empty else pd.DataFrame()
+        coach_parts = []
+        if prop_status == "FAILED":
+            coach_parts.append(
+                "The official prop challenge has failed, which changes the coaching priority immediately. The right response is not to look for the next A+ entry to recover the account; it is to pause, review the ledger, and understand whether the failure came from trade quality, overexposure, daily-loss pressure, or taking too many correlated opportunities. Continuing to risk capital after a failed challenge would defeat the purpose of having the grading system in the first place."
+            )
+        elif prop_status == "PASSED":
+            coach_parts.append(
+                "The official prop challenge has reached its pass condition. Coach AI would treat this as a capital-preservation moment rather than an invitation to keep pressing. The system has done its job on this ledger, so the better decision is to lock in the result and let the next challenge start with a clean risk profile."
             )
         else:
-            resolved = closed_resolved_trades(closed_trades)
-            notes = list(prop_notes)
-            if not resolved.empty:
-                asset_perf = resolved.groupby("asset").apply(lambda g: pd.Series({"win_rate": win_rate_group(g) / 100, "trades": len(closed_resolved_trades(g)), "avg_r": pd.to_numeric(g.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean()}), include_groups=False).reset_index()
-                asset_perf = asset_perf[asset_perf["trades"] >= 5].sort_values(["win_rate", "avg_r"], ascending=False)
-                if not asset_perf.empty:
-                    best = asset_perf.iloc[0]
-                    notes.append(f"Your strongest supported asset is **{best['asset']}**: {best['trades']} closed trades, {best['win_rate']*100:.2f}% win rate, average {best['avg_r']:+.2f}R. Treat this as the playbook to repeat, not just a lucky asset.")
-                weak = resolved.groupby("asset").apply(lambda g: pd.Series({"win_rate": win_rate_group(g) / 100, "trades": len(closed_resolved_trades(g)), "avg_r": pd.to_numeric(g.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean()}), include_groups=False).reset_index()
-                weak = weak[weak["trades"] >= 5].sort_values(["win_rate", "avg_r"], ascending=True)
-                if not weak.empty:
-                    w = weak.iloc[0]
-                    notes.append(f"Your weakest supported area is **{w['asset']}**: {w['trades']} closed trades and {w['win_rate']*100:.2f}% win rate. Reduce size or demand stronger MTF confirmation here until the numbers improve.")
-                session_perf = resolved.groupby("session").apply(lambda g: pd.Series({"win_rate": win_rate_group(g) / 100, "trades": len(closed_resolved_trades(g)), "avg_r": pd.to_numeric(g.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean()}), include_groups=False).reset_index()
+            try:
+                roi_now = (float(prop_state.get("current_equity") or 0) / float(prop_state.get("starting_balance") or 1) - 1) * 100
+            except Exception:
+                roi_now = 0.0
+            coach_parts.append(
+                f"The official prop challenge is still active and currently sits at {roi_now:+.2f}% toward the target. That means the system is still in decision-making mode, not recovery mode or celebration mode. The main coaching priority is to protect the ledger from unnecessary drawdown while allowing only the strongest graded opportunities to continue proving themselves."
+            )
+
+        if len(closed_trades) < 10 or resolved.empty:
+            coach_parts.append(
+                f"Coach AI currently has {len(closed_trades)} closed journal trade(s) to study. That is enough to describe individual trades, but not enough to make strong claims about the best asset, best session, or worst recurring mistake. The correct behaviour at this stage is patience: keep collecting outcomes, avoid changing the rules too early, and pay close attention to whether open exposure is growing faster than evidence quality."
+            )
+        else:
+            asset_perf = resolved.groupby("asset").apply(
+                lambda g: pd.Series({
+                    "win_rate": win_rate_group(g) / 100,
+                    "trades": len(closed_resolved_trades(g)),
+                    "avg_r": pd.to_numeric(g.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean(),
+                }), include_groups=False
+            ).reset_index()
+            supported_assets = asset_perf[asset_perf["trades"] >= 5].copy()
+            if not supported_assets.empty:
+                best = supported_assets.sort_values(["win_rate", "avg_r"], ascending=False).iloc[0]
+                worst = supported_assets.sort_values(["win_rate", "avg_r"], ascending=True).iloc[0]
+                coach_parts.append(
+                    f"The strongest supported asset in the current sample is {best['asset']}. It has {int(best['trades'])} closed trades, a {best['win_rate']*100:.2f}% win rate, and an average result of {best['avg_r']:+.2f}R. Coach AI would not treat this as a lucky label on a chart; it suggests the engine's confirmation model is currently reading that market structure better than others. When similar grades compete for attention, this asset deserves priority until the sample changes."
+                )
+                coach_parts.append(
+                    f"The weakest supported area is {worst['asset']}, with {int(worst['trades'])} closed trades, a {worst['win_rate']*100:.2f}% win rate, and an average result of {worst['avg_r']:+.2f}R. The recommendation is not to ban the asset, but to demand stronger evidence before trusting it: cleaner multi-timeframe alignment, less stretched momentum, and better risk placement. Until performance improves, this area should be treated as research fuel rather than a prop-firm priority."
+                )
+            if "session" in resolved.columns:
+                session_perf = resolved.groupby("session").apply(
+                    lambda g: pd.Series({
+                        "win_rate": win_rate_group(g) / 100,
+                        "trades": len(closed_resolved_trades(g)),
+                        "avg_r": pd.to_numeric(g.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean(),
+                    }), include_groups=False
+                ).reset_index()
                 session_perf = session_perf[session_perf["trades"] >= 5].sort_values(["win_rate", "avg_r"], ascending=False)
                 if not session_perf.empty:
                     srow = session_perf.iloc[0]
-                    notes.append(f"Best supported session is **{srow['session']}** with {srow['trades']} closed trades and {srow['win_rate']*100:.2f}% win rate. Prioritise this session when similar grades appear.")
-            if len(open_trades) >= 3:
-                notes.append("Exposure warning: three or more trades are open. The coach would slow down new entries until at least one trade resolves, especially in prop-firm mode.")
-            a_count = len(open_trades[open_trades["grade"].isin(["A+", "A"])])
-            b_count = len(open_trades[open_trades["grade"].isin(["B", "C"])])
-            notes.append(f"Current open quality mix: **{a_count}** A+/A trade(s) and **{b_count}** B/C trade(s). Prop-firm focus should stay on A+/A only; B/C is research/journal learning fuel.")
-            body = "\n\n".join([f"- {n}" for n in notes])
-            render_ai_card("Trade Management Guidance", body)
+                    coach_parts.append(
+                        f"Session behaviour also matters. The best supported session is {srow['session']}, with {int(srow['trades'])} closed trades and a {srow['win_rate']*100:.2f}% win rate. That suggests the system is finding cleaner follow-through during that window. When two trades have similar grades, Coach AI would prefer the one appearing in the stronger session, because execution environment can be the difference between a good idea and a good fill."
+                    )
 
-
+        if len(open_trades) >= 3:
+            coach_parts.append(
+                f"Current exposure is elevated because {len(open_trades)} trades are still open. The coaching message here is simple: let some risk resolve before adding more. This matters even more in prop-firm mode, where one good setup can be ruined by stacking too many positions into the same market shock."
+            )
+        a_count = len(open_trades[open_trades["grade"].isin(["A+", "A"])]) if not open_trades.empty and "grade" in open_trades.columns else 0
+        b_count = len(open_trades[open_trades["grade"].isin(["B", "C"])]) if not open_trades.empty and "grade" in open_trades.columns else 0
+        coach_parts.append(
+            f"The current open-quality mix is {a_count} A+/A trade(s) and {b_count} B/C trade(s). The practical instruction is to keep prop-firm capital reserved for A+/A setups and let B/C trades remain journal-learning data. The goal is not to take every signal; it is to learn which signals deserve capital when the cost of being wrong is highest."
+        )
+        render_ai_card("Trade Management Guidance", "\n\n".join(coach_parts))
 
     with t6:
         st.subheader("Explain AI")
-        st.caption(
-            "Explain AI starts with closed outcomes by default because resolved trades provide the clearest lessons. "
-            "You can also review open journal trades and blocked No Trade ideas to understand the full signal lifecycle."
-        )
-        # Review Closed Outcomes: only closed trades should appear here.
-        review_frames = []
-        if not closed_trades.empty:
-            tmp = closed_trades.sort_values("created_at", ascending=False).head(75).copy()
-            review_frames.append(tmp)
-        if review_frames:
-            review_queue = pd.concat(review_frames, ignore_index=True, sort=False)
-            review_display = prepare_signal_table(review_queue, limit=75)
-            preferred_cols = ["Asset", "Timeframe", "Signal", "Grade", "Status", "Outcome", "R Multiple", "Entry", "SL", "TP"]
-            ordered_cols = [c for c in preferred_cols if c in review_display.columns]
-            remaining_cols = [c for c in review_display.columns if c not in ordered_cols and c != "Review Case"]
-            review_display = review_display[ordered_cols + remaining_cols]
+        st.caption("Closed outcomes are the main lesson source. Select a trade from the table to open its full Explain AI lesson. Lessons are saved in the explain_ai_lessons table.")
+
+        if closed_trades.empty:
+            st.info("No closed trades yet. Explain AI will populate once TP, SL, or expiry outcomes are recorded.")
+        else:
+            review_queue = closed_trades.sort_values("created_at", ascending=False).head(200).copy()
+            review_display = prepare_signal_table(review_queue, limit=200)
+            # Preserve the real DB signal_id for row selection; prepare_signal_table may display the public Benzino ID.
+            review_display["Raw Signal ID"] = review_queue.reset_index(drop=True)["signal_id"].astype(str).values
+            preferred_cols = ["Asset", "Timeframe", "Signal", "Grade", "Status", "Outcome", "R Multiple", "Entry", "SL", "TP", "Session", "Created At", "Raw Signal ID"]
+            review_display = review_display[[c for c in preferred_cols if c in review_display.columns] + [c for c in review_display.columns if c not in preferred_cols and c != "Review Case"]]
+
             title_col, sig_col, grade_col, status_col, search_col = st.columns([4.0, 1.1, 1.1, 1.25, 2.2], vertical_alignment="center")
             with title_col:
-                st.markdown("<div class='benzino-panel-title'>Review Closed Outcomes</div>", unsafe_allow_html=True)
+                st.markdown("<div class='benzino-panel-title'>Closed Trade Lessons</div>", unsafe_allow_html=True)
             with sig_col:
                 explain_signal_filter = st.selectbox("Signal", ["All", "BUY", "SELL"], label_visibility="collapsed", key="explain_review_signal_filter")
             with grade_col:
@@ -5413,7 +5554,8 @@ def render_workflow(username: str, settings: dict) -> None:
                 _status_options = ["All"] + sorted(review_display["Status"].dropna().astype(str).unique().tolist()) if "Status" in review_display.columns else ["All"]
                 explain_status_filter = st.selectbox("Status", _status_options, label_visibility="collapsed", key="explain_review_status_filter")
             with search_col:
-                explain_review_search = st.text_input("Search Explain AI review outcomes", placeholder="Search…", label_visibility="collapsed", key="explain_review_search")
+                explain_review_search = st.text_input("Search closed trade lessons", placeholder="Search…", label_visibility="collapsed", key="explain_review_search")
+
             if explain_signal_filter != "All" and "Signal" in review_display.columns:
                 review_display = review_display[review_display["Signal"].astype(str).str.upper().str.contains(explain_signal_filter, na=False)]
             if explain_grade_filter != "All" and "Grade" in review_display.columns:
@@ -5423,78 +5565,50 @@ def render_workflow(username: str, settings: dict) -> None:
             if explain_review_search:
                 q = str(explain_review_search).lower().strip()
                 review_display = review_display[review_display.astype(str).apply(lambda col: col.str.lower().str.contains(q, na=False)).any(axis=1)]
-            render_benzino_aggrid(review_display, key="explain_ai_review_queue", height=360, page_size=8, pinned=["Asset", "Timeframe", "Signal", "Grade", "Status", "Outcome", "R Multiple"], badge_cols={"Signal":"signal", "Grade":"grade", "Status":"status", "Outcome":"outcome"}, numeric_cols_right=["Confidence", "Decayed Confidence", "RR", "R Multiple", "Edge Score", "MTF Score"], enable_search=False)
 
-        case = st.selectbox(
-            "Choose a case",
-            ["📄 Closed outcome", "📂 Open journal trade", "⛔ Blocked NO TRADE idea"],
-            index=0,
-        )
+            st.caption("Select a row to open the lesson window. In AgGrid, double-clicking visually selects the row; in Streamlit's fallback table, use the row selector.")
+            selected_sid = ""
+            event = st.dataframe(
+                review_display.drop(columns=["Raw Signal ID"], errors="ignore"),
+                width="stretch",
+                hide_index=True,
+                selection_mode="single-row",
+                on_select="rerun",
+                key="explain_ai_closed_trade_table",
+            )
+            try:
+                selected_rows = event.selection.rows
+            except Exception:
+                selected_rows = []
+            if selected_rows:
+                idx = selected_rows[0]
+                if 0 <= idx < len(review_display):
+                    selected_sid = str(review_display.iloc[idx].get("Raw Signal ID") or "")
 
-        if "Blocked NO TRADE" in case:
-            blocked_latest = no_trades.sort_values("created_at", ascending=False).head(8).copy()
-            if blocked_latest.empty:
-                st.info("No No Trade ideas recorded yet for this timeframe.")
-            else:
-                options = blocked_latest.apply(lambda r: f"{r.get('asset')} · {r.get('timeframe')} · {r.get('signal')} · {time_ago(r.get('created_at'))} · {r.get('signal_id')}", axis=1).tolist()
-                choice = st.selectbox("Choose one of the last 8 blocked ideas", options, key="explain_blocked")
-                sid = choice.split(" · ")[-1]
-                row = blocked_latest[blocked_latest["signal_id"].astype(str).eq(sid)].iloc[0]
-                render_ai_card("Why This Was Blocked", rich_signal_explanation(row))
+            if selected_sid:
+                row_df = review_queue[review_queue["signal_id"].astype(str).eq(selected_sid)]
+                if not row_df.empty:
+                    selected_row = row_df.iloc[0].copy()
+                    generated_lesson = rich_closed_trade_explanation(selected_row)
+                    stored_lesson = load_explain_ai_lesson(selected_sid)
+                    lesson_text = stored_lesson or generated_lesson
+                    if not stored_lesson:
+                        try:
+                            save_explain_ai_lesson(selected_sid, str(selected_row.get("scan_owner") or active_username()), generated_lesson)
+                        except Exception as exc:
+                            st.warning(f"Could not save Explain AI lesson: {exc}")
 
-        elif "Open journal trade" in case:
-            open_latest = open_trades.sort_values("created_at", ascending=False).head(8).copy()
-            if open_latest.empty:
-                st.info("No open journal trades right now. This case will populate the next time an A+/A/B/C setup is graded.")
-            else:
-                options = open_latest.apply(lambda r: f"{r.get('asset')} · {r.get('timeframe')} · {r.get('signal')} · {r.get('grade')} · {time_ago(r.get('created_at'))} · {r.get('signal_id')}", axis=1).tolist()
-                choice = st.selectbox("Choose one of the last 8 open trades", options, key="explain_open")
-                sid = choice.split(" · ")[-1]
-                row = open_latest[open_latest["signal_id"].astype(str).eq(sid)].iloc[0]
-                render_ai_card("Why This Trade Is Still Open", rich_open_trade_explanation(row))
+                    @st.dialog("Closed Trade Lesson", width="large")
+                    def _show_closed_lesson():
+                        render_ai_card("Closed Trade Lesson", lesson_text)
+                        if st.button("Regenerate and save latest lesson", type="primary", key=f"regen_lesson_{selected_sid}"):
+                            try:
+                                save_explain_ai_lesson(selected_sid, str(selected_row.get("scan_owner") or active_username()), generated_lesson)
+                                st.success("Lesson regenerated and saved to explain_ai_lessons.")
+                            except Exception as exc:
+                                st.error(f"Failed to save lesson: {exc}")
+                    _show_closed_lesson()
 
-        else:
-            closed_latest = closed_trades.sort_values("created_at", ascending=False).head(8).copy()
-            if closed_latest.empty:
-                st.info("No closed trades yet. Explain AI will focus on closed outcomes once TP, SL, or expiry appears.")
-            else:
-                options = closed_latest.apply(lambda r: f"{r.get('asset')} · {r.get('timeframe')} · {r.get('outcome')} · {r.get('grade')} · {fmt_nairobi(r.get('created_at'))} · {r.get('signal_id')}", axis=1).tolist()
-                choice = st.selectbox("Choose one of the last 8 closed trades", options, key="explain_closed")
-                sid = choice.split(" · ")[-1]
-                row = closed_latest[closed_latest["signal_id"].astype(str).eq(sid)].iloc[0]
-
-                existing_note = str(row.get("trade_notes") or "").strip()
-                note_key = f"trade_note_{sid}"
-                if note_key not in st.session_state:
-                    st.session_state[note_key] = existing_note
-
-                st.markdown("<div class='benzino-panel-title' style='margin-top:12px'>Trade Note</div>", unsafe_allow_html=True)
-                st.caption("Add context for Explain AI — e.g. 'news spike caused SL', 'entered during high-impact NFP release', 'manual close due to regime shift'. This note is saved to Supabase and incorporated into the AI explanation below.")
-                note_text = st.text_area(
-                    "Note (optional)",
-                    value=st.session_state[note_key],
-                    placeholder="e.g. Sharp spike caused by CPI data release — institutional stop hunt above previous high before reversal.",
-                    height=90,
-                    key=f"note_input_{sid}",
-                    label_visibility="collapsed",
-                )
-                if st.button("Save note", key=f"save_note_{sid}", type="primary"):
-                    try:
-                        execute(
-                            "UPDATE scanner_signals SET trade_notes = %s WHERE signal_id = %s",
-                            (note_text.strip() or None, sid),
-                        )
-                        st.session_state[note_key] = note_text.strip()
-                        row = row.copy()
-                        row["trade_notes"] = note_text.strip()
-                        st.success("Note saved.")
-                    except Exception as exc:
-                        st.error(f"Failed to save note: {exc}")
-                else:
-                    row = row.copy()
-                    row["trade_notes"] = st.session_state[note_key]
-
-                render_ai_card("Closed Trade Lesson", rich_closed_trade_explanation(row))
 
 
 

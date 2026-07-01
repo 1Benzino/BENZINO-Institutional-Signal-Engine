@@ -622,6 +622,18 @@ def init_tables() -> None:
         counter BIGINT NOT NULL DEFAULT 0,
         CONSTRAINT single_row CHECK (id = 1)
     );
+
+    CREATE TABLE IF NOT EXISTS explain_ai_lessons (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        signal_id TEXT REFERENCES scanner_signals(signal_id),
+        scan_owner TEXT,
+        lesson_type TEXT,
+        lesson_text TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_explain_ai_lessons_signal_type
+        ON explain_ai_lessons(signal_id, lesson_type, updated_at DESC);
     """
     try:
         conn = db_connect()
