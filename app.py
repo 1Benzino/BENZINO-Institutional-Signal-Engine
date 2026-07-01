@@ -5114,21 +5114,15 @@ def render_workflow(username: str, settings: dict) -> None:
         df = pd.DataFrame(columns=raw_df.columns if raw_df is not None else [])
     df["outcome"] = df.apply(outcome_label, axis=1)
     trades = df[df["grade"].astype(str).isin(VALID_GRADES)].copy()
-    # No Trade Tracker source: always use raw_df (pre-timeframe-filter) so that
-    # the page shows all SHADOW rows regardless of the user's preferred timeframe
-    # view, since a user viewing "1h" shouldn't see an empty No Trade tab just
-    # because most SHADOW signals happened on "15m". status == "SHADOW" is the
-    # single authoritative source of truth — save_signal() writes SHADOW for
-    # every row that isn't a graded A+/A/B/C BUY/SELL.
-    #
-    # The previous filter (grade=="NO TRADE" AND signal IN ["BUY","SELL"]) was
-    # wrong because it silently excluded the majority of no-trade rows: signal=="HOLD"
-    # rows, which are generated whenever systems genuinely split (dominant=="SPLIT")
-    # and are by far the most common class of shadow signal.
-    _nt_source = raw_df.copy() if raw_df is not None and not raw_df.empty else df.copy()
-    if "outcome" not in _nt_source.columns:
+    # No Trade Tracker source: use the same user/watchlist + selected timeframe
+    # scope as the rest of the Workflow page. The previous version used raw_df
+    # before apply_timeframe_view(), which made this tab show all timeframes even
+    # when the user had selected 15m/1h/4h/1d. It also rendered only .head(300)
+    # later, so busy days could hide older Supabase shadow history.
+    _nt_source = df.copy() if df is not None and not df.empty else pd.DataFrame(columns=raw_df.columns if raw_df is not None else [])
+    if not _nt_source.empty and "outcome" not in _nt_source.columns:
         _nt_source["outcome"] = _nt_source.apply(outcome_label, axis=1)
-    no_trades = _nt_source[_nt_source["status"].astype(str).str.upper().eq("SHADOW")].copy()
+    no_trades = _nt_source[_nt_source["status"].astype(str).str.upper().eq("SHADOW")].copy() if not _nt_source.empty and "status" in _nt_source.columns else pd.DataFrame()
     open_trades = trades[trades["status"].astype(str).str.upper().eq("OPEN")]
     closed_trades = trades[trades["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])]
 
@@ -5945,7 +5939,14 @@ def render_workflow(username: str, settings: dict) -> None:
         st.caption("All signals the scanner blocked from being journaled as real trades. Includes two types: (1) directional ideas (BUY/SELL) where the grade was too weak or R:R too thin — these are hypothetically tracked against TP/SL/expiry to see if they'd have worked. (2) HOLD rows where the systems genuinely split with no directional consensus — these have no hypothetical outcome since there's no entry thesis, but they're recorded so you can see how often the scanner truly sees no edge.")
         no_trades_directional = no_trades[no_trades["signal"].astype(str).str.upper().isin(["BUY", "SELL"])].copy() if not no_trades.empty else pd.DataFrame()
         no_trades_hold = no_trades[no_trades["signal"].astype(str).str.upper().eq("HOLD")].copy() if not no_trades.empty else pd.DataFrame()
-        no_trades_resolved = no_trades_directional[no_trades_directional["shadow_outcome"].notna()].copy() if "shadow_outcome" in no_trades_directional.columns and not no_trades_directional.empty else pd.DataFrame()
+        no_trades_resolved = (
+            no_trades_directional[
+                no_trades_directional["shadow_outcome"].notna()
+                & no_trades_directional["shadow_outcome"].astype(str).str.strip().ne("")
+            ].copy()
+            if "shadow_outcome" in no_trades_directional.columns and not no_trades_directional.empty
+            else pd.DataFrame()
+        )
         h1, h2, h3, h4 = st.columns(4)
         with h1: metric_card("Total shadow rows", f"{len(no_trades):,}", "Never alerted, never journaled")
         with h2: metric_card("Directional ideas", f"{len(no_trades_directional):,}", "BUY/SELL blocked by grade or R:R")
@@ -5965,7 +5966,10 @@ def render_workflow(username: str, settings: dict) -> None:
             )
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         no_trade_cols = ["created_at_eat", "asset", "timeframe", "signal", "grade", "status", "entry", "sl", "tp", "rr", "confidence", "edge_score", "shadow_outcome", "shadow_r_multiple", "shadow_exit_price", "reason", "session"]
-        render_benzino_aggrid(prepare_signal_table(no_trades[[c for c in no_trade_cols if c in no_trades.columns]].head(300)), key="no_trade_tracker", title="Research Queue", height=460, page_size=10, pinned=["Asset", "Signal", "Grade", "Age"], badge_cols={"Signal":"signal", "Grade":"grade", "Status":"status", "Hypothetical Outcome":"outcome"}, numeric_cols_right=["Entry", "SL", "TP", "Confidence", "Decayed Confidence", "RR", "Edge Score", "Hypothetical R", "Hypothetical Exit", "R Multiple"])
+        no_trade_table = no_trades[[c for c in no_trade_cols if c in no_trades.columns]].copy() if not no_trades.empty else pd.DataFrame(columns=[c for c in no_trade_cols if c in no_trades.columns])
+        if not no_trade_table.empty and "created_at" in no_trades.columns:
+            no_trade_table = no_trade_table.loc[no_trades.sort_values("created_at", ascending=False).index.intersection(no_trade_table.index)]
+        render_benzino_aggrid(prepare_signal_table(no_trade_table), key="no_trade_tracker", title="Research Queue", height=560, page_size=100, pinned=["Asset", "Signal", "Grade", "Age"], badge_cols={"Signal":"signal", "Grade":"grade", "Status":"status", "Hypothetical Outcome":"outcome"}, numeric_cols_right=["Entry", "SL", "TP", "Confidence", "Decayed Confidence", "RR", "Edge Score", "Hypothetical R", "Hypothetical Exit", "R Multiple"])
 
     with t5:
         st.subheader("Coach AI")
@@ -6165,6 +6169,33 @@ def user_win_rate_for_admin(username: str, user_settings: dict | None = None) ->
     return user_performance_for_admin(username, user_settings).get("win_rate", "0.00%")
 
 
+
+
+def prop_firm_win_rate_for_admin(username: str, timeframe: str = "1h") -> str:
+    """Return the user's prop-firm challenge win rate for the admin User Management table.
+
+    Full FTMO challenge pass = Phase 2 passed. This reads the replayed
+    prop_challenge_history for that user's preferred timeframe only.
+    """
+    try:
+        scope = prop_challenge_scan_owner(username, timeframe)
+        df = read_df(
+            """
+            SELECT phase_2_passed
+            FROM prop_challenge_history
+            WHERE scan_owner = %s
+            """,
+            (scope,),
+        )
+        if df.empty:
+            return "0.00%"
+        total = len(df)
+        passed = int(pd.Series(df["phase_2_passed"]).fillna(False).astype(bool).sum())
+        return f"{(passed / total * 100):.2f}%" if total else "0.00%"
+    except Exception:
+        return "0.00%"
+
+
 def render_settings(username: str, settings: dict) -> None:
     page_header("Settings", "Profile, watchlist, Telegram routing, activation date, and reset tools.")
 
@@ -6219,6 +6250,9 @@ def render_settings(username: str, settings: dict) -> None:
                     for u in all_users["username"].astype(str).tolist()
                 }
                 all_users["win_rate"] = all_users["username"].astype(str).map(lambda u: admin_perf_map.get(u, {}).get("win_rate", "0.00%"))
+                all_users["prop_firm_win_rate"] = all_users["username"].astype(str).map(
+                    lambda u: prop_firm_win_rate_for_admin(u, settings_map.get(u, {}).get("preferred_timeframe", "1h"))
+                )
                 all_users["starting_balance"] = all_users["username"].astype(str).map(lambda u: admin_perf_map.get(u, {}).get("starting_balance", "$0.00"))
                 all_users["current_balance"] = all_users["username"].astype(str).map(lambda u: admin_perf_map.get(u, {}).get("current_balance", "$0.00"))
 
@@ -6226,7 +6260,7 @@ def render_settings(username: str, settings: dict) -> None:
                 all_users["telegram_activated"] = all_users["username"].astype(str).map(lambda u: "Yes" if telegram_map.get(u) else "No")
                 all_users["created_at"] = all_users["created_at"].apply(fmt_nairobi)
                 all_users["tracking_started_at"] = all_users["tracking_started_at"].apply(fmt_nairobi)
-                user_cols = ["username", "role", "preferred_timeframe", "win_rate", "watchlist_count", "watchlist", "current_balance", "starting_balance", "account_size", "risk_pct", "leverage", "telegram_activated", "email", "created_at", "tracking_started_at"]
+                user_cols = ["username", "role", "preferred_timeframe", "win_rate", "prop_firm_win_rate", "watchlist_count", "watchlist", "current_balance", "starting_balance", "account_size", "risk_pct", "leverage", "telegram_activated", "email", "created_at", "tracking_started_at"]
                 all_users = all_users[[c for c in user_cols if c in all_users.columns]]
                 render_benzino_aggrid(all_users, key="admin_user_management", title="User Management", height=420, page_size=10, pinned=["username"], numeric_cols_right=["watchlist_count", "account_size", "risk_pct", "leverage"], badge_cols={"telegram_activated": "status"})
 
