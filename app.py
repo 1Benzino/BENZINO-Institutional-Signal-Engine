@@ -5827,19 +5827,18 @@ def render_workflow(username: str, settings: dict) -> None:
                 st.markdown("**Daily challenge ledger · all simulated challenges**")
                 daily_view = day_summary.copy()
 
-                # Keep the ledger human-logical: latest challenge first, but
-                # inside each challenge show Phase 1 before Phase 2, and each
-                # phase in chronological day order. This avoids Phase 2 rows
-                # appearing above the Phase 1 rows that actually came first.
+                # Keep the ledger human-logical: latest challenge first, latest
+                # day first, and where Phase 1 and Phase 2 share the same day,
+                # show Phase 2 first because it happened later in the replay.
                 daily_view["__challenge_no"] = daily_view["Challenge"].astype(str).str.replace("#", "", regex=False)
                 daily_view["__challenge_no"] = pd.to_numeric(daily_view["__challenge_no"], errors="coerce").fillna(-1).astype(int)
                 daily_view["__phase_order"] = daily_view["Phase"].astype(str).str.extract(r"(\d+)")[0]
-                daily_view["__phase_order"] = pd.to_numeric(daily_view["__phase_order"], errors="coerce").fillna(99).astype(int)
+                daily_view["__phase_order"] = pd.to_numeric(daily_view["__phase_order"], errors="coerce").fillna(0).astype(int)
                 daily_view["__day_sort"] = pd.to_datetime(daily_view["Day"], errors="coerce")
 
                 daily_view = daily_view.sort_values(
-                    ["__challenge_no", "__phase_order", "__day_sort"],
-                    ascending=[False, True, True],
+                    ["__challenge_no", "__day_sort", "__phase_order"],
+                    ascending=[False, False, False],
                     kind="mergesort",
                 )
 
@@ -5861,6 +5860,27 @@ def render_workflow(username: str, settings: dict) -> None:
                         daily_view = daily_view[daily_view["Challenge"].astype(str) == selected_daily_challenge].copy()
 
                 daily_view = daily_view.drop(columns=["__challenge_no", "__phase_order", "__day_sort"], errors="ignore")
+
+                # Column order: keep the key result flags immediately after Daily P/L,
+                # then show the balances as properly formatted dollar amounts.
+                preferred_daily_cols = [
+                    "Challenge", "Phase", "Day", "Daily P/L", "Day Result", "Target Hit",
+                    "Trades", "Opening Balance", "Closing Balance", "Intraday Low",
+                    "Daily Loss Floor", "Phase Target", "Daily Breach",
+                ]
+                daily_view = daily_view[[c for c in preferred_daily_cols if c in daily_view.columns]]
+
+                currency_cols = ["Daily P/L", "Opening Balance", "Closing Balance", "Intraday Low", "Daily Loss Floor", "Phase Target"]
+                for c in currency_cols:
+                    if c in daily_view.columns:
+                        daily_view[c] = pd.to_numeric(daily_view[c], errors="coerce").apply(
+                            lambda x: "—" if pd.isna(x) else f"${x:,.2f}"
+                        )
+                if "Trades" in daily_view.columns:
+                    daily_view["Trades"] = pd.to_numeric(daily_view["Trades"], errors="coerce").apply(
+                        lambda x: "—" if pd.isna(x) else f"{int(x):,}"
+                    )
+
                 render_benzino_aggrid(
                     daily_view,
                     key="challenge_daily_loss_check",
@@ -5868,7 +5888,7 @@ def render_workflow(username: str, settings: dict) -> None:
                     page_size=10,
                     pinned=["Challenge", "Phase", "Day"],
                     badge_cols={"Daily Breach":"status", "Target Hit":"status", "Day Result":"outcome"},
-                    numeric_cols_right=["Opening Balance", "Daily P/L", "Closing Balance", "Intraday Low", "Daily Loss Floor", "Trades"],
+                    numeric_cols_right=[],
                     enable_search=False,
                     show_status_filter=False,
                 )
