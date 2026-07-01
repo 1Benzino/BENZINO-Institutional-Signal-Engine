@@ -2122,8 +2122,14 @@ def compute_dashboard_summary(df: pd.DataFrame, settings: dict) -> dict:
     return out
 
 
-def render_balance_curve(df: pd.DataFrame, settings: dict, title: str = "Balance curve") -> None:
-    """Render realised balance curve from closed trades when evidence exists."""
+def render_balance_curve(df: pd.DataFrame, settings: dict, title: str = "Balance curve", split_by_grade: bool = False, include_overall: bool = False) -> None:
+    """Render realised balance curve from closed trades when evidence exists.
+
+    When split_by_grade=True, the chart shows separate hypothetical equity
+    curves for A+/A, B, and C trades. Each curve starts from the same user
+    account size and only compounds the trades in that grade bucket, making it
+    clear which quality tier is helping or hurting the journal.
+    """
     if df is None or df.empty:
         return
     view = add_trade_pnl_columns(df.copy(), settings)
@@ -2132,7 +2138,36 @@ def render_balance_curve(df: pd.DataFrame, settings: dict, title: str = "Balance
     if closed.empty:
         return
     closed = closed.sort_values("created_at")
-    fig = px.line(closed, x="created_at", y="balance_after", color="timeframe" if "timeframe" in closed.columns else None, title=title)
+
+    if split_by_grade and "grade" in closed.columns:
+        account = float(settings.get("account_size", 10000) or 10000)
+        grade = closed["grade"].astype(str).str.upper().str.strip()
+        closed["Grade Group"] = np.select(
+            [grade.isin(["A+", "A"]), grade.eq("B"), grade.eq("C")],
+            ["A+/A only", "B only", "C only"],
+            default="Other",
+        )
+        closed = closed[closed["Grade Group"].isin(["A+/A only", "B only", "C only"])].copy()
+        if closed.empty:
+            return
+        pieces = []
+        if include_overall:
+            overall = closed.sort_values("created_at").copy()
+            overall["Grade Group"] = "All trades"
+            overall["grade_balance_after"] = account + pd.to_numeric(overall["pnl_cash"], errors="coerce").fillna(0.0).cumsum()
+            pieces.append(overall)
+        for group_name, group_df in closed.groupby("Grade Group", sort=False):
+            group_df = group_df.sort_values("created_at").copy()
+            group_df["grade_balance_after"] = account + pd.to_numeric(group_df["pnl_cash"], errors="coerce").fillna(0.0).cumsum()
+            pieces.append(group_df)
+        chart_df = pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame()
+        if chart_df.empty:
+            return
+        fig = px.line(chart_df, x="created_at", y="grade_balance_after", color="Grade Group", title=title)
+        fig.update_layout(yaxis_title="Balance after", xaxis_title="created_at")
+    else:
+        fig = px.line(closed, x="created_at", y="balance_after", color="timeframe" if "timeframe" in closed.columns else None, title=title)
+
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -4077,40 +4112,8 @@ def render_opportunity_board(username: str, settings: dict) -> None:
     left, right = st.columns([1.55, 1])
     with left:
         with st.container(border=True, height=440):
-            st.markdown("<div class='benzino-panel-title'>Equity Curve</div>", unsafe_allow_html=True)
-            eq = extra["equity_series"]
-            if eq.empty:
-                st.markdown("<div class='benzino-empty-note'>No closed trades yet — the equity curve fills in as journaled trades resolve.</div>", unsafe_allow_html=True)
-            else:
-                st.markdown("<div class='benzino-equity-range'>", unsafe_allow_html=True)
-                period = st.segmented_control(
-                    "",
-                    options=["7D", "30D", "90D", "6M", "ALL"],
-                    default="ALL",
-                    selection_mode="single",
-                    label_visibility="collapsed",
-                    key="dash_equity_period",
-                )
-                st.markdown("</div>", unsafe_allow_html=True)
-                view = eq.copy()
-                period_days = {"7D": 7, "30D": 30, "90D": 90, "6M": 180, "ALL": None}
-                selected_days = period_days.get(period or "ALL")
-                if selected_days:
-                    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=selected_days)
-                    view = view[pd.to_datetime(view["created_at"], utc=True, errors="coerce") >= cutoff]
-                if view.empty:
-                    st.markdown("<div class='benzino-empty-note'>No closed trades in this period.</div>", unsafe_allow_html=True)
-                else:
-                    fig = px.area(view, x="created_at", y="balance_after")
-                    fig.update_traces(line_color="#00D4A3", fillcolor="rgba(0,212,163,0.18)")
-                    fig.update_layout(
-                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                        font_color="#8BAAB8", margin=dict(l=10, r=10, t=10, b=10),
-                        xaxis_title=None, yaxis_title=None, height=310,
-                    )
-                    fig.update_xaxes(gridcolor="#16263B")
-                    fig.update_yaxes(gridcolor="#16263B")
-                    st.plotly_chart(fig, use_container_width=True)
+            st.markdown("<div class='benzino-panel-title'>Balance Curve by Grade</div>", unsafe_allow_html=True)
+            render_balance_curve(df, settings, title="", split_by_grade=True, include_overall=True)
 
     with right:
         with st.container(border=True, height=440):
@@ -5216,7 +5219,6 @@ def render_workflow(username: str, settings: dict) -> None:
             {"Signal":"signal", "Grade":"grade", "Status":"status", "Outcome":"outcome"},
             ["RR", "R Multiple", "pnl_cash", "balance_after"],
         )
-        render_balance_curve(trades, settings, title="User Journal Balance Curve")
 
 
     with t2:
