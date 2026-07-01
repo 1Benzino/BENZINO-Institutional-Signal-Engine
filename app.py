@@ -5156,23 +5156,26 @@ def render_workflow(username: str, settings: dict) -> None:
                     show_status_filter=False,
                 )
 
-            history_rows = [item for item in prop_history if isinstance(item, dict)]
-            if history_rows:
-                st.markdown("**Challenge review history**")
-                history_view = pd.DataFrame(history_rows).drop(columns=["Attempt ID"], errors="ignore")
-                if "Completed At" in history_view.columns:
-                    history_view = history_view.sort_values("Completed At", ascending=False)
-                render_benzino_aggrid(
-                    history_view,
-                    key=f"challenge_review_history_{challenge_tf}",
-                    height=320,
-                    page_size=10,
-                    pinned=["Timeframe", "Result"],
-                    badge_cols={"Result": "status"},
-                    numeric_cols_right=["Trading Days", "Closed Trades"],
-                    enable_search=False,
-                    show_status_filter=False,
-                )
+
+        history_rows = [item for item in prop_history if isinstance(item, dict)]
+        st.markdown("**Challenge review history**")
+        if history_rows:
+            history_view = pd.DataFrame(history_rows).drop(columns=["Attempt ID"], errors="ignore")
+            if "Completed At" in history_view.columns:
+                history_view = history_view.sort_values("Completed At", ascending=False)
+            render_benzino_aggrid(
+                history_view,
+                key=f"challenge_review_history_{challenge_tf}",
+                height=320,
+                page_size=10,
+                pinned=["Timeframe", "Result"],
+                badge_cols={"Result": "status"},
+                numeric_cols_right=["Trading Days", "Closed Trades"],
+                enable_search=False,
+                show_status_filter=False,
+            )
+        else:
+            st.info("No completed prop-firm challenges have been archived yet. Passed or failed attempts will appear here automatically.")
 
     with t4:
         st.caption("All signals the scanner blocked from being journaled as real trades. Includes two types: (1) directional ideas (BUY/SELL) where the grade was too weak or R:R too thin — these are hypothetically tracked against TP/SL/expiry to see if they'd have worked. (2) HOLD rows where the systems genuinely split with no directional consensus — these have no hypothetical outcome since there's no entry thesis, but they're recorded so you can see how often the scanner truly sees no edge.")
