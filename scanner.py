@@ -949,7 +949,7 @@ def fetch_unresolved_shadow_trades(assets: set[str] | None = None, timeframes: s
                 SELECT * FROM scanner_signals
                 WHERE status = 'SHADOW'
                   AND shadow_outcome IS NULL
-                  AND created_at >= NOW() - INTERVAL '%s days'
+                  AND created_at >= NOW() - (%s::int * INTERVAL '1 day')
             """
             params: list = [max_age_days]
             if assets:
@@ -2196,7 +2196,7 @@ def backfill_shadow_trade_plans(assets: set[str] | None = None, timeframes: set[
                 FROM scanner_signals
                 WHERE status = 'SHADOW'
                   AND shadow_outcome IS NULL
-                  AND created_at >= NOW() - INTERVAL '%s days'
+                  AND created_at >= NOW() - (%s::int * INTERVAL '1 day')
                   AND (
                         UPPER(TRIM(COALESCE(signal,''))) = 'HOLD'
                      OR ABS(COALESCE(entry,0) - COALESCE(sl,0)) <= 0.00000001
@@ -2376,7 +2376,7 @@ def run_scan() -> None:
 
     # 1. Resolve outcomes for everything already open BEFORE scanning for new setups.
     evaluate_open_trades(assets=set(scan_assets.keys()), timeframes=set(active_tfs))
-    evaluate_shadow_trades(assets=set(scan_assets.keys()), timeframes=set(active_tfs))
+    evaluate_shadow_trades(assets=set(scan_assets.keys()), timeframes=None)
 
     journaled, alerted, shadowed = 0, 0, 0
     assets_scanned = 0
