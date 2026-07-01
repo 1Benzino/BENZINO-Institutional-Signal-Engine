@@ -4718,19 +4718,24 @@ def render_workflow(username: str, settings: dict) -> None:
 
         def _render_journal_signal_grid(source_df: pd.DataFrame, table_title: str, key_prefix: str, cols: list[str], badge_map: dict, numeric_right: list[str]) -> None:
             prepared = prepare_signal_table(source_df[[c for c in cols if c in source_df.columns]].head(200))
-            title_col, sig_col, grade_col, search_col = st.columns([5.0, 1.15, 1.15, 2.4], vertical_alignment="center")
+            title_col, sig_col, grade_col, status_col, search_col = st.columns([3.6, 1.0, 1.0, 1.15, 2.25], vertical_alignment="center")
             with title_col:
                 st.markdown(f"<div class='benzino-panel-title'>{html.escape(table_title)}</div>", unsafe_allow_html=True)
             with sig_col:
                 signal_choice = st.selectbox("Signal", ["All", "BUY", "SELL", "HOLD", "NO TRADE"], label_visibility="collapsed", key=f"{key_prefix}_signal_filter")
             with grade_col:
                 grade_choice = st.selectbox("Grade", ["All", "A+", "A", "B", "C", "NO TRADE"], label_visibility="collapsed", key=f"{key_prefix}_grade_filter")
+            with status_col:
+                status_options = ["All"] + sorted([str(v) for v in prepared.get("Status", pd.Series(dtype=str)).dropna().astype(str).unique() if str(v).strip()]) if "Status" in prepared.columns else ["All"]
+                status_choice = st.selectbox("Status", status_options, label_visibility="collapsed", key=f"{key_prefix}_status_filter_inline")
             with search_col:
                 search_choice = st.text_input(f"Search {table_title}", placeholder="Search…", label_visibility="collapsed", key=f"{key_prefix}_search")
             if signal_choice != "All" and "Signal" in prepared.columns:
                 prepared = prepared[prepared["Signal"].astype(str).str.upper().str.contains(signal_choice, na=False)]
             if grade_choice != "All" and "Grade" in prepared.columns:
                 prepared = prepared[prepared["Grade"].astype(str).str.upper().eq(grade_choice.upper())]
+            if status_choice != "All" and "Status" in prepared.columns:
+                prepared = prepared[prepared["Status"].astype(str).eq(status_choice)]
             if search_choice:
                 q = str(search_choice).lower().strip()
                 prepared = prepared[prepared.astype(str).apply(lambda col: col.str.lower().str.contains(q, na=False)).any(axis=1)]
@@ -5385,20 +5390,21 @@ def render_workflow(username: str, settings: dict) -> None:
             "Explain AI starts with closed outcomes by default because resolved trades provide the clearest lessons. "
             "You can also review open journal trades and blocked No Trade ideas to understand the full signal lifecycle."
         )
-        # Review Outcomes: only closed trades should appear here.
+        # Review Closed Outcomes: only closed trades should appear here.
         review_frames = []
         if not closed_trades.empty:
             tmp = closed_trades.sort_values("created_at", ascending=False).head(75).copy()
-            tmp["Review Case"] = "Closed Outcome"
             review_frames.append(tmp)
         if review_frames:
             review_queue = pd.concat(review_frames, ignore_index=True, sort=False)
             review_display = prepare_signal_table(review_queue, limit=75)
-            cols = ["Review Case"] + [c for c in review_display.columns if c != "Review Case"]
-            review_display = review_display[cols]
+            preferred_cols = ["Asset", "Timeframe", "Signal", "Grade", "Status", "Outcome", "R Multiple", "Entry", "SL", "TP"]
+            ordered_cols = [c for c in preferred_cols if c in review_display.columns]
+            remaining_cols = [c for c in review_display.columns if c not in ordered_cols and c != "Review Case"]
+            review_display = review_display[ordered_cols + remaining_cols]
             title_col, sig_col, grade_col, status_col, search_col = st.columns([4.0, 1.1, 1.1, 1.25, 2.2], vertical_alignment="center")
             with title_col:
-                st.markdown("<div class='benzino-panel-title'>Review Outcomes</div>", unsafe_allow_html=True)
+                st.markdown("<div class='benzino-panel-title'>Review Closed Outcomes</div>", unsafe_allow_html=True)
             with sig_col:
                 explain_signal_filter = st.selectbox("Signal", ["All", "BUY", "SELL"], label_visibility="collapsed", key="explain_review_signal_filter")
             with grade_col:
@@ -5417,7 +5423,7 @@ def render_workflow(username: str, settings: dict) -> None:
             if explain_review_search:
                 q = str(explain_review_search).lower().strip()
                 review_display = review_display[review_display.astype(str).apply(lambda col: col.str.lower().str.contains(q, na=False)).any(axis=1)]
-            render_benzino_aggrid(review_display, key="explain_ai_review_queue", height=360, page_size=8, pinned=["Review Case", "Asset"], badge_cols={"Signal":"signal", "Grade":"grade", "Status":"status", "Outcome":"outcome"}, numeric_cols_right=["Confidence", "Decayed Confidence", "RR", "R Multiple", "Edge Score", "MTF Score"], enable_search=False)
+            render_benzino_aggrid(review_display, key="explain_ai_review_queue", height=360, page_size=8, pinned=["Asset", "Timeframe", "Signal", "Grade", "Status", "Outcome", "R Multiple"], badge_cols={"Signal":"signal", "Grade":"grade", "Status":"status", "Outcome":"outcome"}, numeric_cols_right=["Confidence", "Decayed Confidence", "RR", "R Multiple", "Edge Score", "MTF Score"], enable_search=False)
 
         case = st.selectbox(
             "Choose a case",
