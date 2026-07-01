@@ -1450,10 +1450,11 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
     phase_days: set = set()
     phase_rows = []
     phase1_pnl_bank = 0.0
+    phase1_passed_at = ""
     cycle_trade_rows = []
 
     def finish_history(status, finished_ts, reason=""):
-        nonlocal phase, cycle_phase1_passed, cycle_start_ts, phase_start_ts, phase_start_idx, phase_balance, phase_daily, phase_days, phase_rows, phase1_pnl_bank, cycle_trade_rows
+        nonlocal phase, cycle_phase1_passed, cycle_start_ts, phase_start_ts, phase_start_idx, phase_balance, phase_daily, phase_days, phase_rows, phase1_pnl_bank, phase1_passed_at, cycle_trade_rows
         cycle_df = pd.DataFrame(cycle_trade_rows)
         win_rate = win_rate_from_resolved(cycle_df) if not cycle_df.empty else 0.0
         realised = (phase1_pnl_bank if cycle_phase1_passed else 0.0) + (phase_balance - starting)
@@ -1473,6 +1474,7 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
         phase = 1
         cycle_phase1_passed = False
         phase1_pnl_bank = 0.0
+        phase1_passed_at = ""
         phase_balance = starting
         phase_daily = {}
         phase_days = set()
@@ -1510,6 +1512,7 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
                 # Phase 1 passed. Phase 2 begins from a fresh $10,000 verification account.
                 cycle_phase1_passed = True
                 phase1_pnl_bank = phase_balance - starting
+                phase1_passed_at = ts
                 phase = 2
                 phase_balance = starting
                 phase_daily = {}
@@ -1560,6 +1563,7 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
         "max_drawdown_pct": max_dd_pct,
         "fail_reason": "",
         "pass_date": "",
+        "phase1_passed_at": phase1_passed_at,
     }
     return {"history": histories, "active": active, "active_curve": active_curve, "active_daily": active_daily}
 
@@ -5454,7 +5458,11 @@ def render_workflow(username: str, settings: dict) -> None:
         challenge_started_at = fmt_nairobi(active_prop.get("start_at")) if active_prop.get("start_at") else (fmt_nairobi(prop_started_at_raw) if prop_started_at_raw else "")
         last_closed_at = fmt_nairobi(active_prop.get("last_closed_at")) if active_prop.get("last_closed_at") else ""
         active_phase_name = str(active_prop.get("phase", "Phase 1 Challenge"))
-        active_target_label = "+$1,000" if int(active_prop.get("phase_number", 1) or 1) == 1 else "+$500"
+        active_phase_number = int(active_prop.get("phase_number", 1) or 1)
+        active_target_label = "+$1,000" if active_phase_number == 1 else "+$500"
+        phase1_passed_at = fmt_nairobi(active_prop.get("phase1_passed_at")) if active_prop.get("phase1_passed_at") else ""
+        current_phase_status = "Phase 2 active" if active_phase_number == 2 else "Phase 1 active"
+        current_phase_subtitle = "Phase 1 passed; verification is running" if active_phase_number == 2 else "Phase 1 target still in progress"
 
         funded_status = "ACTIVE" if phase2.get("status") == "PASSED" else "LOCKED"
         funded_note = "Eligible after Phase 2 is passed" if funded_status == "LOCKED" else "Funded account rules active: unlimited target, 5% daily loss, 10% max loss, up to 90% profit split."
@@ -5465,12 +5473,16 @@ def render_workflow(username: str, settings: dict) -> None:
         with c2: metric_card("ROI to target", f"{roi_pct:+.2f}%", f"Target {active_target_label}")
         with c3: metric_card("Worst day P/L", f"${worst_day_pnl:+,.2f}", f"Daily floor -${starting*0.05:,.0f}")
         with c4: metric_card("Trading days", f"{trading_days}", "Minimum 4 required")
-        with c5: metric_card("Challenge status", status, active_phase_name)
+        with c5: metric_card("Challenge status", current_phase_status, current_phase_subtitle)
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         i1, i2, i3, i4, i5 = st.columns(5)
         with i1: metric_card("Current phase started", challenge_started_at or "—", "Auto-replayed from Supabase")
-        with i2: metric_card("Passed on", pass_date or "—", "When target + min days were met")
+        with i2:
+            if active_phase_number == 2:
+                metric_card("Phase 1 passed at", phase1_passed_at or "—", "Phase 2 starts after this time")
+            else:
+                metric_card("Current phase passed at", "—", "Only shown after the active phase passes")
         with i3: metric_card("Last closed", last_closed_at or "—", "Most recent resolved A+/A trade")
         with i4: metric_card("Closed / Open", f"{closed_count} / {open_count}", "A+/A trades only")
         with i5: metric_card("Max drawdown", f"${max_drawdown_cash:,.2f}", f"{max_drawdown_pct:.2f}% from peak")
@@ -5484,7 +5496,7 @@ def render_workflow(username: str, settings: dict) -> None:
             st.caption("Fewer than 10 real closed A+/A trades exist, so this uses a conservative placeholder R-distribution until more trade history is available.")
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-        status_line = f"<b class='{status_color}'>{html.escape(status)}</b> · {html.escape(active_phase_name)} progress to {html.escape(active_target_label)} target: {progress_to_target*100:.0f}%"
+        status_line = f"<b>{html.escape(current_phase_status)}</b> · {html.escape(active_phase_name)} progress to {html.escape(active_target_label)} target: {progress_to_target*100:.0f}%"
         if fail_reason:
             status_line += f" · {html.escape(fail_reason)}"
             if breach_date:
@@ -5494,8 +5506,8 @@ def render_workflow(username: str, settings: dict) -> None:
 
         if status == "FAILED":
             st.error("This challenge failed because the selected timeframe/watchlist breached a prop-firm loss rule. The balance can still be above $10,000 and fail if one trading day loses more than $500.")
-        elif status == "PASSED":
-            st.success("This challenge has reached its 10% profit target with the minimum trading days satisfied.")
+        elif active_phase_number == 2:
+            st.success("Phase 1 has passed. The account is now in Phase 2 verification and will only archive as a full challenge pass after the +$500 Phase 2 target and minimum trading days are met.")
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         st.subheader("FTMO rule coverage")
