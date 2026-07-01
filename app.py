@@ -1396,10 +1396,10 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
     This is the source of truth for the dashboard: it ignores the old incremental
     prop_firm_state balance and reconstructs every pass/fail from Supabase trade
     history since account activation. Each new cycle starts from $10,000. Phase 1
-    needs +$1,000, Phase 2 needs +$500, and either phase fails on -$500 daily loss
-    or -$1,000 total loss. Phase targets end the phase immediately; the
-    dashboard does not keep accumulating the same phase after the target has
-    already been reached.
+    needs +$1,000 and at least 4 distinct trading days. Phase 2 needs +$500
+    and at least 4 distinct trading days. Either phase fails on -$500 daily loss
+    or -$1,000 total loss. A phase is not passed just because the target is hit;
+    it must still satisfy the minimum trading-day rule at the same time.
     """
     risk_cash = starting * 0.01
     daily_floor = -starting * 0.05
@@ -1459,7 +1459,12 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
         nonlocal phase, cycle_phase1_passed, cycle_start_ts, phase_start_ts, phase_start_idx, phase_balance, phase_daily, phase_days, phase_rows, phase1_pnl_bank, phase1_passed_at, cycle_trade_rows
         cycle_df = pd.DataFrame(cycle_trade_rows)
         win_rate = win_rate_from_resolved(cycle_df) if not cycle_df.empty else 0.0
-        realised = (phase1_pnl_bank if cycle_phase1_passed else 0.0) + (phase_balance - starting)
+        # Keep the archived table internally consistent: the displayed
+        # realised P/L is the difference between the displayed ending balance
+        # and the fixed $10,000 starting balance for the phase/account that
+        # closed the cycle. Phase 1 profit is not mixed into a Phase 2 ending
+        # balance because each FTMO phase starts from a fresh $10,000 account.
+        realised = phase_balance - starting
         histories.append({
             "status": status,
             "phase_1_passed": bool(cycle_phase1_passed or status == "PASSED"),
@@ -1509,9 +1514,11 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
         elif phase_daily.get(day, 0.0) <= daily_floor:
             terminal = "FAILED"
             reason = "5% max daily loss breached"
-        elif phase_balance >= targets[phase]:
+        elif phase_balance >= targets[phase] and len(phase_days) >= CHALLENGE_MIN_TRADING_DAYS:
             if phase == 1:
-                # Phase 1 passed. Phase 2 begins from a fresh $10,000 verification account.
+                # Phase 1 passed only after both requirements are true:
+                # +$1,000 target reached AND at least 4 distinct trading days.
+                # Phase 2 then begins from a fresh $10,000 verification account.
                 cycle_phase1_passed = True
                 phase1_pnl_bank = phase_balance - starting
                 phase1_passed_at = ts
@@ -1523,6 +1530,7 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
                 phase_start_ts = ts + pd.Timedelta(seconds=1)
                 phase_start_idx = i + 1
                 continue
+            # Phase 2 also requires +$500 AND at least 4 distinct trading days.
             terminal = "PASSED"
         if terminal:
             finish_history(terminal, ts, reason)
@@ -2559,10 +2567,10 @@ def aggrid_badge_renderers() -> dict:
             let bg = 'rgba(139,158,176,.16)';
             let color = '#A9BBC9';
 
-            if (v.includes('TP') || v.includes('WIN')) {
+            if (v.includes('PASSED') || v.includes('TP') || v.includes('WIN')) {
               bg = 'rgba(0,212,163,.18)';
               color = '#00D4A3';
-            } else if (v.includes('SL') || v.includes('LOSS')) {
+            } else if (v.includes('FAILED') || v.includes('SL') || v.includes('LOSS')) {
               bg = 'rgba(255,93,93,.18)';
               color = '#FF5D5D';
             } else if (v.includes('EXPIRED')) {
@@ -5464,7 +5472,12 @@ def render_workflow(username: str, settings: dict) -> None:
         active_target_label = "+$1,000" if active_phase_number == 1 else "+$500"
         phase1_passed_at = fmt_nairobi(active_prop.get("phase1_passed_at")) if active_prop.get("phase1_passed_at") else ""
         current_phase_status = "Phase 2 active" if active_phase_number == 2 else "Phase 1 active"
-        current_phase_subtitle = "Phase 1 passed; verification is running" if active_phase_number == 2 else "Phase 1 target still in progress"
+        if active_phase_number == 2:
+            current_phase_subtitle = "Phase 1 passed; Phase 2 target + 4 days required"
+        elif current >= targets[1]:
+            current_phase_subtitle = "Target reached; waiting for 4 trading days"
+        else:
+            current_phase_subtitle = "Phase 1 target + 4 days required"
 
         funded_status = "ACTIVE" if phase2.get("status") == "PASSED" else "LOCKED"
         funded_note = "Eligible after Phase 2 is passed" if funded_status == "LOCKED" else "Funded account rules active: unlimited target, 5% daily loss, 10% max loss, up to 90% profit split."
@@ -5661,15 +5674,26 @@ def render_workflow(username: str, settings: dict) -> None:
             history_view["Phase 2"] = history_view["phase_2_passed"].apply(lambda x: "PASSED" if bool(x) else "NOT PASSED")
             history_view["Started"] = history_view["started_at"].apply(fmt_nairobi)
             history_view["Finished"] = history_view["finished_at"].apply(fmt_nairobi)
-            history_view["Starting Balance"] = pd.to_numeric(history_view["starting_balance"], errors="coerce")
-            history_view["Ending Balance"] = pd.to_numeric(history_view["ending_balance"], errors="coerce")
-            history_view["Realised P/L"] = pd.to_numeric(history_view["realised_pnl"], errors="coerce")
+            def _fmt_usd(value, signed: bool = False) -> str:
+                try:
+                    if pd.isna(value):
+                        return "—"
+                    v = float(value)
+                    if not np.isfinite(v):
+                        return "—"
+                    return f"${v:+,.2f}" if signed else f"${v:,.2f}"
+                except Exception:
+                    return "—"
+
+            history_view["Starting Balance"] = pd.to_numeric(history_view["starting_balance"], errors="coerce").apply(_fmt_usd)
+            history_view["Ending Balance"] = pd.to_numeric(history_view["ending_balance"], errors="coerce").apply(_fmt_usd)
+            history_view["Realised P/L"] = pd.to_numeric(history_view["realised_pnl"], errors="coerce").apply(lambda x: _fmt_usd(x, signed=True))
             history_view["Win Rate %"] = pd.to_numeric(history_view["win_rate"], errors="coerce")
             history_view["Trading Days"] = pd.to_numeric(history_view["trading_days"], errors="coerce").fillna(0).astype(int)
             history_view["Failure Reason"] = history_view.get("failure_reason", "").fillna("").astype(str) if "failure_reason" in history_view.columns else ""
             display_cols = [
-                "Challenge", "Timeframe", "Result", "Failure Reason", "Finished",
-                "Starting Balance", "Ending Balance", "Realised P/L", "Win Rate %", "Trading Days", "Phase 1", "Phase 2", "Started",
+                "Challenge", "Timeframe", "Result", "Failure Reason", "Started", "Finished",
+                "Starting Balance", "Ending Balance", "Realised P/L", "Win Rate %", "Trading Days", "Phase 1", "Phase 2",
             ]
             render_benzino_aggrid(
                 history_view[[c for c in display_cols if c in history_view.columns]],
