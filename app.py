@@ -60,7 +60,7 @@ except Exception:  # pragma: no cover
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "v7.3-prop-firm-replay-fix"
+APP_VERSION = "v7.3-prop-history-phase-columns"
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "assets"
 LOGO_PATH = ASSETS_DIR / "benzino_logo.png"
@@ -1445,7 +1445,7 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
     }
 
     if prop_closed_all is None or prop_closed_all.empty:
-        return {"history": [], "active": empty_active, "active_curve": pd.DataFrame(), "active_daily": pd.DataFrame(), "all_trades": pd.DataFrame()}
+        return {"history": [], "active": empty_active, "active_curve": pd.DataFrame(), "active_daily": pd.DataFrame(), "all_daily": pd.DataFrame(), "all_trades": pd.DataFrame()}
 
     df = prop_closed_all.copy()
     df = numeric_cols(df, ["r_multiple", "entry", "sl", "tp", "rr"])
@@ -1458,12 +1458,13 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
     if pd.notna(act_ts):
         df = df[df["prop_event_time"] >= act_ts].copy().reset_index(drop=True)
     if df.empty:
-        return {"history": [], "active": empty_active, "active_curve": pd.DataFrame(), "active_daily": pd.DataFrame(), "all_trades": pd.DataFrame()}
+        return {"history": [], "active": empty_active, "active_curve": pd.DataFrame(), "active_daily": pd.DataFrame(), "all_daily": pd.DataFrame(), "all_trades": pd.DataFrame()}
 
     df["pnl_cash"] = pd.to_numeric(df["r_multiple"], errors="coerce").fillna(0.0) * risk_cash
 
     histories: list[dict] = []
     all_replay_rows: list[dict] = []
+    challenge_no = 1
 
     phase = 1
     cycle_start_ts = act_ts if pd.notna(act_ts) else df["prop_event_time"].iloc[0]
@@ -1517,9 +1518,10 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
     def _archive(status: str, finished_ts, failure_reason: str, terminal_balance: float, terminal_phase: int):
         nonlocal phase, cycle_start_ts, phase_start_ts, phase_balance, phase_rows, phase_days
         nonlocal phase_day_open, phase_day_min_equity, phase_day_pnl, cycle_rows
-        nonlocal phase1_passed_at, phase1_passed
+        nonlocal phase1_passed_at, phase1_passed, challenge_no
 
         histories.append({
+            "challenge_number": int(challenge_no),
             "status": str(status).upper(),
             "phase_1_passed": bool(phase1_passed or str(status).upper() == "PASSED"),
             "phase_2_passed": bool(str(status).upper() == "PASSED"),
@@ -1545,6 +1547,7 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
         phase_day_min_equity = {}
         phase_day_pnl = {}
         cycle_rows = []
+        challenge_no += 1
         cycle_start_ts = pd.Timestamp(finished_ts) + pd.Timedelta(seconds=1)
         phase_start_ts = cycle_start_ts
 
@@ -1569,6 +1572,7 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
         phase_days.add(day)
 
         row_dict = row.to_dict()
+        row_dict["challenge_number"] = int(challenge_no)
         row_dict["balance_after"] = float(phase_balance)
         row_dict["prop_day"] = day
         row_dict["challenge_phase"] = f"Phase {phase}"
@@ -1651,7 +1655,25 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
     }
 
     all_trades = pd.DataFrame(all_replay_rows)
-    return {"history": histories, "active": active, "active_curve": active_curve, "active_daily": active_daily, "all_trades": all_trades}
+    all_daily = pd.DataFrame()
+    if not all_trades.empty:
+        all_daily = all_trades.groupby(["challenge_number", "challenge_phase", "prop_day"]).agg(
+            **{
+                "Daily P/L": ("pnl_cash", "sum"),
+                "Trades": ("pnl_cash", "count"),
+                "Opening Balance": ("day_open_balance", "first"),
+                "Closing Balance": ("balance_after", "last"),
+                "Intraday Low": ("balance_after", "min"),
+                "Daily Loss Floor": ("daily_loss_floor", "first"),
+                "Phase Target": ("phase_target", "first"),
+            }
+        ).reset_index().rename(columns={"challenge_number": "Challenge", "challenge_phase": "Phase", "prop_day": "Day"})
+        all_daily["Challenge"] = all_daily["Challenge"].apply(lambda x: f"#{int(x)}" if pd.notna(x) else "—")
+        all_daily["Day Result"] = all_daily["Daily P/L"].apply(lambda x: "WIN" if float(x) > 0 else "LOSS" if float(x) < 0 else "BREAKEVEN")
+        all_daily["Daily Breach"] = all_daily.apply(lambda r: "YES" if float(r["Intraday Low"]) < float(r["Daily Loss Floor"]) else "NO", axis=1)
+        all_daily["Target Hit"] = all_daily.apply(lambda r: "YES" if float(r["Closing Balance"]) >= float(r["Phase Target"]) else "NO", axis=1)
+        all_daily = all_daily.sort_values(["Challenge", "Day", "Phase"], ascending=[False, False, True])
+    return {"history": histories, "active": active, "active_curve": active_curve, "active_daily": active_daily, "all_daily": all_daily, "all_trades": all_trades}
 
 def prop_firm_monte_carlo(trades_df: pd.DataFrame, state: dict, runs: int = 2000) -> dict:
     """
@@ -5527,7 +5549,9 @@ def render_workflow(username: str, settings: dict) -> None:
         active_prop = prop_sim.get("active", {})
         prop_curve = prop_sim.get("active_curve", pd.DataFrame())
         prop_all_replay = prop_sim.get("all_trades", pd.DataFrame())
-        day_summary = prop_sim.get("active_daily", pd.DataFrame())
+        day_summary = prop_sim.get("all_daily", pd.DataFrame())
+        if day_summary is None or day_summary.empty:
+            day_summary = prop_sim.get("active_daily", pd.DataFrame())
         current = float(active_prop.get("equity", starting) or starting)
         roi_pct = float(active_prop.get("roi_pct", 0.0) or 0.0)
         progress_to_target = float(active_prop.get("progress", 0.0) or 0.0)
@@ -5799,16 +5823,16 @@ def render_workflow(username: str, settings: dict) -> None:
                     st.plotly_chart(fig, use_container_width=True)
 
             if not day_summary.empty:
-                st.markdown("**Daily challenge ledger**")
+                st.markdown("**Daily challenge ledger · all simulated challenges**")
                 daily_view = day_summary.copy().sort_values("Day", ascending=False)
                 render_benzino_aggrid(
                     daily_view,
                     key="challenge_daily_loss_check",
                     height=300,
                     page_size=10,
-                    pinned=["Day"],
+                    pinned=["Challenge", "Phase", "Day"],
                     badge_cols={"Daily Breach":"status", "Target Hit":"status", "Day Result":"outcome"},
-                    numeric_cols_right=["Opening Balance", "Daily P/L", "Closing Balance", "Trades"],
+                    numeric_cols_right=["Opening Balance", "Daily P/L", "Closing Balance", "Intraday Low", "Daily Loss Floor", "Trades"],
                     enable_search=False,
                     show_status_filter=False,
                 )
@@ -5820,7 +5844,6 @@ def render_workflow(username: str, settings: dict) -> None:
             history_view = history_view.copy()
             history_view["Timeframe"] = challenge_tf
             history_view["Challenge"] = history_view["challenge_number"].apply(lambda x: f"#{int(x)}" if pd.notna(x) else "—")
-            history_view["Result"] = history_view["status"].astype(str).str.upper()
             def _phase1_label(row):
                 if bool(row.get("phase_1_passed", False)):
                     return "PASSED"
@@ -5855,16 +5878,16 @@ def render_workflow(username: str, settings: dict) -> None:
             history_view["Trading Days"] = pd.to_numeric(history_view["trading_days"], errors="coerce").fillna(0).astype(int)
             history_view["Failure Reason"] = history_view.get("failure_reason", "").fillna("").astype(str) if "failure_reason" in history_view.columns else ""
             display_cols = [
-                "Challenge", "Timeframe", "Result", "Failure Reason", "Started", "Finished",
-                "Starting Balance", "Ending Balance", "Realised P/L", "Win Rate %", "Trading Days", "Phase 1", "Phase 2",
+                "Challenge", "Timeframe", "Phase 1", "Phase 2", "Failure Reason", "Trading Days",
+                "Started", "Finished", "Starting Balance", "Ending Balance", "Realised P/L", "Win Rate %",
             ]
             render_benzino_aggrid(
                 history_view[[c for c in display_cols if c in history_view.columns]],
                 key=f"challenge_review_history_{challenge_tf}",
                 height=320,
                 page_size=10,
-                pinned=["Challenge", "Timeframe", "Result", "Failure Reason"],
-                badge_cols={"Result": "status", "Phase 1": "status", "Phase 2": "status"},
+                pinned=["Challenge", "Timeframe", "Phase 1", "Phase 2"],
+                badge_cols={"Phase 1": "status", "Phase 2": "status"},
                 numeric_cols_right=["Starting Balance", "Ending Balance", "Realised P/L", "Win Rate %", "Trading Days"],
                 enable_search=False,
                 show_status_filter=False,
