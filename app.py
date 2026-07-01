@@ -346,6 +346,22 @@ def init_tables() -> None:
         pnl_cash NUMERIC,
         closed_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS prop_challenge_history (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        scan_owner TEXT,
+        challenge_number INTEGER,
+        phase_1_passed BOOLEAN,
+        phase_2_passed BOOLEAN,
+        status TEXT,
+        starting_balance NUMERIC,
+        ending_balance NUMERIC,
+        realised_pnl NUMERIC,
+        win_rate NUMERIC,
+        trading_days INTEGER,
+        started_at TIMESTAMPTZ,
+        finished_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
     """
     conn = db_connect()
     try:
@@ -1219,6 +1235,106 @@ def load_prop_firm_trades(limit: int = 500) -> pd.DataFrame:
         return df
     return numeric_cols(df, ["r_multiple", "pnl_cash", "entry", "sl", "tp"])
 
+
+
+
+def prop_challenge_scan_owner(username: str, timeframe: str) -> str:
+    """Store prop challenge attempts per user and preferred timeframe."""
+    return f"{normalize_username(username)}:{str(timeframe or '1h').lower()}"
+
+
+def load_prop_challenge_history(username: str, timeframe: str, limit: int = 100) -> pd.DataFrame:
+    """Read completed prop-firm challenge attempts from Supabase."""
+    scope = prop_challenge_scan_owner(username, timeframe)
+    df = read_df(
+        """
+        SELECT challenge_number, status, phase_1_passed, phase_2_passed,
+               starting_balance, ending_balance, realised_pnl, win_rate,
+               trading_days, started_at, finished_at, created_at
+        FROM prop_challenge_history
+        WHERE scan_owner = %s
+        ORDER BY COALESCE(challenge_number, 0) DESC, created_at DESC
+        LIMIT %s
+        """,
+        (scope, limit),
+    )
+    return df
+
+
+def archive_prop_challenge_attempt(
+    username: str,
+    timeframe: str,
+    *,
+    status: str,
+    phase_1_passed: bool,
+    phase_2_passed: bool,
+    starting_balance: float,
+    ending_balance: float,
+    realised_pnl: float,
+    win_rate: float,
+    trading_days: int,
+    started_at: str,
+    finished_at: str,
+) -> bool:
+    """Persist a completed prop challenge once, then return True if inserted."""
+    scope = prop_challenge_scan_owner(username, timeframe)
+    status = str(status or "").upper()
+    finished_ts = pd.to_datetime(finished_at, errors="coerce", utc=True)
+    started_ts = pd.to_datetime(started_at, errors="coerce", utc=True)
+    if pd.isna(finished_ts):
+        finished_ts = pd.Timestamp.now(tz="UTC")
+    if pd.isna(started_ts):
+        started_ts = finished_ts
+
+    existing = read_df(
+        """
+        SELECT id
+        FROM prop_challenge_history
+        WHERE scan_owner = %s
+          AND status = %s
+          AND finished_at = %s
+        LIMIT 1
+        """,
+        (scope, status, finished_ts.isoformat()),
+    )
+    if not existing.empty:
+        return False
+
+    seq = read_df(
+        "SELECT COALESCE(MAX(challenge_number), 0) + 1 AS next_number FROM prop_challenge_history WHERE scan_owner = %s",
+        (scope,),
+    )
+    challenge_number = 1
+    if not seq.empty:
+        try:
+            challenge_number = int(seq.iloc[0].get("next_number") or 1)
+        except Exception:
+            challenge_number = 1
+
+    execute(
+        """
+        INSERT INTO prop_challenge_history(
+            scan_owner, challenge_number, phase_1_passed, phase_2_passed, status,
+            starting_balance, ending_balance, realised_pnl, win_rate, trading_days,
+            started_at, finished_at
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """,
+        (
+            scope,
+            challenge_number,
+            bool(phase_1_passed),
+            bool(phase_2_passed),
+            status,
+            float(starting_balance),
+            float(ending_balance),
+            float(realised_pnl),
+            float(win_rate),
+            int(trading_days or 0),
+            started_ts.isoformat(),
+            finished_ts.isoformat(),
+        ),
+    )
+    return True
 
 def prop_firm_monte_carlo(trades_df: pd.DataFrame, state: dict, runs: int = 2000) -> dict:
     """
@@ -4684,12 +4800,6 @@ def render_workflow(username: str, settings: dict) -> None:
         prop_start_map = settings.get("prop_challenge_started_at_by_tf", {})
         if not isinstance(prop_start_map, dict):
             prop_start_map = {}
-        prop_history_map = settings.get("prop_challenge_history_by_tf", {})
-        if not isinstance(prop_history_map, dict):
-            prop_history_map = {}
-        prop_history = prop_history_map.get(challenge_tf, [])
-        if not isinstance(prop_history, list):
-            prop_history = []
         prop_started_at_raw = str(prop_start_map.get(challenge_tf, "") or settings.get("tracking_started_at", "") or "")
 
         st.caption(
@@ -4949,30 +5059,31 @@ def render_workflow(username: str, settings: dict) -> None:
             except Exception:
                 completed_at_raw = ""
 
-            attempt_id = f"{challenge_tf}|{terminal_result}|{completed_at_raw or terminal_phase.get('pass_date') or terminal_phase.get('breach_date')}"
-            existing_ids = {str(item.get("Attempt ID", "")) for item in prop_history if isinstance(item, dict)}
-            if attempt_id not in existing_ids:
-                prop_history.append({
-                    "Attempt ID": attempt_id,
-                    "Timeframe": challenge_tf,
-                    "Result": terminal_result,
-                    "Failed Phase": terminal_phase.get("phase", "") if terminal_result == "FAILED" else "",
-                    "Completed Phase": terminal_phase.get("phase", ""),
-                    "Started": terminal_phase.get("start_date", challenge_started_at),
-                    "Completed At": fmt_nairobi(completed_at_raw) if completed_at_raw else (terminal_phase.get("pass_date", "") or terminal_phase.get("breach_date", "")),
-                    "Reason": terminal_phase.get("breach_reason", "") if terminal_result == "FAILED" else "Phase 2 target completed",
-                    "Equity": f"${float(terminal_phase.get('equity', starting) or starting):,.2f}",
-                    "P/L": f"${float(terminal_phase.get('pnl', 0.0) or 0.0):+,.2f}",
-                    "ROI %": f"{float(terminal_phase.get('roi_pct', 0.0) or 0.0):+.2f}%",
-                    "Trading Days": int(terminal_phase.get("trading_days", 0) or 0),
-                    "Closed Trades": int(terminal_phase.get("closed_trades", 0) or 0),
-                    "Best Day": f"${float(terminal_phase.get('best_day', 0.0) or 0.0):+,.2f}",
-                    "Worst Day": f"${float(terminal_phase.get('worst_day', 0.0) or 0.0):+,.2f}",
-                    "Max Drawdown": f"${float(terminal_phase.get('max_drawdown_cash', 0.0) or 0.0):,.2f}",
-                })
-                prop_history_map[challenge_tf] = prop_history[-50:]
+            finished_raw = completed_at_raw or restart_at_raw
+            completed_slice = pd.DataFrame()
+            try:
+                if terminal_pos is not None and prop_curve is not None and not prop_curve.empty:
+                    completed_slice = prop_curve.iloc[: int(terminal_pos) + 1].copy()
+            except Exception:
+                completed_slice = pd.DataFrame()
+            completed_win_rate = win_rate_from_resolved(completed_slice) if completed_slice is not None and not completed_slice.empty else 0.0
+
+            inserted = archive_prop_challenge_attempt(
+                username,
+                challenge_tf,
+                status=terminal_result,
+                phase_1_passed=str(phase1.get("status", "")).upper() == "PASSED",
+                phase_2_passed=str(phase2.get("status", "")).upper() == "PASSED",
+                starting_balance=starting,
+                ending_balance=float(terminal_phase.get("equity", starting) or starting),
+                realised_pnl=float(terminal_phase.get("pnl", 0.0) or 0.0),
+                win_rate=completed_win_rate,
+                trading_days=int(terminal_phase.get("trading_days", 0) or 0),
+                started_at=prop_started_at_raw or datetime.now(timezone.utc).isoformat(),
+                finished_at=finished_raw,
+            )
+            if inserted:
                 prop_start_map[challenge_tf] = restart_at_raw
-                settings["prop_challenge_history_by_tf"] = prop_history_map
                 settings["prop_challenge_started_at_by_tf"] = prop_start_map
                 save_settings(username, settings)
                 st.rerun()
@@ -5157,20 +5268,34 @@ def render_workflow(username: str, settings: dict) -> None:
                 )
 
 
-        history_rows = [item for item in prop_history if isinstance(item, dict)]
         st.markdown("**Challenge review history**")
-        if history_rows:
-            history_view = pd.DataFrame(history_rows).drop(columns=["Attempt ID"], errors="ignore")
-            if "Completed At" in history_view.columns:
-                history_view = history_view.sort_values("Completed At", ascending=False)
+        history_view = load_prop_challenge_history(username, challenge_tf, limit=100)
+        if not history_view.empty:
+            history_view = history_view.copy()
+            history_view["Timeframe"] = challenge_tf
+            history_view["Challenge"] = history_view["challenge_number"].apply(lambda x: f"#{int(x)}" if pd.notna(x) else "—")
+            history_view["Result"] = history_view["status"].astype(str).str.upper()
+            history_view["Phase 1"] = history_view["phase_1_passed"].apply(lambda x: "PASSED" if bool(x) else "NOT PASSED")
+            history_view["Phase 2"] = history_view["phase_2_passed"].apply(lambda x: "PASSED" if bool(x) else "NOT PASSED")
+            history_view["Started"] = history_view["started_at"].apply(fmt_nairobi)
+            history_view["Finished"] = history_view["finished_at"].apply(fmt_nairobi)
+            history_view["Starting Balance"] = pd.to_numeric(history_view["starting_balance"], errors="coerce")
+            history_view["Ending Balance"] = pd.to_numeric(history_view["ending_balance"], errors="coerce")
+            history_view["Realised P/L"] = pd.to_numeric(history_view["realised_pnl"], errors="coerce")
+            history_view["Win Rate %"] = pd.to_numeric(history_view["win_rate"], errors="coerce")
+            history_view["Trading Days"] = pd.to_numeric(history_view["trading_days"], errors="coerce").fillna(0).astype(int)
+            display_cols = [
+                "Challenge", "Timeframe", "Result", "Phase 1", "Phase 2", "Started", "Finished",
+                "Starting Balance", "Ending Balance", "Realised P/L", "Win Rate %", "Trading Days",
+            ]
             render_benzino_aggrid(
-                history_view,
+                history_view[[c for c in display_cols if c in history_view.columns]],
                 key=f"challenge_review_history_{challenge_tf}",
                 height=320,
                 page_size=10,
-                pinned=["Timeframe", "Result"],
-                badge_cols={"Result": "status"},
-                numeric_cols_right=["Trading Days", "Closed Trades"],
+                pinned=["Challenge", "Timeframe", "Result"],
+                badge_cols={"Result": "status", "Phase 1": "status", "Phase 2": "status"},
+                numeric_cols_right=["Starting Balance", "Ending Balance", "Realised P/L", "Win Rate %", "Trading Days"],
                 enable_search=False,
                 show_status_filter=False,
             )
