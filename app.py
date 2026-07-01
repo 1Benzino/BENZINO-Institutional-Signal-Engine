@@ -4678,28 +4678,26 @@ def render_workflow(username: str, settings: dict) -> None:
         max_loss_floor = starting * 0.90
         target_balance = starting * 1.10
 
-        # Allow each user to restart the visible prop challenge without deleting history.
-        # Restarting stores a per-timeframe start timestamp and the Prop Firm tab
-        # ignores older A+/A rows for this view only.
+        # Each user's visible prop challenge is now self-resetting.
+        # The start timestamp is stored per timeframe, and completed attempts are
+        # saved to settings so the user can review passed/failed challenges later.
         prop_start_map = settings.get("prop_challenge_started_at_by_tf", {})
         if not isinstance(prop_start_map, dict):
             prop_start_map = {}
+        prop_history_map = settings.get("prop_challenge_history_by_tf", {})
+        if not isinstance(prop_history_map, dict):
+            prop_history_map = {}
+        prop_history = prop_history_map.get(challenge_tf, [])
+        if not isinstance(prop_history, list):
+            prop_history = []
         prop_started_at_raw = str(prop_start_map.get(challenge_tf, "") or settings.get("tracking_started_at", "") or "")
 
-        prop_header_left, prop_header_right = st.columns([0.78, 0.22], vertical_alignment="center")
-        with prop_header_left:
-            st.caption(
-                f"This tab recalculates the FTMO-style challenge from your current watchlist and selected timeframe "
-                f"({challenge_tf}). It uses only A+/A closed trades, fixed $10,000 account size, 1% risk per trade, "
-                f"10% profit target, 5% max daily loss, 10% max total loss, and minimum 4 trading days."
-            )
-        with prop_header_right:
-            if st.button("Restart challenge", key=f"restart_prop_challenge_{challenge_tf}", width="stretch"):
-                prop_start_map[challenge_tf] = datetime.now(timezone.utc).isoformat()
-                settings["prop_challenge_started_at_by_tf"] = prop_start_map
-                save_settings(username, settings)
-                st.success(f"{challenge_tf} prop challenge restarted.")
-                st.rerun()
+        st.caption(
+            f"This tab recalculates the FTMO-style challenge from your current watchlist and selected timeframe "
+            f"({challenge_tf}). It uses only A+/A closed trades, fixed $10,000 account size, 1% risk per trade, "
+            f"10% profit target, 5% max daily loss, 10% max total loss, and minimum 4 trading days. "
+            "When a challenge passes Phase 2 or fails a rule, it is archived below and the next challenge starts automatically."
+        )
 
         prop_source = trades[
             trades.get("grade", pd.Series(dtype=str)).astype(str).isin(["A+", "A"])
@@ -4924,6 +4922,61 @@ def render_workflow(username: str, settings: dict) -> None:
                 phase2["start_date"] = "Waiting for next eligible trade"
         else:
             phase2 = {"phase": "Phase 2 Verification", "status": "LOCKED", "start_date": "After Phase 1 passes", "pass_date": "", "breach_date": "", "breach_reason": "", "progress": 0.0, "equity": starting, "pnl": 0.0, "roi_pct": 0.0, "trading_days": 0, "closed_trades": 0, "best_day": 0.0, "worst_day": 0.0, "max_drawdown_cash": 0.0, "max_drawdown_pct": 0.0, "daily_ledger": pd.DataFrame()}
+        terminal_phase = None
+        terminal_result = ""
+        if str(phase1.get("status", "")).upper() == "FAILED":
+            terminal_phase = phase1
+            terminal_result = "FAILED"
+        elif str(phase2.get("status", "")).upper() == "FAILED":
+            terminal_phase = phase2
+            terminal_result = "FAILED"
+        elif str(phase2.get("status", "")).upper() == "PASSED":
+            terminal_phase = phase2
+            terminal_result = "PASSED"
+
+        if terminal_phase is not None and terminal_result:
+            terminal_pos = terminal_phase.get("end_pos")
+            completed_at_raw = ""
+            restart_at_raw = datetime.now(timezone.utc).isoformat()
+            try:
+                if terminal_pos is not None and prop_curve is not None and not prop_curve.empty:
+                    terminal_pos = int(terminal_pos)
+                    if 0 <= terminal_pos < len(prop_curve):
+                        terminal_ts = pd.to_datetime(prop_curve.iloc[terminal_pos]["prop_event_time"], errors="coerce", utc=True)
+                        if pd.notna(terminal_ts):
+                            completed_at_raw = terminal_ts.isoformat()
+                            restart_at_raw = (terminal_ts + pd.Timedelta(seconds=1)).isoformat()
+            except Exception:
+                completed_at_raw = ""
+
+            attempt_id = f"{challenge_tf}|{terminal_result}|{completed_at_raw or terminal_phase.get('pass_date') or terminal_phase.get('breach_date')}"
+            existing_ids = {str(item.get("Attempt ID", "")) for item in prop_history if isinstance(item, dict)}
+            if attempt_id not in existing_ids:
+                prop_history.append({
+                    "Attempt ID": attempt_id,
+                    "Timeframe": challenge_tf,
+                    "Result": terminal_result,
+                    "Failed Phase": terminal_phase.get("phase", "") if terminal_result == "FAILED" else "",
+                    "Completed Phase": terminal_phase.get("phase", ""),
+                    "Started": terminal_phase.get("start_date", challenge_started_at),
+                    "Completed At": fmt_nairobi(completed_at_raw) if completed_at_raw else (terminal_phase.get("pass_date", "") or terminal_phase.get("breach_date", "")),
+                    "Reason": terminal_phase.get("breach_reason", "") if terminal_result == "FAILED" else "Phase 2 target completed",
+                    "Equity": f"${float(terminal_phase.get('equity', starting) or starting):,.2f}",
+                    "P/L": f"${float(terminal_phase.get('pnl', 0.0) or 0.0):+,.2f}",
+                    "ROI %": f"{float(terminal_phase.get('roi_pct', 0.0) or 0.0):+.2f}%",
+                    "Trading Days": int(terminal_phase.get("trading_days", 0) or 0),
+                    "Closed Trades": int(terminal_phase.get("closed_trades", 0) or 0),
+                    "Best Day": f"${float(terminal_phase.get('best_day', 0.0) or 0.0):+,.2f}",
+                    "Worst Day": f"${float(terminal_phase.get('worst_day', 0.0) or 0.0):+,.2f}",
+                    "Max Drawdown": f"${float(terminal_phase.get('max_drawdown_cash', 0.0) or 0.0):,.2f}",
+                })
+                prop_history_map[challenge_tf] = prop_history[-50:]
+                prop_start_map[challenge_tf] = restart_at_raw
+                settings["prop_challenge_history_by_tf"] = prop_history_map
+                settings["prop_challenge_started_at_by_tf"] = prop_start_map
+                save_settings(username, settings)
+                st.rerun()
+
         funded_status = "ACTIVE" if phase2.get("status") == "PASSED" else "LOCKED"
         funded_note = "Eligible after Phase 2 is passed" if funded_status == "LOCKED" else "Funded account rules active: unlimited target, 5% daily loss, 10% max loss, up to 90% profit split."
         status_color = "green" if status == "PASSED" else "red" if status == "FAILED" else ""
@@ -5099,6 +5152,24 @@ def render_workflow(username: str, settings: dict) -> None:
                     pinned=["Day"],
                     badge_cols={"Daily Breach":"status", "Target Hit":"status", "Day Result":"outcome"},
                     numeric_cols_right=["Opening Balance", "Daily P/L", "Closing Balance", "Trades"],
+                    enable_search=False,
+                    show_status_filter=False,
+                )
+
+            history_rows = [item for item in prop_history if isinstance(item, dict)]
+            if history_rows:
+                st.markdown("**Challenge review history**")
+                history_view = pd.DataFrame(history_rows).drop(columns=["Attempt ID"], errors="ignore")
+                if "Completed At" in history_view.columns:
+                    history_view = history_view.sort_values("Completed At", ascending=False)
+                render_benzino_aggrid(
+                    history_view,
+                    key=f"challenge_review_history_{challenge_tf}",
+                    height=320,
+                    page_size=10,
+                    pinned=["Timeframe", "Result"],
+                    badge_cols={"Result": "status"},
+                    numeric_cols_right=["Trading Days", "Closed Trades"],
                     enable_search=False,
                     show_status_filter=False,
                 )
