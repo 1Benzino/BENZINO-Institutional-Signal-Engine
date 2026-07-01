@@ -5481,13 +5481,13 @@ def render_workflow(username: str, settings: dict) -> None:
         current_phase_status = "Phase 2 active" if active_phase_number == 2 else "Phase 1 active"
         if active_phase_number == 2:
             current_phase_subtitle = "Phase 1 passed; Phase 2 target + 4 days required"
-        elif current >= targets[1]:
-            current_phase_subtitle = "Target reached; waiting for 4 trading days"
+        elif current >= (starting + 1000.0):
+            current_phase_subtitle = "Phase 1 target reached; waiting for 4 trading days"
         else:
             current_phase_subtitle = "Phase 1 target + 4 days required"
 
-        funded_status = "ACTIVE" if phase2.get("status") == "PASSED" else "LOCKED"
-        funded_note = "Eligible after Phase 2 is passed" if funded_status == "LOCKED" else "Funded account rules active: unlimited target, 5% daily loss, 10% max loss, up to 90% profit split."
+        funded_status = "LOCKED"
+        funded_note = "Eligible after Phase 2 is passed"
         status_color = "green" if status == "PASSED" else "red" if status == "FAILED" else ""
         mc = prop_firm_monte_carlo(prop_curve, {"starting_balance": starting, "current_equity": current}, runs=2000)
         c1, c2, c3, c4, c5 = st.columns(5)
