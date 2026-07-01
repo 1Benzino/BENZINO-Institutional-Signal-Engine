@@ -60,7 +60,7 @@ except Exception:  # pragma: no cover
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "v7.3-no-trade-shadow-curve"
+APP_VERSION = "v7.3-no-trade-full-shadow-curve"
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "assets"
 LOGO_PATH = ASSETS_DIR / "benzino_logo.png"
@@ -6010,12 +6010,15 @@ def render_workflow(username: str, settings: dict) -> None:
         st.caption("All signals the scanner blocked from being journaled as real trades. Includes two types: (1) directional ideas (BUY/SELL) where the grade was too weak or R:R too thin — these are hypothetically tracked against TP/SL/expiry to see if they'd have worked. (2) HOLD rows where the systems genuinely split with no directional consensus — these have no hypothetical outcome since there's no entry thesis, but they're recorded so you can see how often the scanner truly sees no edge.")
         no_trades_directional = no_trades[no_trades["signal"].astype(str).str.upper().isin(["BUY", "SELL"])].copy() if not no_trades.empty else pd.DataFrame()
         no_trades_hold = no_trades[no_trades["signal"].astype(str).str.upper().eq("HOLD")].copy() if not no_trades.empty else pd.DataFrame()
+        # Count every resolved shadow row, including legacy HOLD rows that the
+        # updated scanner backfills into a research-only BUY/SELL plan. This is
+        # the full No Trade research ledger, not just brand-new directional rows.
         no_trades_resolved = (
-            no_trades_directional[
-                no_trades_directional["shadow_outcome"].notna()
-                & no_trades_directional["shadow_outcome"].astype(str).str.strip().ne("")
+            no_trades[
+                no_trades["shadow_outcome"].notna()
+                & no_trades["shadow_outcome"].astype(str).str.strip().ne("")
             ].copy()
-            if "shadow_outcome" in no_trades_directional.columns and not no_trades_directional.empty
+            if "shadow_outcome" in no_trades.columns and not no_trades.empty
             else pd.DataFrame()
         )
         # No Trade research dashboard: simulate a separate account that takes
@@ -6083,7 +6086,7 @@ def render_workflow(username: str, settings: dict) -> None:
                 unsafe_allow_html=True,
             )
         else:
-            st.info("No resolved No Trade shadow outcomes yet. After the scanner runs with the updated shadow-tracking logic, this curve will populate from Supabase automatically.")
+            st.info("No resolved No Trade shadow outcomes yet. The updated scanner will now backfill and resolve the historical SHADOW / NO TRADE rows from Supabase, including legacy HOLD rows that previously had Entry = SL = TP.")
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         no_trade_cols = ["created_at_eat", "asset", "timeframe", "signal", "grade", "status", "entry", "sl", "tp", "rr", "confidence", "edge_score", "shadow_outcome", "shadow_r_multiple", "shadow_exit_price", "reason", "session"]

@@ -935,7 +935,7 @@ def fetch_open_trades(assets: set[str] | None = None, timeframes: set[str] | Non
 
 
 def fetch_unresolved_shadow_trades(assets: set[str] | None = None, timeframes: set[str] | None = None,
-                                   max_age_days: int = 14) -> list[dict]:
+                                   max_age_days: int = 3650) -> list[dict]:
     """
     NO TRADE signals are never alerted and never touch the prop ledger, but they
     ARE still worth tracking hypothetically: "if a trader had taken this blocked
@@ -958,7 +958,7 @@ def fetch_unresolved_shadow_trades(assets: set[str] | None = None, timeframes: s
             if timeframes:
                 sql += " AND timeframe = ANY(%s)"
                 params.append(list(timeframes))
-            sql += " ORDER BY created_at ASC LIMIT 500"
+            sql += " ORDER BY created_at ASC LIMIT 10000"
             cur.execute(sql, tuple(params))
             rows = [dict(r) for r in cur.fetchall()]
         conn.close()
@@ -2179,13 +2179,14 @@ def evaluate_open_trades(assets: set[str] | None = None, timeframes: set[str] | 
             bump_bars_open(signal_id, bars_open)
 
 
-def backfill_shadow_trade_plans(assets: set[str] | None = None, timeframes: set[str] | None = None, max_age_days: int = 60) -> int:
-    """Repair legacy NO TRADE rows that were saved with Entry = SL = TP.
+def backfill_shadow_trade_plans(assets: set[str] | None = None, timeframes: set[str] | None = None, max_age_days: int = 3650) -> int:
+    """Repair every legacy SHADOW / NO TRADE row that lacks a usable plan.
 
-    Older builds stored split/HOLD rows without a usable hypothetical trade
-    plan, so the app could not evaluate them. This backfills a research-only
-    BUY/SELL direction and 1:2 ATR-based plan using the row's saved entry/ATR.
-    The row stays SHADOW and remains excluded from real journal/prop metrics.
+    Older builds stored split/HOLD rows as Entry = SL = TP, which meant there
+    was no hypothetical trade to resolve. For research, every shadow row is now
+    given a deterministic BUY/SELL test direction and the same ATR 1:2 plan as
+    the real scanner. The row remains SHADOW forever and is excluded from real
+    journal, alerts, and prop-firm metrics.
     """
     try:
         conn = db_connect()
@@ -2209,7 +2210,7 @@ def backfill_shadow_trade_plans(assets: set[str] | None = None, timeframes: set[
             if timeframes:
                 sql += " AND timeframe = ANY(%s)"
                 params.append(list(timeframes))
-            sql += " ORDER BY created_at ASC LIMIT 1000"
+            sql += " ORDER BY created_at ASC LIMIT 10000"
             cur.execute(sql, tuple(params))
             rows = [dict(r) for r in cur.fetchall()]
         conn.close()
@@ -2222,8 +2223,14 @@ def backfill_shadow_trade_plans(assets: set[str] | None = None, timeframes: set[
         try:
             entry = safe_number(row.get("entry"), 0.0)
             atr = safe_number(row.get("atr"), 0.0)
-            if entry <= 0 or atr <= 0:
+            if entry <= 0:
                 continue
+            # Prefer stored ATR, which is how live scanner plans are built.
+            # For very old rows where ATR was not saved, use a small deterministic
+            # fallback so the legacy shadow research stream can still be tested
+            # instead of being permanently invisible in the No Trade Tracker.
+            if atr <= 0:
+                atr = max(abs(entry) * 0.0025, 1e-8)
             votes = row.get("strategy_votes") or {}
             if isinstance(votes, str):
                 try:
@@ -2281,8 +2288,10 @@ def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] 
         signal, entry, sl, tp = str(t["signal"]).upper(), float(t["entry"]), float(t["sl"]), float(t["tp"])
         signal_id = t["signal_id"]
 
-        if abs(entry - sl) <= 0 or sl == tp:
-            continue  # no usable hypothetical trade plan was ever built for this row
+        if signal not in ("BUY", "SELL") or abs(entry - sl) <= 0 or sl == tp:
+            # A very old row may still have missed the backfill step because it
+            # had unusual data. Skip safely; it will remain visible as unresolved.
+            continue
 
         df = get_timeframe_df(ticker, timeframe)
         if df is None:
