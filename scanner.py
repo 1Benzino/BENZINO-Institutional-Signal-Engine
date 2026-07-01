@@ -647,6 +647,27 @@ def init_tables() -> None:
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_exit_price NUMERIC")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_closed_at TIMESTAMPTZ")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS display_id TEXT")
+                # Dashboard uses this table when replaying simulated FTMO challenge cycles.
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS prop_challenge_history (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        scan_owner TEXT,
+                        challenge_number INTEGER,
+                        phase_1_passed BOOLEAN,
+                        phase_2_passed BOOLEAN,
+                        status TEXT,
+                        starting_balance NUMERIC,
+                        ending_balance NUMERIC,
+                        realised_pnl NUMERIC,
+                        win_rate NUMERIC,
+                        trading_days INTEGER,
+                        started_at TIMESTAMPTZ,
+                        finished_at TIMESTAMPTZ,
+                        failure_reason TEXT,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+                cur.execute("ALTER TABLE prop_challenge_history ADD COLUMN IF NOT EXISTS failure_reason TEXT")
                 cur.execute("ALTER TABLE user_telegram_settings ADD COLUMN IF NOT EXISTS alerts_enabled BOOLEAN DEFAULT FALSE")
                 cur.execute("ALTER TABLE user_telegram_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()")
                 cur.execute("ALTER TABLE scanner_runtime_log ADD COLUMN IF NOT EXISTS open_trades INTEGER DEFAULT 0")

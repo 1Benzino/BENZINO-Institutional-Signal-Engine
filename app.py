@@ -60,7 +60,7 @@ except Exception:  # pragma: no cover
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "v7.2-full-ui-cleanup"
+APP_VERSION = "v7.3-prop-firm-replay-fix"
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "assets"
 LOGO_PATH = ASSETS_DIR / "benzino_logo.png"
@@ -360,6 +360,7 @@ def init_tables() -> None:
         trading_days INTEGER,
         started_at TIMESTAMPTZ,
         finished_at TIMESTAMPTZ,
+        failure_reason TEXT,
         created_at TIMESTAMPTZ DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS explain_ai_lessons (
@@ -407,6 +408,7 @@ def init_tables() -> None:
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_outcome TEXT")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS trade_notes TEXT")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS display_id TEXT")
+                cur.execute("ALTER TABLE prop_challenge_history ADD COLUMN IF NOT EXISTS failure_reason TEXT")
                 # Migration/fix: Telegram delivery must never control journal status.
                 # A+/A/B/C BUY/SELL setups are active journal trades; NO TRADE/HOLD stays SHADOW.
                 cur.execute(
@@ -1261,7 +1263,7 @@ def load_prop_challenge_history(username: str, timeframe: str, limit: int = 100)
         """
         SELECT challenge_number, status, phase_1_passed, phase_2_passed,
                starting_balance, ending_balance, realised_pnl, win_rate,
-               trading_days, started_at, finished_at, created_at
+               trading_days, started_at, finished_at, failure_reason, created_at
         FROM prop_challenge_history
         WHERE scan_owner = %s
         ORDER BY COALESCE(challenge_number, 0) DESC, created_at DESC
@@ -1286,6 +1288,7 @@ def archive_prop_challenge_attempt(
     trading_days: int,
     started_at: str,
     finished_at: str,
+    failure_reason: str = "",
 ) -> bool:
     """Persist a completed prop challenge once, then return True if inserted."""
     scope = prop_challenge_scan_owner(username, timeframe)
@@ -1327,8 +1330,8 @@ def archive_prop_challenge_attempt(
         INSERT INTO prop_challenge_history(
             scan_owner, challenge_number, phase_1_passed, phase_2_passed, status,
             starting_balance, ending_balance, realised_pnl, win_rate, trading_days,
-            started_at, finished_at
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            started_at, finished_at, failure_reason
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """,
         (
             scope,
@@ -1343,9 +1346,223 @@ def archive_prop_challenge_attempt(
             int(trading_days or 0),
             started_ts.isoformat(),
             finished_ts.isoformat(),
+            str(failure_reason or ""),
         ),
     )
+
     return True
+
+
+def rebuild_prop_challenge_history_from_trades(username: str, timeframe: str, histories: list[dict]) -> None:
+    """Replace this user's simulated prop-firm history for the timeframe with a clean replay."""
+    scope = prop_challenge_scan_owner(username, timeframe)
+    try:
+        execute("DELETE FROM prop_challenge_history WHERE scan_owner = %s", (scope,))
+    except Exception:
+        return
+    for idx, h in enumerate(histories, start=1):
+        try:
+            execute(
+                """
+                INSERT INTO prop_challenge_history(
+                    scan_owner, challenge_number, phase_1_passed, phase_2_passed, status,
+                    starting_balance, ending_balance, realised_pnl, win_rate, trading_days,
+                    started_at, finished_at, failure_reason
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    scope,
+                    idx,
+                    bool(h.get("phase_1_passed", False)),
+                    bool(h.get("phase_2_passed", False)),
+                    str(h.get("status", "")).upper(),
+                    float(h.get("starting_balance", 10000.0)),
+                    float(h.get("ending_balance", 10000.0)),
+                    float(h.get("realised_pnl", 0.0)),
+                    float(h.get("win_rate", 0.0)),
+                    int(h.get("trading_days", 0) or 0),
+                    pd.to_datetime(h.get("started_at"), errors="coerce", utc=True).isoformat(),
+                    pd.to_datetime(h.get("finished_at"), errors="coerce", utc=True).isoformat(),
+                    str(h.get("failure_reason", "") or ""),
+                ),
+            )
+        except Exception:
+            continue
+
+
+def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: str = "", starting: float = 10000.0) -> dict:
+    """Replay all scoped A+/A closed trades into Phase 1 -> Phase 2 challenge cycles.
+
+    This is the source of truth for the dashboard: it ignores the old incremental
+    prop_firm_state balance and reconstructs every pass/fail from Supabase trade
+    history since account activation. Each new cycle starts from $10,000. Phase 1
+    needs +$1,000, Phase 2 needs +$500, and either phase fails on -$500 daily loss
+    or -$1,000 total loss.
+    """
+    risk_cash = starting * 0.01
+    daily_floor = -starting * 0.05
+    max_loss_floor = starting * 0.90
+    targets = {1: starting * 1.10, 2: starting * 1.05}
+    empty_active = {
+        "phase": "Phase 1 Challenge",
+        "phase_number": 1,
+        "status": "ACTIVE",
+        "start_at": pd.to_datetime(activated_at, errors="coerce", utc=True),
+        "equity": starting,
+        "pnl": 0.0,
+        "roi_pct": 0.0,
+        "progress": 0.0,
+        "trading_days": 0,
+        "closed_count": 0,
+        "open_count": 0,
+        "worst_day_pnl": 0.0,
+        "best_day_pnl": 0.0,
+        "last_closed_at": "",
+        "max_drawdown_cash": 0.0,
+        "max_drawdown_pct": 0.0,
+        "fail_reason": "",
+        "pass_date": "",
+    }
+    if prop_closed_all is None or prop_closed_all.empty:
+        return {"history": [], "active": empty_active, "active_curve": pd.DataFrame(), "active_daily": pd.DataFrame()}
+
+    df = prop_closed_all.copy()
+    df = numeric_cols(df, ["r_multiple", "entry", "sl", "tp", "rr"])
+    event_time = pd.to_datetime(df.get("exit_at", pd.Series(pd.NaT, index=df.index)), errors="coerce", utc=True)
+    created_time = pd.to_datetime(df.get("created_at", pd.Series(pd.NaT, index=df.index)), errors="coerce", utc=True)
+    df["prop_event_time"] = event_time.fillna(created_time)
+    df = df.dropna(subset=["prop_event_time"]).sort_values("prop_event_time").reset_index(drop=True)
+    act_ts = pd.to_datetime(activated_at, errors="coerce", utc=True)
+    if pd.notna(act_ts):
+        df = df[df["prop_event_time"] >= act_ts].copy().reset_index(drop=True)
+    if df.empty:
+        return {"history": [], "active": empty_active, "active_curve": pd.DataFrame(), "active_daily": pd.DataFrame()}
+    df["pnl_cash"] = pd.to_numeric(df["r_multiple"], errors="coerce").fillna(0.0) * risk_cash
+
+    histories: list[dict] = []
+    phase = 1
+    cycle_phase1_passed = False
+    cycle_start_ts = act_ts if pd.notna(act_ts) else df["prop_event_time"].iloc[0]
+    phase_start_ts = cycle_start_ts
+    phase_start_idx = 0
+    phase_balance = starting
+    phase_daily: dict = {}
+    phase_days: set = set()
+    phase_rows = []
+    phase1_pnl_bank = 0.0
+    cycle_trade_rows = []
+
+    def finish_history(status, finished_ts, reason=""):
+        nonlocal phase, cycle_phase1_passed, cycle_start_ts, phase_start_ts, phase_start_idx, phase_balance, phase_daily, phase_days, phase_rows, phase1_pnl_bank, cycle_trade_rows
+        cycle_df = pd.DataFrame(cycle_trade_rows)
+        win_rate = win_rate_from_resolved(cycle_df) if not cycle_df.empty else 0.0
+        realised = (phase1_pnl_bank if cycle_phase1_passed else 0.0) + (phase_balance - starting)
+        histories.append({
+            "status": status,
+            "phase_1_passed": bool(cycle_phase1_passed or status == "PASSED"),
+            "phase_2_passed": bool(status == "PASSED"),
+            "starting_balance": starting,
+            "ending_balance": phase_balance,
+            "realised_pnl": realised,
+            "win_rate": win_rate,
+            "trading_days": len(set([r.get("prop_day") for r in cycle_trade_rows if r.get("prop_day") is not None])),
+            "started_at": cycle_start_ts,
+            "finished_at": finished_ts,
+            "failure_reason": reason,
+        })
+        phase = 1
+        cycle_phase1_passed = False
+        phase1_pnl_bank = 0.0
+        phase_balance = starting
+        phase_daily = {}
+        phase_days = set()
+        phase_rows = []
+        cycle_trade_rows = []
+        cycle_start_ts = finished_ts + pd.Timedelta(seconds=1)
+        phase_start_ts = cycle_start_ts
+
+    for i, row in df.iterrows():
+        ts = row["prop_event_time"]
+        if ts < phase_start_ts:
+            continue
+        pnl = float(row.get("pnl_cash") or 0.0)
+        phase_balance += pnl
+        day = ts.tz_convert(NAIROBI_TZ).date() if getattr(ts, "tzinfo", None) else pd.Timestamp(ts, tz="UTC").tz_convert(NAIROBI_TZ).date()
+        phase_daily[day] = phase_daily.get(day, 0.0) + pnl
+        phase_days.add(day)
+        row_dict = row.to_dict()
+        row_dict["balance_after"] = phase_balance
+        row_dict["prop_day"] = day
+        row_dict["challenge_phase"] = f"Phase {phase}"
+        phase_rows.append(row_dict)
+        cycle_trade_rows.append(row_dict)
+
+        reason = ""
+        terminal = ""
+        if phase_balance <= max_loss_floor:
+            terminal = "FAILED"
+            reason = "10% max total loss breached"
+        elif phase_daily.get(day, 0.0) <= daily_floor:
+            terminal = "FAILED"
+            reason = "5% max daily loss breached"
+        elif phase_balance >= targets[phase] and len(phase_days) >= 4:
+            if phase == 1:
+                # Phase 1 passed. Phase 2 begins from a fresh $10,000 verification account.
+                cycle_phase1_passed = True
+                phase1_pnl_bank = phase_balance - starting
+                phase = 2
+                phase_balance = starting
+                phase_daily = {}
+                phase_days = set()
+                phase_rows = []
+                phase_start_ts = ts + pd.Timedelta(seconds=1)
+                phase_start_idx = i + 1
+                continue
+            terminal = "PASSED"
+        if terminal:
+            finish_history(terminal, ts, reason)
+            phase_start_idx = i + 1
+
+    active_curve = pd.DataFrame(phase_rows)
+    active_daily = pd.DataFrame()
+    if not active_curve.empty:
+        active_daily = active_curve.groupby("prop_day").agg(
+            daily_pnl=("pnl_cash", "sum"),
+            trades=("pnl_cash", "count"),
+        ).reset_index().rename(columns={"prop_day": "Day", "daily_pnl": "Daily P/L", "trades": "Trades"})
+        active_daily = active_daily.sort_values("Day")
+        active_daily["Opening Balance"] = starting + active_daily["Daily P/L"].cumsum().shift(1).fillna(0.0)
+        active_daily["Closing Balance"] = starting + active_daily["Daily P/L"].cumsum()
+        active_daily["Day Result"] = active_daily["Daily P/L"].apply(lambda x: "WIN" if float(x) > 0 else "LOSS" if float(x) < 0 else "BREAKEVEN")
+        active_daily["Daily Breach"] = active_daily["Daily P/L"].apply(lambda x: "YES" if float(x) <= daily_floor else "NO")
+        active_daily["Target Hit"] = active_daily["Closing Balance"].apply(lambda x: "YES" if float(x) >= targets[phase] else "NO")
+    running_peak = active_curve["balance_after"].cummax() if not active_curve.empty else pd.Series(dtype=float)
+    dd = active_curve["balance_after"] - running_peak if not active_curve.empty else pd.Series(dtype=float)
+    max_dd_cash = float(dd.min()) if len(dd) else 0.0
+    max_dd_pct = float(((dd / running_peak.replace(0, np.nan)) * 100).replace([np.inf, -np.inf], np.nan).min()) if len(dd) else 0.0
+    equity = float(active_curve["balance_after"].iloc[-1]) if not active_curve.empty else starting
+    target_profit = (targets[phase] - starting)
+    active = {
+        "phase": "Phase 1 Challenge" if phase == 1 else "Phase 2 Verification",
+        "phase_number": phase,
+        "status": "ACTIVE",
+        "start_at": phase_start_ts,
+        "equity": equity,
+        "pnl": equity - starting,
+        "roi_pct": ((equity - starting) / starting * 100) if starting else 0.0,
+        "progress": max(0.0, min(1.0, (equity - starting) / target_profit)) if target_profit else 0.0,
+        "trading_days": len(phase_days),
+        "closed_count": len(active_curve),
+        "worst_day_pnl": float(active_daily["Daily P/L"].min()) if not active_daily.empty else 0.0,
+        "best_day_pnl": float(active_daily["Daily P/L"].max()) if not active_daily.empty else 0.0,
+        "last_closed_at": active_curve["prop_event_time"].max() if not active_curve.empty else "",
+        "max_drawdown_cash": max_dd_cash,
+        "max_drawdown_pct": max_dd_pct,
+        "fail_reason": "",
+        "pass_date": "",
+    }
+    return {"history": histories, "active": active, "active_curve": active_curve, "active_daily": active_daily}
+
 
 def prop_firm_monte_carlo(trades_df: pd.DataFrame, state: dict, runs: int = 2000) -> dict:
     """
@@ -4922,13 +5139,14 @@ def render_workflow(username: str, settings: dict) -> None:
         max_loss_floor = starting * 0.90
         target_balance = starting * 1.10
 
-        # Each user's visible prop challenge is now self-resetting.
-        # The start timestamp is stored per timeframe, and completed attempts are
-        # saved to settings so the user can review passed/failed challenges later.
+        # The prop-firm view now replays every scoped A+/A closed trade from the
+        # user's activation timestamp. It does not trust the old incremental
+        # prop_firm_state row, because that row can drift when challenges pass,
+        # fail, or restart between scanner runs.
         prop_start_map = settings.get("prop_challenge_started_at_by_tf", {})
         if not isinstance(prop_start_map, dict):
             prop_start_map = {}
-        prop_started_at_raw = str(prop_start_map.get(challenge_tf, "") or settings.get("tracking_started_at", "") or "")
+        prop_started_at_raw = str(settings.get("tracking_started_at", "") or "")
 
         st.caption(
             f"This tab recalculates the FTMO-style challenge from your current watchlist and selected timeframe "
@@ -4940,14 +5158,9 @@ def render_workflow(username: str, settings: dict) -> None:
         prop_source = trades[
             trades.get("grade", pd.Series(dtype=str)).astype(str).isin(["A+", "A"])
         ].copy() if trades is not None and not trades.empty else pd.DataFrame()
-        if not prop_source.empty and prop_started_at_raw:
-            try:
-                prop_start_ts = pd.to_datetime(prop_started_at_raw, errors="coerce", utc=True)
-                if pd.notna(prop_start_ts):
-                    created_scope = pd.to_datetime(prop_source.get("created_at", pd.Series(pd.NaT, index=prop_source.index)), errors="coerce", utc=True)
-                    prop_source = prop_source[created_scope >= prop_start_ts].copy()
-            except Exception:
-                pass
+        # Do not cut the stream at the last restart. The simulator below handles
+        # every pass/fail/restart cycle itself and then exposes only the active
+        # current cycle for the top cards.
         prop_closed = closed_resolved_trades(prop_source) if not prop_source.empty else pd.DataFrame()
 
         status = "ACTIVE"
@@ -5172,7 +5385,7 @@ def render_workflow(username: str, settings: dict) -> None:
             terminal_phase = phase2
             terminal_result = "PASSED"
 
-        if terminal_phase is not None and terminal_result:
+        if False and terminal_phase is not None and terminal_result:
             terminal_pos = terminal_phase.get("end_pos")
             completed_at_raw = ""
             restart_at_raw = datetime.now(timezone.utc).isoformat()
@@ -5216,20 +5429,47 @@ def render_workflow(username: str, settings: dict) -> None:
                 save_settings(username, settings)
                 st.rerun()
 
+        # Authoritative self-resetting replay from all Supabase trade data since activation.
+        # This rebuilds challenge history and then replaces the displayed cards with
+        # the currently active Phase 1/Phase 2 account, so balances never keep
+        # compounding past the $1,000 / $500 targets.
+        prop_sim = simulate_prop_challenge_cycles(prop_closed, prop_started_at_raw, starting)
+        rebuild_prop_challenge_history_from_trades(username, challenge_tf, prop_sim.get("history", []))
+        active_prop = prop_sim.get("active", {})
+        prop_curve = prop_sim.get("active_curve", pd.DataFrame())
+        day_summary = prop_sim.get("active_daily", pd.DataFrame())
+        current = float(active_prop.get("equity", starting) or starting)
+        roi_pct = float(active_prop.get("roi_pct", 0.0) or 0.0)
+        progress_to_target = float(active_prop.get("progress", 0.0) or 0.0)
+        trading_days = int(active_prop.get("trading_days", 0) or 0)
+        closed_count = int(active_prop.get("closed_count", 0) or 0)
+        worst_day_pnl = float(active_prop.get("worst_day_pnl", 0.0) or 0.0)
+        best_day_pnl = float(active_prop.get("best_day_pnl", 0.0) or 0.0)
+        max_drawdown_cash = float(active_prop.get("max_drawdown_cash", 0.0) or 0.0)
+        max_drawdown_pct = float(active_prop.get("max_drawdown_pct", 0.0) or 0.0)
+        status = "ACTIVE"
+        fail_reason = ""
+        breach_date = ""
+        pass_date = ""
+        challenge_started_at = fmt_nairobi(active_prop.get("start_at")) if active_prop.get("start_at") else (fmt_nairobi(prop_started_at_raw) if prop_started_at_raw else "")
+        last_closed_at = fmt_nairobi(active_prop.get("last_closed_at")) if active_prop.get("last_closed_at") else ""
+        active_phase_name = str(active_prop.get("phase", "Phase 1 Challenge"))
+        active_target_label = "+$1,000" if int(active_prop.get("phase_number", 1) or 1) == 1 else "+$500"
+
         funded_status = "ACTIVE" if phase2.get("status") == "PASSED" else "LOCKED"
         funded_note = "Eligible after Phase 2 is passed" if funded_status == "LOCKED" else "Funded account rules active: unlimited target, 5% daily loss, 10% max loss, up to 90% profit split."
         status_color = "green" if status == "PASSED" else "red" if status == "FAILED" else ""
         mc = prop_firm_monte_carlo(prop_curve, {"starting_balance": starting, "current_equity": current}, runs=2000)
         c1, c2, c3, c4, c5 = st.columns(5)
-        with c1: metric_card("Challenge equity", f"${current:,.2f}", f"Start ${starting:,.0f}")
-        with c2: metric_card("ROI to target", f"{roi_pct:+.2f}%", "Target +10.00%")
+        with c1: metric_card("Current phase equity", f"${current:,.2f}", f"{active_phase_name} · Start ${starting:,.0f}")
+        with c2: metric_card("ROI to target", f"{roi_pct:+.2f}%", f"Target {active_target_label}")
         with c3: metric_card("Worst day P/L", f"${worst_day_pnl:+,.2f}", f"Daily floor -${starting*0.05:,.0f}")
         with c4: metric_card("Trading days", f"{trading_days}", "Minimum 4 required")
-        with c5: metric_card("Challenge status", status, fail_reason or (f"Passed {pass_date}" if pass_date else ""))
+        with c5: metric_card("Challenge status", status, active_phase_name)
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         i1, i2, i3, i4, i5 = st.columns(5)
-        with i1: metric_card("Challenge started", challenge_started_at or "—", "User activation / last restart")
+        with i1: metric_card("Current phase started", challenge_started_at or "—", "Auto-replayed from Supabase")
         with i2: metric_card("Passed on", pass_date or "—", "When target + min days were met")
         with i3: metric_card("Last closed", last_closed_at or "—", "Most recent resolved A+/A trade")
         with i4: metric_card("Closed / Open", f"{closed_count} / {open_count}", "A+/A trades only")
@@ -5244,7 +5484,7 @@ def render_workflow(username: str, settings: dict) -> None:
             st.caption("Fewer than 10 real closed A+/A trades exist, so this uses a conservative placeholder R-distribution until more trade history is available.")
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-        status_line = f"<b class='{status_color}'>{html.escape(status)}</b> · Progress to 10% target: {progress_to_target*100:.0f}%"
+        status_line = f"<b class='{status_color}'>{html.escape(status)}</b> · {html.escape(active_phase_name)} progress to {html.escape(active_target_label)} target: {progress_to_target*100:.0f}%"
         if fail_reason:
             status_line += f" · {html.escape(fail_reason)}"
             if breach_date:
@@ -5412,8 +5652,9 @@ def render_workflow(username: str, settings: dict) -> None:
             history_view["Realised P/L"] = pd.to_numeric(history_view["realised_pnl"], errors="coerce")
             history_view["Win Rate %"] = pd.to_numeric(history_view["win_rate"], errors="coerce")
             history_view["Trading Days"] = pd.to_numeric(history_view["trading_days"], errors="coerce").fillna(0).astype(int)
+            history_view["Failure Reason"] = history_view.get("failure_reason", "").fillna("").astype(str) if "failure_reason" in history_view.columns else ""
             display_cols = [
-                "Challenge", "Timeframe", "Result", "Phase 1", "Phase 2", "Started", "Finished",
+                "Challenge", "Timeframe", "Result", "Phase 1", "Phase 2", "Failure Reason", "Started", "Finished",
                 "Starting Balance", "Ending Balance", "Realised P/L", "Win Rate %", "Trading Days",
             ]
             render_benzino_aggrid(
