@@ -5825,6 +5825,19 @@ def render_workflow(username: str, settings: dict) -> None:
             if not day_summary.empty:
                 st.markdown("**Daily challenge ledger · all simulated challenges**")
                 daily_view = day_summary.copy().sort_values("Day", ascending=False)
+                if "Challenge" in daily_view.columns:
+                    daily_challenges = sorted(
+                        [str(x) for x in daily_view["Challenge"].dropna().unique()],
+                        key=lambda x: int(str(x).replace("#", "")) if str(x).replace("#", "").isdigit() else -1,
+                        reverse=True,
+                    )
+                    selected_daily_challenge = st.selectbox(
+                        "Filter daily ledger by challenge",
+                        ["All"] + daily_challenges,
+                        key=f"daily_challenge_filter_{challenge_tf}",
+                    )
+                    if selected_daily_challenge != "All":
+                        daily_view = daily_view[daily_view["Challenge"].astype(str) == selected_daily_challenge].copy()
                 render_benzino_aggrid(
                     daily_view,
                     key="challenge_daily_loss_check",
@@ -5881,8 +5894,41 @@ def render_workflow(username: str, settings: dict) -> None:
                 "Challenge", "Timeframe", "Phase 1", "Phase 2", "Failure Reason", "Trading Days",
                 "Started", "Finished", "Starting Balance", "Ending Balance", "Realised P/L", "Win Rate %",
             ]
+            history_display = history_view[[c for c in display_cols if c in history_view.columns]].copy()
+
+            history_filter_col1, history_filter_col2 = st.columns([1, 1])
+            with history_filter_col1:
+                if "Challenge" in history_display.columns:
+                    history_challenges = sorted(
+                        [str(x) for x in history_display["Challenge"].dropna().unique()],
+                        key=lambda x: int(str(x).replace("#", "")) if str(x).replace("#", "").isdigit() else -1,
+                        reverse=True,
+                    )
+                    selected_history_challenge = st.selectbox(
+                        "Filter challenge history by challenge",
+                        ["All"] + history_challenges,
+                        key=f"history_challenge_filter_{challenge_tf}",
+                    )
+                    if selected_history_challenge != "All":
+                        history_display = history_display[history_display["Challenge"].astype(str) == selected_history_challenge].copy()
+            with history_filter_col2:
+                selected_history_result = st.selectbox(
+                    "Filter challenge history by result",
+                    ["All", "Passed", "Failed"],
+                    key=f"history_result_filter_{challenge_tf}",
+                )
+                if selected_history_result == "Passed":
+                    history_display = history_display[
+                        (history_display.get("Phase 1", "").astype(str).str.upper() == "PASSED")
+                        & (history_display.get("Phase 2", "").astype(str).str.upper() == "PASSED")
+                    ].copy()
+                elif selected_history_result == "Failed":
+                    history_display = history_display[
+                        ~((history_display.get("Phase 1", "").astype(str).str.upper() == "PASSED")
+                          & (history_display.get("Phase 2", "").astype(str).str.upper() == "PASSED"))
+                    ].copy()
             render_benzino_aggrid(
-                history_view[[c for c in display_cols if c in history_view.columns]],
+                history_display,
                 key=f"challenge_review_history_{challenge_tf}",
                 height=320,
                 page_size=10,
