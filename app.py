@@ -1398,26 +1398,36 @@ def rebuild_prop_challenge_history_from_trades(username: str, timeframe: str, hi
 
 
 def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: str = "", starting: float = 10000.0) -> dict:
-    """Replay all scoped A+/A closed trades into Phase 1 -> Phase 2 challenge cycles.
+    """Replay scoped A+/A closed trades using the exact FTMO 2-step model.
 
-    This is the source of truth for the dashboard: it ignores the old incremental
-    prop_firm_state balance and reconstructs every pass/fail from Supabase trade
-    history since account activation. Each new cycle starts from $10,000. Phase 1
-    needs +$1,000 and at least 4 distinct trading days. Phase 2 needs +$500
-    and at least 4 distinct trading days. Either phase fails on -$500 daily loss
-    or -$1,000 total loss. A phase is not passed just because the target is hit;
-    it must still satisfy the minimum trading-day rule at the same time.
+    Model used:
+      • Phase 1 starts from a fresh $10,000 account and passes at $11,000 only
+        after at least 4 distinct trading days have been completed.
+      • Phase 2 starts from a fresh $10,000 verification account after Phase 1
+        passes and passes at $10,500 only after at least 4 distinct trading days.
+      • Max total loss is anchored to the original account size: equity must not
+        fall below $9,000 in either phase.
+      • Max daily loss is anchored to the balance at the start of that trading
+        day: equity must not fall below day-open balance minus $500.
+
+    Completed cycles are rebuilt from Supabase every run. The active object is
+    the current unfinished phase after all completed passes/fails have been
+    consumed. No old prop_firm_state balance is trusted here.
     """
-    risk_cash = starting * 0.01
-    daily_floor = -starting * 0.05
-    max_loss_floor = starting * 0.90
-    targets = {1: starting * 1.10, 2: starting * 1.05}
+    risk_cash = float(starting) * 0.01
+    daily_loss_limit_cash = float(starting) * CHALLENGE_MAX_DAILY_LOSS_PCT
+    max_loss_floor = float(starting) * (1.0 - CHALLENGE_MAX_TOTAL_LOSS_PCT)
+    targets = {
+        1: float(starting) * (1.0 + CHALLENGE_PHASE1_TARGET_PCT),
+        2: float(starting) * (1.0 + CHALLENGE_PHASE2_TARGET_PCT),
+    }
+
     empty_active = {
         "phase": "Phase 1 Challenge",
         "phase_number": 1,
         "status": "ACTIVE",
         "start_at": pd.to_datetime(activated_at, errors="coerce", utc=True),
-        "equity": starting,
+        "equity": float(starting),
         "pnl": 0.0,
         "roi_pct": 0.0,
         "progress": 0.0,
@@ -1431,9 +1441,11 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
         "max_drawdown_pct": 0.0,
         "fail_reason": "",
         "pass_date": "",
+        "phase1_passed_at": "",
     }
+
     if prop_closed_all is None or prop_closed_all.empty:
-        return {"history": [], "active": empty_active, "active_curve": pd.DataFrame(), "active_daily": pd.DataFrame()}
+        return {"history": [], "active": empty_active, "active_curve": pd.DataFrame(), "active_daily": pd.DataFrame(), "all_trades": pd.DataFrame()}
 
     df = prop_closed_all.copy()
     df = numeric_cols(df, ["r_multiple", "entry", "sl", "tp", "rr"])
@@ -1441,149 +1453,205 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
     created_time = pd.to_datetime(df.get("created_at", pd.Series(pd.NaT, index=df.index)), errors="coerce", utc=True)
     df["prop_event_time"] = event_time.fillna(created_time)
     df = df.dropna(subset=["prop_event_time"]).sort_values("prop_event_time").reset_index(drop=True)
+
     act_ts = pd.to_datetime(activated_at, errors="coerce", utc=True)
     if pd.notna(act_ts):
         df = df[df["prop_event_time"] >= act_ts].copy().reset_index(drop=True)
     if df.empty:
-        return {"history": [], "active": empty_active, "active_curve": pd.DataFrame(), "active_daily": pd.DataFrame()}
+        return {"history": [], "active": empty_active, "active_curve": pd.DataFrame(), "active_daily": pd.DataFrame(), "all_trades": pd.DataFrame()}
+
     df["pnl_cash"] = pd.to_numeric(df["r_multiple"], errors="coerce").fillna(0.0) * risk_cash
 
     histories: list[dict] = []
+    all_replay_rows: list[dict] = []
+
     phase = 1
-    cycle_phase1_passed = False
     cycle_start_ts = act_ts if pd.notna(act_ts) else df["prop_event_time"].iloc[0]
     phase_start_ts = cycle_start_ts
-    phase_start_idx = 0
-    phase_balance = starting
-    phase_daily: dict = {}
+    phase_balance = float(starting)
+    phase_rows: list[dict] = []
     phase_days: set = set()
-    phase_rows = []
-    phase1_pnl_bank = 0.0
+    phase_day_open: dict = {}
+    phase_day_min_equity: dict = {}
+    phase_day_pnl: dict = {}
+    cycle_rows: list[dict] = []
     phase1_passed_at = ""
-    cycle_trade_rows = []
+    phase1_passed = False
 
-    def finish_history(status, finished_ts, reason=""):
-        nonlocal phase, cycle_phase1_passed, cycle_start_ts, phase_start_ts, phase_start_idx, phase_balance, phase_daily, phase_days, phase_rows, phase1_pnl_bank, phase1_passed_at, cycle_trade_rows
-        cycle_df = pd.DataFrame(cycle_trade_rows)
-        win_rate = win_rate_from_resolved(cycle_df) if not cycle_df.empty else 0.0
-        # Keep the archived table internally consistent: the displayed
-        # realised P/L is the difference between the displayed ending balance
-        # and the fixed $10,000 starting balance for the phase/account that
-        # closed the cycle. Phase 1 profit is not mixed into a Phase 2 ending
-        # balance because each FTMO phase starts from a fresh $10,000 account.
-        realised = phase_balance - starting
+    def _day_from_ts(ts):
+        try:
+            return pd.Timestamp(ts).tz_convert(NAIROBI_TZ).date()
+        except Exception:
+            return pd.Timestamp(ts, tz="UTC").tz_convert(NAIROBI_TZ).date()
+
+    def _phase_stats(rows: list[dict]) -> dict:
+        if not rows:
+            return {
+                "days": 0,
+                "worst_day_pnl": 0.0,
+                "best_day_pnl": 0.0,
+                "max_drawdown_cash": 0.0,
+                "max_drawdown_pct": 0.0,
+                "last_closed_at": "",
+            }
+        tmp = pd.DataFrame(rows)
+        day_pnl = tmp.groupby("prop_day")["pnl_cash"].sum() if "prop_day" in tmp.columns else pd.Series(dtype=float)
+        bal = pd.to_numeric(tmp["balance_after"], errors="coerce") if "balance_after" in tmp.columns else pd.Series(dtype=float)
+        peak = bal.cummax() if len(bal) else pd.Series(dtype=float)
+        dd = bal - peak if len(bal) else pd.Series(dtype=float)
+        dd_pct = ((dd / peak.replace(0, np.nan)) * 100).replace([np.inf, -np.inf], np.nan) if len(dd) else pd.Series(dtype=float)
+        return {
+            "days": int(day_pnl.index.nunique()) if len(day_pnl) else 0,
+            "worst_day_pnl": float(day_pnl.min()) if len(day_pnl) else 0.0,
+            "best_day_pnl": float(day_pnl.max()) if len(day_pnl) else 0.0,
+            "max_drawdown_cash": float(dd.min()) if len(dd) else 0.0,
+            "max_drawdown_pct": float(dd_pct.min()) if len(dd_pct.dropna()) else 0.0,
+            "last_closed_at": tmp["prop_event_time"].max() if "prop_event_time" in tmp.columns and not tmp.empty else "",
+        }
+
+    def _win_rate(rows: list[dict]) -> float:
+        if not rows:
+            return 0.0
+        return win_rate_from_resolved(pd.DataFrame(rows))
+
+    def _archive(status: str, finished_ts, failure_reason: str, terminal_balance: float, terminal_phase: int):
+        nonlocal phase, cycle_start_ts, phase_start_ts, phase_balance, phase_rows, phase_days
+        nonlocal phase_day_open, phase_day_min_equity, phase_day_pnl, cycle_rows
+        nonlocal phase1_passed_at, phase1_passed
+
         histories.append({
-            "status": status,
-            "phase_1_passed": bool(cycle_phase1_passed or status == "PASSED"),
-            "phase_2_passed": bool(status == "PASSED"),
-            "starting_balance": starting,
-            "ending_balance": phase_balance,
-            "realised_pnl": realised,
-            "win_rate": win_rate,
-            "trading_days": len(set([r.get("prop_day") for r in cycle_trade_rows if r.get("prop_day") is not None])),
+            "status": str(status).upper(),
+            "phase_1_passed": bool(phase1_passed or str(status).upper() == "PASSED"),
+            "phase_2_passed": bool(str(status).upper() == "PASSED"),
+            "starting_balance": float(starting),
+            "ending_balance": float(terminal_balance),
+            "realised_pnl": float(terminal_balance) - float(starting),
+            "win_rate": _win_rate(cycle_rows),
+            # This is the number of trading days in the terminal phase, because
+            # that is the phase whose account/balance is displayed on this row.
+            "trading_days": len(set([r.get("prop_day") for r in phase_rows if r.get("prop_day") is not None])),
             "started_at": cycle_start_ts,
             "finished_at": finished_ts,
-            "failure_reason": reason,
+            "failure_reason": str(failure_reason or ""),
         })
+
         phase = 1
-        cycle_phase1_passed = False
-        phase1_pnl_bank = 0.0
+        phase1_passed = False
         phase1_passed_at = ""
-        phase_balance = starting
-        phase_daily = {}
-        phase_days = set()
+        phase_balance = float(starting)
         phase_rows = []
-        cycle_trade_rows = []
-        cycle_start_ts = finished_ts + pd.Timedelta(seconds=1)
+        phase_days = set()
+        phase_day_open = {}
+        phase_day_min_equity = {}
+        phase_day_pnl = {}
+        cycle_rows = []
+        cycle_start_ts = pd.Timestamp(finished_ts) + pd.Timedelta(seconds=1)
         phase_start_ts = cycle_start_ts
 
-    for i, row in df.iterrows():
+    for _, row in df.iterrows():
         ts = row["prop_event_time"]
         if ts < phase_start_ts:
             continue
+
+        day = _day_from_ts(ts)
+        if day not in phase_day_open:
+            # FTMO daily loss is measured from the balance at the start of the
+            # trading day, not from the total account start and not from daily
+            # net P/L alone.
+            phase_day_open[day] = float(phase_balance)
+            phase_day_min_equity[day] = float(phase_balance)
+            phase_day_pnl[day] = 0.0
+
         pnl = float(row.get("pnl_cash") or 0.0)
         phase_balance += pnl
-        day = ts.tz_convert(NAIROBI_TZ).date() if getattr(ts, "tzinfo", None) else pd.Timestamp(ts, tz="UTC").tz_convert(NAIROBI_TZ).date()
-        phase_daily[day] = phase_daily.get(day, 0.0) + pnl
+        phase_day_pnl[day] = phase_day_pnl.get(day, 0.0) + pnl
+        phase_day_min_equity[day] = min(float(phase_day_min_equity.get(day, phase_balance)), float(phase_balance))
         phase_days.add(day)
+
         row_dict = row.to_dict()
-        row_dict["balance_after"] = phase_balance
+        row_dict["balance_after"] = float(phase_balance)
         row_dict["prop_day"] = day
         row_dict["challenge_phase"] = f"Phase {phase}"
+        row_dict["day_open_balance"] = float(phase_day_open[day])
+        row_dict["daily_loss_floor"] = float(phase_day_open[day]) - daily_loss_limit_cash
+        row_dict["phase_target"] = targets[phase]
         phase_rows.append(row_dict)
-        cycle_trade_rows.append(row_dict)
+        cycle_rows.append(row_dict)
+        all_replay_rows.append(row_dict.copy())
 
-        reason = ""
         terminal = ""
-        if phase_balance <= max_loss_floor:
+        reason = ""
+        if phase_balance < max_loss_floor:
             terminal = "FAILED"
-            reason = "10% max total loss breached"
-        elif phase_daily.get(day, 0.0) <= daily_floor:
+            reason = f"Phase {phase}: 10% max total loss breached"
+        elif phase_balance < (float(phase_day_open[day]) - daily_loss_limit_cash):
             terminal = "FAILED"
-            reason = "5% max daily loss breached"
+            reason = f"Phase {phase}: 5% max daily loss breached"
         elif phase_balance >= targets[phase] and len(phase_days) >= CHALLENGE_MIN_TRADING_DAYS:
             if phase == 1:
-                # Phase 1 passed only after both requirements are true:
-                # +$1,000 target reached AND at least 4 distinct trading days.
-                # Phase 2 then begins from a fresh $10,000 verification account.
-                cycle_phase1_passed = True
-                phase1_pnl_bank = phase_balance - starting
+                # Phase 1 is complete. FTMO Verification starts from a fresh
+                # $10,000 account on the next eligible trade.
+                phase1_passed = True
                 phase1_passed_at = ts
                 phase = 2
-                phase_balance = starting
-                phase_daily = {}
-                phase_days = set()
+                phase_balance = float(starting)
                 phase_rows = []
-                phase_start_ts = ts + pd.Timedelta(seconds=1)
-                phase_start_idx = i + 1
+                phase_days = set()
+                phase_day_open = {}
+                phase_day_min_equity = {}
+                phase_day_pnl = {}
+                phase_start_ts = pd.Timestamp(ts) + pd.Timedelta(seconds=1)
                 continue
-            # Phase 2 also requires +$500 AND at least 4 distinct trading days.
             terminal = "PASSED"
+
         if terminal:
-            finish_history(terminal, ts, reason)
-            phase_start_idx = i + 1
+            _archive(terminal, ts, reason, phase_balance, phase)
 
     active_curve = pd.DataFrame(phase_rows)
     active_daily = pd.DataFrame()
     if not active_curve.empty:
         active_daily = active_curve.groupby("prop_day").agg(
-            daily_pnl=("pnl_cash", "sum"),
-            trades=("pnl_cash", "count"),
-        ).reset_index().rename(columns={"prop_day": "Day", "daily_pnl": "Daily P/L", "trades": "Trades"})
+            **{
+                "Daily P/L": ("pnl_cash", "sum"),
+                "Trades": ("pnl_cash", "count"),
+                "Opening Balance": ("day_open_balance", "first"),
+                "Closing Balance": ("balance_after", "last"),
+                "Intraday Low": ("balance_after", "min"),
+                "Daily Loss Floor": ("daily_loss_floor", "first"),
+            }
+        ).reset_index().rename(columns={"prop_day": "Day"})
         active_daily = active_daily.sort_values("Day")
-        active_daily["Opening Balance"] = starting + active_daily["Daily P/L"].cumsum().shift(1).fillna(0.0)
-        active_daily["Closing Balance"] = starting + active_daily["Daily P/L"].cumsum()
         active_daily["Day Result"] = active_daily["Daily P/L"].apply(lambda x: "WIN" if float(x) > 0 else "LOSS" if float(x) < 0 else "BREAKEVEN")
-        active_daily["Daily Breach"] = active_daily["Daily P/L"].apply(lambda x: "YES" if float(x) <= daily_floor else "NO")
+        active_daily["Daily Breach"] = active_daily.apply(lambda r: "YES" if float(r["Intraday Low"]) < float(r["Daily Loss Floor"]) else "NO", axis=1)
         active_daily["Target Hit"] = active_daily["Closing Balance"].apply(lambda x: "YES" if float(x) >= targets[phase] else "NO")
-    running_peak = active_curve["balance_after"].cummax() if not active_curve.empty else pd.Series(dtype=float)
-    dd = active_curve["balance_after"] - running_peak if not active_curve.empty else pd.Series(dtype=float)
-    max_dd_cash = float(dd.min()) if len(dd) else 0.0
-    max_dd_pct = float(((dd / running_peak.replace(0, np.nan)) * 100).replace([np.inf, -np.inf], np.nan).min()) if len(dd) else 0.0
-    equity = float(active_curve["balance_after"].iloc[-1]) if not active_curve.empty else starting
-    target_profit = (targets[phase] - starting)
+
+    stats = _phase_stats(phase_rows)
+    equity = float(active_curve["balance_after"].iloc[-1]) if not active_curve.empty else float(starting)
+    target_profit = targets[phase] - float(starting)
     active = {
         "phase": "Phase 1 Challenge" if phase == 1 else "Phase 2 Verification",
         "phase_number": phase,
         "status": "ACTIVE",
         "start_at": phase_start_ts,
         "equity": equity,
-        "pnl": equity - starting,
-        "roi_pct": ((equity - starting) / starting * 100) if starting else 0.0,
-        "progress": max(0.0, min(1.0, (equity - starting) / target_profit)) if target_profit else 0.0,
+        "pnl": equity - float(starting),
+        "roi_pct": ((equity - float(starting)) / float(starting) * 100) if starting else 0.0,
+        "progress": max(0.0, min(1.0, (equity - float(starting)) / target_profit)) if target_profit else 0.0,
         "trading_days": len(phase_days),
         "closed_count": len(active_curve),
-        "worst_day_pnl": float(active_daily["Daily P/L"].min()) if not active_daily.empty else 0.0,
-        "best_day_pnl": float(active_daily["Daily P/L"].max()) if not active_daily.empty else 0.0,
-        "last_closed_at": active_curve["prop_event_time"].max() if not active_curve.empty else "",
-        "max_drawdown_cash": max_dd_cash,
-        "max_drawdown_pct": max_dd_pct,
+        "open_count": 0,
+        "worst_day_pnl": stats["worst_day_pnl"],
+        "best_day_pnl": stats["best_day_pnl"],
+        "last_closed_at": stats["last_closed_at"],
+        "max_drawdown_cash": stats["max_drawdown_cash"],
+        "max_drawdown_pct": stats["max_drawdown_pct"],
         "fail_reason": "",
         "pass_date": "",
         "phase1_passed_at": phase1_passed_at,
     }
-    return {"history": histories, "active": active, "active_curve": active_curve, "active_daily": active_daily}
 
+    all_trades = pd.DataFrame(all_replay_rows)
+    return {"history": histories, "active": active, "active_curve": active_curve, "active_daily": active_daily, "all_trades": all_trades}
 
 def prop_firm_monte_carlo(trades_df: pd.DataFrame, state: dict, runs: int = 2000) -> dict:
     """
@@ -2574,12 +2642,12 @@ def aggrid_badge_renderers() -> dict:
             let bg = 'rgba(139,158,176,.16)';
             let color = '#A9BBC9';
 
-            if (v.includes('PASSED') || v.includes('TP') || v.includes('WIN')) {
-              bg = 'rgba(0,212,163,.18)';
-              color = '#00D4A3';
-            } else if (v.includes('FAILED') || v.includes('SL') || v.includes('LOSS')) {
+            if (v.includes('NOT PASSED') || v.includes('FAILED') || v.includes('SL') || v.includes('LOSS')) {
               bg = 'rgba(255,93,93,.18)';
               color = '#FF5D5D';
+            } else if (v.includes('PASSED') || v.includes('TP') || v.includes('WIN')) {
+              bg = 'rgba(0,212,163,.18)';
+              color = '#00D4A3';
             } else if (v.includes('EXPIRED')) {
               bg = 'rgba(214,168,78,.18)';
               color = '#D6A84E';
@@ -5173,7 +5241,7 @@ def render_workflow(username: str, settings: dict) -> None:
             f"This tab recalculates the FTMO-style challenge from your current watchlist and selected timeframe "
             f"({challenge_tf}). It uses only A+/A closed trades, fixed $10,000 account size, 1% risk per trade, "
             f"Phase 1 target +$1,000, Phase 2 target +$500, 5% max daily loss and 10% max total loss. "
-            "Each phase is closed as soon as its target or a breach is reached, then the next phase/cycle starts from the next eligible Supabase trade."
+            "Phase 2 starts from a fresh $10,000 verification account after Phase 1 passes; completed cycles are rebuilt from Supabase on every load."
         )
 
         prop_source = trades[
@@ -5458,6 +5526,7 @@ def render_workflow(username: str, settings: dict) -> None:
         rebuild_prop_challenge_history_from_trades(username, challenge_tf, prop_sim.get("history", []))
         active_prop = prop_sim.get("active", {})
         prop_curve = prop_sim.get("active_curve", pd.DataFrame())
+        prop_all_replay = prop_sim.get("all_trades", pd.DataFrame())
         day_summary = prop_sim.get("active_daily", pd.DataFrame())
         current = float(active_prop.get("equity", starting) or starting)
         roi_pct = float(active_prop.get("roi_pct", 0.0) or 0.0)
@@ -5480,11 +5549,52 @@ def render_workflow(username: str, settings: dict) -> None:
         phase1_passed_at = fmt_nairobi(active_prop.get("phase1_passed_at")) if active_prop.get("phase1_passed_at") else ""
         current_phase_status = "Phase 2 active" if active_phase_number == 2 else "Phase 1 active"
         if active_phase_number == 2:
-            current_phase_subtitle = "Phase 1 passed; Phase 2 target + 4 days required"
+            current_phase_subtitle = "Phase 1 passed; Phase 2 target + 4 trading days required"
         elif current >= (starting + 1000.0):
-            current_phase_subtitle = "Phase 1 target reached; waiting for 4 trading days"
+            current_phase_subtitle = "Phase 1 target reached; continue until 4 trading days are complete"
         else:
-            current_phase_subtitle = "Phase 1 target + 4 days required"
+            current_phase_subtitle = "Phase 1 target + 4 trading days required"
+
+        # Keep the FTMO coverage cards and phase analytics aligned with the
+        # authoritative Supabase replay above. Completed phases are archived in
+        # Challenge review history; the top cards always show the currently
+        # active unfinished phase.
+        phase1 = {
+            "phase": "Phase 1 Challenge",
+            "status": "PASSED" if active_phase_number == 2 else "ACTIVE",
+            "start_date": challenge_started_at,
+            "pass_date": phase1_passed_at if active_phase_number == 2 else "",
+            "breach_date": "",
+            "breach_reason": "",
+            "equity": starting if active_phase_number == 2 else current,
+            "pnl": 0.0 if active_phase_number == 2 else current - starting,
+            "roi_pct": 0.0 if active_phase_number == 2 else roi_pct,
+            "progress": 1.0 if active_phase_number == 2 else progress_to_target,
+            "trading_days": CHALLENGE_MIN_TRADING_DAYS if active_phase_number == 2 else trading_days,
+            "closed_trades": 0 if active_phase_number == 2 else closed_count,
+            "best_day": 0.0 if active_phase_number == 2 else best_day_pnl,
+            "worst_day": 0.0 if active_phase_number == 2 else worst_day_pnl,
+            "max_drawdown_cash": 0.0 if active_phase_number == 2 else max_drawdown_cash,
+            "max_drawdown_pct": 0.0 if active_phase_number == 2 else max_drawdown_pct,
+        }
+        phase2 = {
+            "phase": "Phase 2 Verification",
+            "status": "ACTIVE" if active_phase_number == 2 else "LOCKED",
+            "start_date": challenge_started_at if active_phase_number == 2 else "After Phase 1 passes",
+            "pass_date": "",
+            "breach_date": "",
+            "breach_reason": "",
+            "equity": current if active_phase_number == 2 else starting,
+            "pnl": current - starting if active_phase_number == 2 else 0.0,
+            "roi_pct": roi_pct if active_phase_number == 2 else 0.0,
+            "progress": progress_to_target if active_phase_number == 2 else 0.0,
+            "trading_days": trading_days if active_phase_number == 2 else 0,
+            "closed_trades": closed_count if active_phase_number == 2 else 0,
+            "best_day": best_day_pnl if active_phase_number == 2 else 0.0,
+            "worst_day": worst_day_pnl if active_phase_number == 2 else 0.0,
+            "max_drawdown_cash": max_drawdown_cash if active_phase_number == 2 else 0.0,
+            "max_drawdown_pct": max_drawdown_pct if active_phase_number == 2 else 0.0,
+        }
 
         funded_status = "LOCKED"
         funded_note = "Eligible after Phase 2 is passed"
@@ -5629,10 +5739,11 @@ def render_workflow(username: str, settings: dict) -> None:
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         st.subheader("Closed A+/A trades")
-        if prop_curve.empty:
+        all_closed_view_source = prop_all_replay if 'prop_all_replay' in locals() and prop_all_replay is not None and not prop_all_replay.empty else prop_closed
+        if all_closed_view_source is None or all_closed_view_source.empty:
             st.info("No A+/A trades have closed yet for this user, watchlist, and selected timeframe.")
         else:
-            view = prop_curve.copy()
+            view = all_closed_view_source.copy()
             if "prop_event_time" in view.columns:
                 view["closed_at"] = view["prop_event_time"].apply(fmt_nairobi)
             cols = ["closed_at", "asset", "timeframe", "signal", "grade", "status", "outcome", "r_multiple", "pnl_cash", "balance_after", "exit_reason", "entry", "sl", "tp"]
@@ -5647,12 +5758,45 @@ def render_workflow(username: str, settings: dict) -> None:
                 show_status_filter=False,
             )
 
-            fig = px.line(prop_curve, x="prop_event_time", y="balance_after", title="Prop-firm equity curve")
-            fig.add_hline(y=starting, line_dash="dot", annotation_text="Starting balance")
-            fig.add_hline(y=target_balance, line_dash="dot", line_color="#00D4A3", annotation_text="10% target")
-            fig.add_hline(y=max_loss_floor, line_dash="dot", line_color="#FF5D5D", annotation_text="10% max loss")
-            fig.update_layout(height=360, margin=dict(t=50, b=20))
-            st.plotly_chart(fig, use_container_width=True)
+            st.markdown("**Challenge outcomes**")
+            outcome_source = load_prop_challenge_history(username, challenge_tf, limit=1000)
+            if outcome_source is None or outcome_source.empty:
+                outcome_source = pd.DataFrame(prop_sim.get("history", []))
+            if outcome_source is None or outcome_source.empty:
+                st.info("No completed challenges yet. The wins/losses visual will appear once a challenge is passed or failed.")
+            else:
+                outcome_df = outcome_source.copy()
+                outcome_df["Result"] = outcome_df.get("status", pd.Series(dtype=str)).astype(str).str.upper()
+                outcome_df = outcome_df[outcome_df["Result"].isin(["PASSED", "FAILED"])]
+                if outcome_df.empty:
+                    st.info("No completed passed or failed challenges yet.")
+                else:
+                    counts = (
+                        outcome_df["Result"]
+                        .value_counts()
+                        .reindex(["PASSED", "FAILED"], fill_value=0)
+                        .reset_index()
+                    )
+                    counts.columns = ["Result", "Challenges"]
+                    total_challenges = int(counts["Challenges"].sum())
+                    counts["Share"] = counts["Challenges"].apply(lambda x: f"{(float(x) / total_challenges * 100):.1f}%" if total_challenges else "0.0%")
+                    counts["Label"] = counts.apply(lambda r: f"{int(r['Challenges'])} · {r['Share']}", axis=1)
+                    fig = px.bar(
+                        counts,
+                        x="Result",
+                        y="Challenges",
+                        text="Label",
+                        title=f"Passed vs failed challenges · Total {total_challenges}",
+                    )
+                    fig.update_traces(textposition="outside", cliponaxis=False)
+                    fig.update_layout(
+                        height=360,
+                        margin=dict(t=60, b=30, l=20, r=20),
+                        yaxis_title="Number of challenges",
+                        xaxis_title="Challenge result",
+                        showlegend=False,
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
 
             if not day_summary.empty:
                 st.markdown("**Daily challenge ledger**")
@@ -5677,8 +5821,20 @@ def render_workflow(username: str, settings: dict) -> None:
             history_view["Timeframe"] = challenge_tf
             history_view["Challenge"] = history_view["challenge_number"].apply(lambda x: f"#{int(x)}" if pd.notna(x) else "—")
             history_view["Result"] = history_view["status"].astype(str).str.upper()
-            history_view["Phase 1"] = history_view["phase_1_passed"].apply(lambda x: "PASSED" if bool(x) else "NOT PASSED")
-            history_view["Phase 2"] = history_view["phase_2_passed"].apply(lambda x: "PASSED" if bool(x) else "NOT PASSED")
+            def _phase1_label(row):
+                if bool(row.get("phase_1_passed", False)):
+                    return "PASSED"
+                return "FAILED" if str(row.get("status", "")).upper() == "FAILED" else "ACTIVE"
+
+            def _phase2_label(row):
+                if bool(row.get("phase_2_passed", False)):
+                    return "PASSED"
+                if bool(row.get("phase_1_passed", False)) and str(row.get("status", "")).upper() == "FAILED":
+                    return "FAILED"
+                return "LOCKED"
+
+            history_view["Phase 1"] = history_view.apply(_phase1_label, axis=1)
+            history_view["Phase 2"] = history_view.apply(_phase2_label, axis=1)
             history_view["Started"] = history_view["started_at"].apply(fmt_nairobi)
             history_view["Finished"] = history_view["finished_at"].apply(fmt_nairobi)
             def _fmt_usd(value, signed: bool = False) -> str:
