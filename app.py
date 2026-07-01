@@ -5820,7 +5820,27 @@ def render_workflow(username: str, settings: dict) -> None:
 
             if not day_summary.empty:
                 st.markdown("**Daily challenge ledger · all simulated challenges**")
-                daily_view = day_summary.copy().sort_values("Day", ascending=False)
+                daily_view = day_summary.copy()
+
+                # Keep the ledger human-logical: latest challenge first, but
+                # inside each challenge show Phase 1 before Phase 2, and each
+                # phase in chronological day order. This avoids Phase 2 rows
+                # appearing above the Phase 1 rows that actually came first.
+                daily_view["__challenge_no"] = daily_view["Challenge"].astype(str).str.replace("#", "", regex=False)
+                daily_view["__challenge_no"] = pd.to_numeric(daily_view["__challenge_no"], errors="coerce").fillna(-1).astype(int)
+                daily_view["__phase_order"] = daily_view["Phase"].astype(str).str.extract(r"(\d+)")[0]
+                daily_view["__phase_order"] = pd.to_numeric(daily_view["__phase_order"], errors="coerce").fillna(99).astype(int)
+                daily_view["__day_sort"] = pd.to_datetime(daily_view["Day"], errors="coerce")
+
+                daily_view = daily_view.sort_values(
+                    ["__challenge_no", "__phase_order", "__day_sort"],
+                    ascending=[False, True, True],
+                    kind="mergesort",
+                )
+
+                if "Day" in daily_view.columns:
+                    daily_view["Day"] = pd.to_datetime(daily_view["Day"], errors="coerce").dt.strftime("%Y-%m-%d")
+
                 if "Challenge" in daily_view.columns:
                     daily_challenges = sorted(
                         [str(x) for x in daily_view["Challenge"].dropna().unique()],
@@ -5834,6 +5854,8 @@ def render_workflow(username: str, settings: dict) -> None:
                     )
                     if selected_daily_challenge != "All":
                         daily_view = daily_view[daily_view["Challenge"].astype(str) == selected_daily_challenge].copy()
+
+                daily_view = daily_view.drop(columns=["__challenge_no", "__phase_order", "__day_sort"], errors="ignore")
                 render_benzino_aggrid(
                     daily_view,
                     key="challenge_daily_loss_check",
