@@ -60,7 +60,7 @@ except Exception:  # pragma: no cover
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "v7.3-prop-history-phase-columns"
+APP_VERSION = "v7.3-no-trade-shadow-curve"
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "assets"
 LOGO_PATH = ASSETS_DIR / "benzino_logo.png"
@@ -5772,14 +5772,36 @@ def render_workflow(username: str, settings: dict) -> None:
             if "prop_event_time" in view.columns:
                 view["closed_at"] = view["prop_event_time"].apply(fmt_nairobi)
             cols = ["closed_at", "asset", "timeframe", "signal", "grade", "status", "outcome", "r_multiple", "pnl_cash", "balance_after", "exit_reason", "entry", "sl", "tp"]
+
+            closed_trade_table = prepare_signal_table(
+                view[[c for c in cols if c in view.columns]].sort_values("closed_at", ascending=False).head(300)
+            )
+            closed_trade_table = closed_trade_table.rename(columns={
+                "closed_at": "Closed At",
+                "pnl_cash": "P/L Cash",
+                "balance_after": "Balance After",
+            })
+
+            for money_col in ["P/L Cash", "Balance After"]:
+                if money_col in closed_trade_table.columns:
+                    closed_trade_table[money_col] = pd.to_numeric(closed_trade_table[money_col], errors="coerce").apply(
+                        lambda x: "—" if pd.isna(x) else f"${x:,.2f}"
+                    )
+
+            closed_trade_order = [
+                "Asset", "Signal", "Grade", "Status", "Outcome", "R Multiple", "Timeframe",
+                "Closed At", "P/L Cash", "Balance After", "Exit Reason", "Entry", "SL", "TP"
+            ]
+            closed_trade_table = closed_trade_table[[c for c in closed_trade_order if c in closed_trade_table.columns] + [c for c in closed_trade_table.columns if c not in closed_trade_order]]
+
             render_benzino_aggrid(
-                prepare_signal_table(view[[c for c in cols if c in view.columns]].sort_values("closed_at", ascending=False).head(300)),
+                closed_trade_table,
                 key="challenge_closed_trades",
                 height=420,
                 page_size=10,
                 pinned=["Asset", "Signal", "Grade"],
                 badge_cols={"Signal":"signal", "Grade":"grade", "Status":"status", "Outcome":"outcome"},
-                numeric_cols_right=["R Multiple", "pnl_cash", "balance_after", "Entry", "SL", "TP"],
+                numeric_cols_right=["R Multiple", "Entry", "SL", "TP"],
                 show_status_filter=False,
             )
 
@@ -5996,23 +6018,73 @@ def render_workflow(username: str, settings: dict) -> None:
             if "shadow_outcome" in no_trades_directional.columns and not no_trades_directional.empty
             else pd.DataFrame()
         )
+        # No Trade research dashboard: simulate a separate account that takes
+        # every rejected/blocked idea as a hypothetical trade using the user's
+        # selected account size and risk settings. Only resolved shadow rows are
+        # included in the curve because unresolved ideas have no final R yet.
+        shadow_starting_balance = float(settings.get("account_size") or 10000.0)
+        shadow_risk_pct = float(settings.get("risk_pct") or 1.0) / 100.0
+        shadow_risk_cash = shadow_starting_balance * shadow_risk_pct
+
+        shadow_curve = no_trades_resolved.copy() if not no_trades_resolved.empty else pd.DataFrame()
+        if not shadow_curve.empty:
+            shadow_curve["shadow_closed_at_sort"] = pd.to_datetime(
+                shadow_curve.get("shadow_closed_at", shadow_curve.get("created_at")),
+                errors="coerce", utc=True,
+            )
+            shadow_curve["created_at_sort"] = pd.to_datetime(shadow_curve.get("created_at"), errors="coerce", utc=True)
+            shadow_curve["curve_time"] = shadow_curve["shadow_closed_at_sort"].fillna(shadow_curve["created_at_sort"])
+            shadow_curve["shadow_r_multiple"] = pd.to_numeric(shadow_curve["shadow_r_multiple"], errors="coerce")
+            shadow_curve = shadow_curve.dropna(subset=["curve_time", "shadow_r_multiple"]).sort_values("curve_time")
+            shadow_curve["Hypothetical P/L"] = shadow_curve["shadow_r_multiple"] * shadow_risk_cash
+            shadow_curve["Balance"] = shadow_starting_balance + shadow_curve["Hypothetical P/L"].cumsum()
+
+        resolved_count = int(len(shadow_curve)) if not shadow_curve.empty else 0
+        total_shadow_pnl = float(shadow_curve["Hypothetical P/L"].sum()) if resolved_count else 0.0
+        shadow_balance = shadow_starting_balance + total_shadow_pnl
+        hyp_win_rate = 0.0
+        hyp_avg_r = 0.0
+        if resolved_count:
+            hyp_win_rate = float((shadow_curve["shadow_r_multiple"] > 0).mean() * 100)
+            hyp_avg_r = float(shadow_curve["shadow_r_multiple"].mean())
+
         h1, h2, h3, h4 = st.columns(4)
-        with h1: metric_card("Total shadow rows", f"{len(no_trades):,}", "Never alerted, never journaled")
-        with h2: metric_card("Directional ideas", f"{len(no_trades_directional):,}", "BUY/SELL blocked by grade or R:R")
-        with h3: metric_card("HOLD (no consensus)", f"{len(no_trades_hold):,}", "Systems genuinely split, no direction")
-        with h4: metric_card("Hypothetically resolved", f"{len(no_trades_resolved):,}", "Scanner checked TP/SL/expiry")
-        if not no_trades_resolved.empty:
-            hyp_wins = no_trades_resolved["shadow_outcome"].astype(str).eq("SHADOW_TP")
-            hyp_win_rate = (hyp_wins.sum() / len(no_trades_resolved) * 100) if len(no_trades_resolved) else 0.0
-            r5, r6 = st.columns(2)
-            with r5: metric_card("Hypothetical win rate", f"{hyp_win_rate:.2f}%", "Not part of real journal win rate")
-            with r6: metric_card("Hypothetical avg R", f"{pd.to_numeric(no_trades_resolved['shadow_r_multiple'], errors='coerce').mean():+.2f}R", "Across resolved blocked ideas")
+        with h1: metric_card("No Trade balance", f"${shadow_balance:,.2f}", f"Start ${shadow_starting_balance:,.0f} · risk {shadow_risk_pct*100:.2f}%")
+        with h2: metric_card("No Trade P/L", f"${total_shadow_pnl:+,.2f}", "If every resolved blocked idea was taken")
+        with h3: metric_card("Resolved shadow trades", f"{resolved_count:,}", f"From {len(no_trades):,} total shadow rows")
+        with h4: metric_card("No Trade win rate", f"{hyp_win_rate:.2f}%", f"Average {hyp_avg_r:+.2f}R")
+
+        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
+        st.subheader("No Trade hypothetical balance curve")
+        if resolved_count:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=shadow_curve["curve_time"],
+                y=shadow_curve["Balance"],
+                mode="lines",
+                name="No Trade only",
+                hovertemplate="%{x|%Y-%m-%d %H:%M}<br>Balance: $%{y:,.2f}<extra></extra>",
+            ))
+            fig.update_layout(
+                height=360,
+                margin=dict(t=20, b=40, l=20, r=20),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                xaxis_title="Resolved at",
+                yaxis_title="Hypothetical balance",
+                legend_title_text="",
+            )
+            fig.update_yaxes(tickprefix="$", tickformat=",.0f")
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             st.markdown(
-                "<div class='grey-note'>⚠️ These figures describe what would have happened if every blocked directional idea "
-                "had been taken anyway. They are shadow research only and are <b>excluded</b> from the real "
-                "User Journal and Prop Firm win rates above, by design.</div>",
+                "<div class='grey-note'>This curve is research-only. It uses resolved SHADOW rows from Supabase, "
+                "the selected timeframe/watchlist scope, and your selected account/risk settings. It is excluded from "
+                "User Journal and Prop Firm performance.</div>",
                 unsafe_allow_html=True,
             )
+        else:
+            st.info("No resolved No Trade shadow outcomes yet. After the scanner runs with the updated shadow-tracking logic, this curve will populate from Supabase automatically.")
+
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         no_trade_cols = ["created_at_eat", "asset", "timeframe", "signal", "grade", "status", "entry", "sl", "tp", "rr", "confidence", "edge_score", "shadow_outcome", "shadow_r_multiple", "shadow_exit_price", "reason", "session"]
         no_trade_table = no_trades[[c for c in no_trade_cols if c in no_trades.columns]].copy() if not no_trades.empty else pd.DataFrame(columns=[c for c in no_trade_cols if c in no_trades.columns])

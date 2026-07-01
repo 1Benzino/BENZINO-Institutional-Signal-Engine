@@ -949,7 +949,6 @@ def fetch_unresolved_shadow_trades(assets: set[str] | None = None, timeframes: s
                 SELECT * FROM scanner_signals
                 WHERE status = 'SHADOW'
                   AND shadow_outcome IS NULL
-                  AND signal IN ('BUY', 'SELL')
                   AND created_at >= NOW() - INTERVAL '%s days'
             """
             params: list = [max_age_days]
@@ -1660,7 +1659,8 @@ def grade_signal(confluence: dict, rr: float) -> tuple[str, str]:
 def build_trade_plan(price: float, atr: float, signal: str) -> dict:
     atr = safe_number(atr)
     price = safe_number(price)
-    if atr <= 0 or signal == "HOLD":
+    signal = str(signal or "").upper()
+    if atr <= 0 or signal not in ("BUY", "SELL"):
         return {"sl": price, "tp": price, "size": 0, "rr": 0}
     sl = price - atr * ATR_SL_MULT if signal == "BUY" else price + atr * ATR_SL_MULT
     tp = price + atr * ATR_TP_MULT if signal == "BUY" else price - atr * ATR_TP_MULT
@@ -1668,6 +1668,41 @@ def build_trade_plan(price: float, atr: float, signal: str) -> dict:
     size = (ACCOUNT_SIZE * RISK_PER_TRADE) / dist if dist > 0 else 0
     rr = abs(tp - price) / dist if dist > 0 else 0
     return {"sl": sl, "tp": tp, "size": size, "rr": rr}
+
+
+def choose_shadow_research_direction(confluence: dict) -> str:
+    """Choose a hypothetical BUY/SELL direction for NO TRADE research rows.
+
+    A NO TRADE row still needs a trade plan if we want to test whether the
+    system was too strict. For normal weak-direction setups, this returns the
+    dominant side. For split/no-consensus setups, it uses the strongest
+    non-neutral strategy vote, then ML probability as a deterministic tie-break.
+    This direction is research-only: the row remains SHADOW and is never alerted,
+    journaled, or posted to the prop ledger.
+    """
+    try:
+        dominant = str(confluence.get("dominant", "")).upper()
+        if dominant == "BULLISH":
+            return "BUY"
+        if dominant == "BEARISH":
+            return "SELL"
+
+        votes = confluence.get("votes") or {}
+        scored = []
+        for name, payload in votes.items():
+            direction = str((payload or {}).get("direction", "")).upper()
+            if direction not in ("BULLISH", "BEARISH"):
+                continue
+            strength = safe_number((payload or {}).get("strength"), 0.0)
+            scored.append((strength, direction, str(name)))
+        if scored:
+            scored.sort(reverse=True)
+            return "BUY" if scored[0][1] == "BULLISH" else "SELL"
+
+        ml_prob = safe_number(confluence.get("ml_prob"), 0.5)
+        return "BUY" if ml_prob >= 0.5 else "SELL"
+    except Exception:
+        return "BUY"
 
 
 def compute_edge_score(signal: str, confidence: float, ml_prob: float, rr: float,
@@ -1750,7 +1785,10 @@ def scan_asset(asset: str, ticker: str, timeframe: str = "15m") -> ScanResult | 
         confluence = strategy_confluence(df_entry, mtf_vote=(mtf_dir, mtf_strength))
 
         dominant = confluence["dominant"]
-        signal = "BUY" if dominant == "BULLISH" else "SELL" if dominant == "BEARISH" else "HOLD"
+        # Even when the final grade is NO TRADE, build a research-only
+        # hypothetical BUY/SELL plan so the No Trade Tracker can test what
+        # would have happened if the blocked idea had been taken anyway.
+        signal = "BUY" if dominant == "BULLISH" else "SELL" if dominant == "BEARISH" else choose_shadow_research_direction(confluence)
         price = safe_number(df_entry["Close"].iloc[-1])
         atr = safe_number(df_entry["ATR"].iloc[-1], 0.0) if "ATR" in df_entry.columns else 0.0
         rsi = safe_number(df_entry["RSI"].iloc[-1], 50.0) if "RSI" in df_entry.columns else 50.0
@@ -2076,7 +2114,7 @@ def evaluate_open_trades(assets: set[str] | None = None, timeframes: set[str] | 
     print(f"[Evaluate] Checking {len(open_trades)} open trade(s)...")
     for t in open_trades:
         asset, ticker, timeframe = t["asset"], t["ticker"], t["timeframe"]
-        signal, entry, sl, tp = t["signal"], float(t["entry"]), float(t["sl"]), float(t["tp"])
+        signal, entry, sl, tp = str(t["signal"]).upper(), float(t["entry"]), float(t["sl"]), float(t["tp"])
         signal_id = t["signal_id"]
         grade = t["grade"]
 
@@ -2141,6 +2179,85 @@ def evaluate_open_trades(assets: set[str] | None = None, timeframes: set[str] | 
             bump_bars_open(signal_id, bars_open)
 
 
+def backfill_shadow_trade_plans(assets: set[str] | None = None, timeframes: set[str] | None = None, max_age_days: int = 60) -> int:
+    """Repair legacy NO TRADE rows that were saved with Entry = SL = TP.
+
+    Older builds stored split/HOLD rows without a usable hypothetical trade
+    plan, so the app could not evaluate them. This backfills a research-only
+    BUY/SELL direction and 1:2 ATR-based plan using the row's saved entry/ATR.
+    The row stays SHADOW and remains excluded from real journal/prop metrics.
+    """
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            sql = """
+                SELECT signal_id, asset, timeframe, signal, entry, sl, tp, atr, ml_prob, strategy_votes
+                FROM scanner_signals
+                WHERE status = 'SHADOW'
+                  AND shadow_outcome IS NULL
+                  AND created_at >= NOW() - INTERVAL '%s days'
+                  AND (
+                        UPPER(TRIM(COALESCE(signal,''))) = 'HOLD'
+                     OR ABS(COALESCE(entry,0) - COALESCE(sl,0)) <= 0.00000001
+                     OR ABS(COALESCE(sl,0) - COALESCE(tp,0)) <= 0.00000001
+                  )
+            """
+            params: list = [max_age_days]
+            if assets:
+                sql += " AND asset = ANY(%s)"
+                params.append(list(assets))
+            if timeframes:
+                sql += " AND timeframe = ANY(%s)"
+                params.append(list(timeframes))
+            sql += " ORDER BY created_at ASC LIMIT 1000"
+            cur.execute(sql, tuple(params))
+            rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    except Exception as exc:
+        print(f"[Shadow] Backfill fetch failed: {exc}")
+        return 0
+
+    updated = 0
+    for row in rows:
+        try:
+            entry = safe_number(row.get("entry"), 0.0)
+            atr = safe_number(row.get("atr"), 0.0)
+            if entry <= 0 or atr <= 0:
+                continue
+            votes = row.get("strategy_votes") or {}
+            if isinstance(votes, str):
+                try:
+                    votes = json.loads(votes)
+                except Exception:
+                    votes = {}
+            confluence = {"dominant": "SPLIT", "votes": votes, "ml_prob": safe_number(row.get("ml_prob"), 0.5)}
+            direction = choose_shadow_research_direction(confluence)
+            plan = build_trade_plan(entry, atr, direction)
+            if abs(plan["sl"] - entry) <= 0 or abs(plan["tp"] - plan["sl"]) <= 0:
+                continue
+            conn = db_connect()
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE scanner_signals
+                        SET signal = %s, sl = %s, tp = %s, rr = %s,
+                            reason = COALESCE(reason, '') || ' | Shadow research plan backfilled: hypothetical ' || %s || ' using ATR 1:2 RR.'
+                        WHERE signal_id = %s
+                          AND status = 'SHADOW'
+                          AND shadow_outcome IS NULL
+                        """,
+                        (direction, round(plan["sl"], 8), round(plan["tp"], 8), round(plan["rr"], 2), direction, row["signal_id"]),
+                    )
+                    updated += cur.rowcount
+            conn.close()
+        except Exception as exc:
+            print(f"[Shadow] Backfill skipped row {row.get('signal_id')}: {exc}")
+    if updated:
+        print(f"[Shadow] Backfilled {updated} legacy NO TRADE hypothetical plan(s).")
+    return updated
+
+
 def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] | None = None) -> int:
     """
     Hypothetically resolve NO TRADE (shadow) signals using the exact same
@@ -2151,6 +2268,7 @@ def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] 
     your hypothetical win rate would have been X%" — clearly separate from the
     real journal win rate, which only ever counts A+/A/B/C trades.
     """
+    backfill_shadow_trade_plans(assets=assets, timeframes=timeframes)
     shadow_trades = fetch_unresolved_shadow_trades(assets=assets, timeframes=timeframes)
     if not shadow_trades:
         print("[Shadow] No unresolved NO TRADE rows to evaluate.")
@@ -2160,7 +2278,7 @@ def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] 
     resolved = 0
     for t in shadow_trades:
         asset, ticker, timeframe = t["asset"], t["ticker"], t["timeframe"]
-        signal, entry, sl, tp = t["signal"], float(t["entry"]), float(t["sl"]), float(t["tp"])
+        signal, entry, sl, tp = str(t["signal"]).upper(), float(t["entry"]), float(t["sl"]), float(t["tp"])
         signal_id = t["signal_id"]
 
         if abs(entry - sl) <= 0 or sl == tp:
@@ -2188,6 +2306,12 @@ def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] 
             else:
                 hit_sl, hit_tp = high >= sl, low <= tp
 
+            if hit_sl and hit_tp:
+                # Same conservative rule as real trades: ambiguous same-candle
+                # TP+SL is treated as SL.
+                close_shadow_trade(signal_id, sl, "SHADOW_SL", -1.0)
+                closed = True
+                break
             if hit_sl:
                 close_shadow_trade(signal_id, sl, "SHADOW_SL", -1.0)
                 closed = True
