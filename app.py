@@ -1397,7 +1397,9 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
     prop_firm_state balance and reconstructs every pass/fail from Supabase trade
     history since account activation. Each new cycle starts from $10,000. Phase 1
     needs +$1,000, Phase 2 needs +$500, and either phase fails on -$500 daily loss
-    or -$1,000 total loss.
+    or -$1,000 total loss. Phase targets end the phase immediately; the
+    dashboard does not keep accumulating the same phase after the target has
+    already been reached.
     """
     risk_cash = starting * 0.01
     daily_floor = -starting * 0.05
@@ -1507,7 +1509,7 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
         elif phase_daily.get(day, 0.0) <= daily_floor:
             terminal = "FAILED"
             reason = "5% max daily loss breached"
-        elif phase_balance >= targets[phase] and len(phase_days) >= 4:
+        elif phase_balance >= targets[phase]:
             if phase == 1:
                 # Phase 1 passed. Phase 2 begins from a fresh $10,000 verification account.
                 cycle_phase1_passed = True
@@ -5155,8 +5157,8 @@ def render_workflow(username: str, settings: dict) -> None:
         st.caption(
             f"This tab recalculates the FTMO-style challenge from your current watchlist and selected timeframe "
             f"({challenge_tf}). It uses only A+/A closed trades, fixed $10,000 account size, 1% risk per trade, "
-            f"10% profit target, 5% max daily loss, 10% max total loss, and minimum 4 trading days. "
-            "When a challenge passes Phase 2 or fails a rule, it is archived below and the next challenge starts automatically."
+            f"Phase 1 target +$1,000, Phase 2 target +$500, 5% max daily loss and 10% max total loss. "
+            "Each phase is closed as soon as its target or a breach is reached, then the next phase/cycle starts from the next eligible Supabase trade."
         )
 
         prop_source = trades[
@@ -5472,7 +5474,7 @@ def render_workflow(username: str, settings: dict) -> None:
         with c1: metric_card("Current phase equity", f"${current:,.2f}", f"{active_phase_name} · Start ${starting:,.0f}")
         with c2: metric_card("ROI to target", f"{roi_pct:+.2f}%", f"Target {active_target_label}")
         with c3: metric_card("Worst day P/L", f"${worst_day_pnl:+,.2f}", f"Daily floor -${starting*0.05:,.0f}")
-        with c4: metric_card("Trading days", f"{trading_days}", "Minimum 4 required")
+        with c4: metric_card("Trading days", f"{trading_days}", "Current phase only")
         with c5: metric_card("Challenge status", current_phase_status, current_phase_subtitle)
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
@@ -5507,15 +5509,15 @@ def render_workflow(username: str, settings: dict) -> None:
         if status == "FAILED":
             st.error("This challenge failed because the selected timeframe/watchlist breached a prop-firm loss rule. The balance can still be above $10,000 and fail if one trading day loses more than $500.")
         elif active_phase_number == 2:
-            st.success("Phase 1 has passed. The account is now in Phase 2 verification and will only archive as a full challenge pass after the +$500 Phase 2 target and minimum trading days are met.")
+            st.success("Phase 1 has passed. The account is now in Phase 2 verification and will archive as a full challenge pass once the +$500 Phase 2 target is reached.")
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         st.subheader("FTMO rule coverage")
         r1, r2, r3 = st.columns(3)
         with r1:
-            metric_card("Phase 1 Challenge", phase1.get("status", "ACTIVE"), f"Target +$1,000 · {phase1.get('trading_days', 0)}/4 trading days")
+            metric_card("Phase 1 Challenge", phase1.get("status", "ACTIVE"), "Target +$1,000")
         with r2:
-            metric_card("Phase 2 Verification", phase2.get("status", "LOCKED"), f"Target +$500 · {phase2.get('trading_days', 0)}/4 trading days")
+            metric_card("Phase 2 Verification", phase2.get("status", "LOCKED"), "Target +$500")
         with r3:
             metric_card("Funded Account", funded_status, "Unlimited target · 90% split")
 
@@ -5666,15 +5668,15 @@ def render_workflow(username: str, settings: dict) -> None:
             history_view["Trading Days"] = pd.to_numeric(history_view["trading_days"], errors="coerce").fillna(0).astype(int)
             history_view["Failure Reason"] = history_view.get("failure_reason", "").fillna("").astype(str) if "failure_reason" in history_view.columns else ""
             display_cols = [
-                "Challenge", "Timeframe", "Result", "Phase 1", "Phase 2", "Failure Reason", "Started", "Finished",
-                "Starting Balance", "Ending Balance", "Realised P/L", "Win Rate %", "Trading Days",
+                "Challenge", "Timeframe", "Result", "Failure Reason", "Finished",
+                "Starting Balance", "Ending Balance", "Realised P/L", "Win Rate %", "Trading Days", "Phase 1", "Phase 2", "Started",
             ]
             render_benzino_aggrid(
                 history_view[[c for c in display_cols if c in history_view.columns]],
                 key=f"challenge_review_history_{challenge_tf}",
                 height=320,
                 page_size=10,
-                pinned=["Challenge", "Timeframe", "Result"],
+                pinned=["Challenge", "Timeframe", "Result", "Failure Reason"],
                 badge_cols={"Result": "status", "Phase 1": "status", "Phase 2": "status"},
                 numeric_cols_right=["Starting Balance", "Ending Balance", "Realised P/L", "Win Rate %", "Trading Days"],
                 enable_search=False,
