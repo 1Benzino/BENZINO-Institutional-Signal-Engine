@@ -82,6 +82,13 @@ ADMIN_USERNAMES = set()  # Admin is now assigned by database role: first created
 VALID_GRADES = {"A+", "A", "B", "C"}
 SIGNAL_TIMEFRAMES = ["All", "15m", "1h", "4h", "1d"]
 
+# Prop-firm challenge rules used by the Supabase replay simulator.
+CHALLENGE_MIN_TRADING_DAYS = 4
+CHALLENGE_PHASE1_TARGET_PCT = 0.10
+CHALLENGE_PHASE2_TARGET_PCT = 0.05
+CHALLENGE_MAX_DAILY_LOSS_PCT = 0.05
+CHALLENGE_MAX_TOTAL_LOSS_PCT = 0.10
+
 ASSET_UNIVERSE = {
     "XAUUSD": {"name": "XAUUSD", "ticker": "GC=F", "group": "Commodities"},
     "XAGUSD": {"name": "XAGUSD", "ticker": "SI=F", "group": "Commodities"},
