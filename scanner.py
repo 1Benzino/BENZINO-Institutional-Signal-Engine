@@ -554,6 +554,7 @@ CAPITAL_AUTO_TRADE_OWNER = os.environ.get("CAPITAL_AUTO_TRADE_OWNER", "").strip(
 CAPITAL_AUTO_TRADE_MIN_SIZE = float(os.environ.get("CAPITAL_AUTO_TRADE_MIN_SIZE", "0.01"))
 CAPITAL_AUTO_TRADE_MAX_SIZE = float(os.environ.get("CAPITAL_AUTO_TRADE_MAX_SIZE", "0"))  # 0 means no cap
 CAPITAL_AUTO_TRADE_USE_STOPS = os.environ.get("CAPITAL_AUTO_TRADE_USE_STOPS", "true").strip().lower() in {"1", "true", "yes", "y"}
+CAPITAL_AUTO_TRADE_SIZE_RETRY = os.environ.get("CAPITAL_AUTO_TRADE_SIZE_RETRY", "true").strip().lower() in {"1", "true", "yes", "y"}
 
 # Schema migrations are intentionally OFF during normal scanner runs.
 # Running ALTER TABLE / CREATE INDEX every 15 minutes can deadlock with another
@@ -1301,7 +1302,6 @@ def update_prop_firm(signal_id: str, asset: str, grade: str, r_multiple: float) 
         return
 
     force_open_graded_setups()
-    sync_capital_actual_executions()
     state = load_prop_firm_state()
     if state.get("status") != "ACTIVE":
         print(f"[PropFirm] Challenge already {state.get('status')} — ignoring new trade.")
@@ -3399,6 +3399,16 @@ def _parse_float_or_none(value):
         return None
 
 
+def deterministic_uuid_text(seed: str) -> str:
+    """Return a UUID string for comparison rows even when Supabase id is UUID.
+
+    Earlier comparison code used readable ids like AUTO::<signal_id>. That fails
+    when the table was created with id UUID PRIMARY KEY. Using uuid5 keeps the
+    row deterministic and still works if the column is TEXT.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, str(seed or uuid.uuid4().hex)))
+
+
 def capital_asset_from_epic(epic: str, name: str = "") -> str:
     epic_u = str(epic or "").upper()
     name_u = str(name or "").upper()
@@ -3661,7 +3671,7 @@ def rebuild_capital_trade_comparisons(limit: int = 500) -> int:
                         basis = max(abs(simulated_entry or 0), 1.0)
                         drift_pct = abs(entry_diff) / basis * 100
                         quality = "TIGHT" if drift_pct <= 0.05 else "OK" if drift_pct <= 0.25 else "WIDE"
-                    comp_id = f"{actual.get('id')}::{sim.get('signal_id')}"
+                    comp_id = deterministic_uuid_text(f"CAPITAL::{actual.get('id')}::{sim.get('signal_id')}")
                     cur.execute(
                         """
                         INSERT INTO capital_trade_comparisons (
@@ -3893,33 +3903,65 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
         print(f"[CapitalAuto] {sig.asset} {timeframe}: size calculation failed; order skipped.")
         return False
 
-    payload = {
-        "epic": epic,
-        "direction": direction,
-        "size": float(trade_size),
-        "guaranteedStop": False,
-    }
-    if CAPITAL_AUTO_TRADE_USE_STOPS:
-        payload["stopLevel"] = float(sig.sl)
-        payload["profitLevel"] = float(sig.tp)
+    size_attempts = [float(trade_size)]
+    if CAPITAL_AUTO_TRADE_SIZE_RETRY:
+        for div in (2, 5, 10, 25, 50, 100):
+            candidate = round(float(trade_size) / div, 6)
+            if candidate >= CAPITAL_AUTO_TRADE_MIN_SIZE and candidate not in size_attempts:
+                size_attempts.append(candidate)
+        if 1.0 >= CAPITAL_AUTO_TRADE_MIN_SIZE and 1.0 not in size_attempts:
+            size_attempts.append(1.0)
 
-    response = capital_request("POST", "/positions", json_body=payload, retries=2)
-    if not isinstance(response, dict):
-        record_capital_auto_order(sig, status="FAILED", epic=epic, size=trade_size, error="POST /positions failed", raw={"payload": payload, "sizing": sizing})
-        print(f"[CapitalAuto] {sig.asset} {direction}: order failed.")
-        return False
+    response = None
+    confirm = None
+    deal_reference = ""
+    deal_id = ""
+    confirmed_size = float(trade_size)
+    last_payload = {}
+    last_error = "POST /positions failed"
 
-    deal_reference = str(response.get("dealReference") or response.get("reference") or "")
-    confirm = capital_confirm_deal(deal_reference) if deal_reference else None
+    for attempt_size in size_attempts:
+        payload = {
+            "epic": epic,
+            "direction": direction,
+            "size": float(attempt_size),
+            "guaranteedStop": False,
+        }
+        if CAPITAL_AUTO_TRADE_USE_STOPS:
+            payload["stopLevel"] = float(sig.sl)
+            payload["profitLevel"] = float(sig.tp)
+        last_payload = payload
+
+        response = capital_request("POST", "/positions", json_body=payload, retries=2)
+        if not isinstance(response, dict):
+            last_error = "POST /positions failed"
+            continue
+
+        deal_reference = str(response.get("dealReference") or response.get("reference") or "")
+        confirm = capital_confirm_deal(deal_reference) if deal_reference else None
+        confirm_status_try = str(_first_value(confirm or {}, ["dealStatus", "status"], "") or "").upper()
+        reject_reason = str(_first_value(confirm or {}, ["reason", "rejectReason", "errorCode", "errorMessage", "message"], "") or "")
+        deal_id_try = str(_first_value(confirm or {}, ["dealId", "dealID"], "") or "")
+        if bool(deal_reference) and (not confirm_status_try or confirm_status_try in {"ACCEPTED", "OPEN", "SUCCESS", "CONFIRMED"}):
+            deal_id = deal_id_try
+            confirmed_size = float(attempt_size)
+            break
+        last_error = f"Capital confirmation status: {confirm_status_try or 'unknown'}" + (f" · {reject_reason}" if reject_reason else "")
+        # If a broker-side size/limit rejection happens, retry smaller. For other
+        # rejections, keep trying smaller once because Capital often omits the reason.
+        if not CAPITAL_AUTO_TRADE_SIZE_RETRY:
+            break
+    else:
+        response = response if isinstance(response, dict) else None
+
     confirm_status = str(_first_value(confirm or {}, ["dealStatus", "status"], "") or "").upper()
-    deal_id = str(_first_value(confirm or {}, ["dealId", "dealID"], "") or "")
     ok = bool(deal_reference) and (not confirm_status or confirm_status in {"ACCEPTED", "OPEN", "SUCCESS", "CONFIRMED"})
     status = "OPENED" if ok else "REJECTED"
-    error = "" if ok else f"Capital confirmation status: {confirm_status or 'unknown'}"
-    record_capital_auto_order(sig, status=status, deal_reference=deal_reference, deal_id=deal_id, epic=epic, size=trade_size, error=error, raw={"payload": payload, "sizing": sizing, "response": response, "confirm": confirm or {}})
+    error = "" if ok else last_error
+    record_capital_auto_order(sig, status=status, deal_reference=deal_reference, deal_id=deal_id, epic=epic, size=confirmed_size, error=error, raw={"payload": last_payload, "original_size": trade_size, "sizing": sizing, "response": response or {}, "confirm": confirm or {}})
     user_label = str(sizing.get("username") or SCAN_OWNER)
     if ok:
-        print(f"[CapitalAuto] {sig.asset} {timeframe} {direction} {grade}: demo trade opened for {user_label} · size {trade_size} · ref {deal_reference}.")
+        print(f"[CapitalAuto] {sig.asset} {timeframe} {direction} {grade}: demo trade opened for {user_label} · size {confirmed_size} · ref {deal_reference}.")
     else:
         print(f"[CapitalAuto] {sig.asset} {timeframe} {direction} {grade}: order not accepted · {error}.")
     return ok
@@ -3960,7 +4002,7 @@ def rebuild_capital_auto_comparisons(limit: int = 500) -> int:
                         )
                         actual = cur.fetchone()
                     actual = dict(actual) if actual else {}
-                    comp_id = f"AUTO::{row.get('signal_id')}"
+                    comp_id = deterministic_uuid_text(f"AUTO::{row.get('signal_id')}")
                     actual_r = None
                     try:
                         entry = float(row.get("entry") or 0)
@@ -4142,7 +4184,6 @@ def run_scan() -> None:
             asset_seconds.append(time.perf_counter() - asset_start)
 
     force_open_graded_setups()
-    sync_capital_actual_executions()
     state = load_prop_firm_state()
     finished = datetime.now(timezone.utc)
     elapsed = (finished - started).total_seconds()
