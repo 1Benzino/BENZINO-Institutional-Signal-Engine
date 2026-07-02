@@ -549,7 +549,7 @@ REPLAY_EXISTING_OUTCOMES_LIMIT = int(os.environ.get("REPLAY_EXISTING_OUTCOMES_LI
 CAPITAL_SYNC_EXECUTIONS = os.environ.get("CAPITAL_SYNC_EXECUTIONS", "true").strip().lower() in {"1", "true", "yes", "y"}
 CAPITAL_ACTIVITY_LOOKBACK_SECONDS = int(os.environ.get("CAPITAL_ACTIVITY_LOOKBACK_SECONDS", str(7 * 24 * 60 * 60)))
 CAPITAL_MATCH_WINDOW_HOURS = int(os.environ.get("CAPITAL_MATCH_WINDOW_HOURS", "2"))
-CAPITAL_AUTO_TRADE_ENABLED = os.environ.get("CAPITAL_AUTO_TRADE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "y"}
+CAPITAL_AUTO_TRADE_ENABLED = os.environ.get("CAPITAL_AUTO_TRADE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y"}  # platform kill-switch; per-user toggle is in Supabase
 CAPITAL_AUTO_TRADE_REQUIRE_DEMO = os.environ.get("CAPITAL_AUTO_TRADE_REQUIRE_DEMO", "true").strip().lower() in {"1", "true", "yes", "y"}
 CAPITAL_AUTO_TRADE_GRADES = {g.strip().upper() for g in os.environ.get("CAPITAL_AUTO_TRADE_GRADES", "A+,A").split(",") if g.strip()}
 # Demo auto-trading is intentionally stricter than simulation: only A/A+ can be executed.
@@ -738,6 +738,7 @@ def init_tables() -> None:
         account_type TEXT DEFAULT 'DEMO',
         enabled BOOLEAN DEFAULT FALSE,
         auto_trade_enabled BOOLEAN DEFAULT FALSE,
+        auto_trade_grades TEXT DEFAULT 'A+,A',
         use_benzino_settings BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -4227,7 +4228,7 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
     Auto-trading is stricter than simulation:
       • only the user's watchlist
       • only the user's selected timeframe
-      • only A/A+
+      • only the grades the user selected for demo testing
       • only the user's dynamic best session
       • max 4 accepted auto-orders per Nairobi day
     """
@@ -4252,6 +4253,7 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
                     SELECT us.username, us.settings_json,
                            COALESCE(ucc.enabled, TRUE) AS capital_connected,
                            COALESCE(ucc.auto_trade_enabled, TRUE) AS user_auto_enabled,
+                           COALESCE(NULLIF(ucc.auto_trade_grades,''), 'A+,A') AS auto_trade_grades,
                            COALESCE(ucc.use_benzino_settings, TRUE) AS use_benzino_settings
                     FROM user_settings us
                     JOIN user_watchlists uw
@@ -4271,6 +4273,7 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
                     SELECT us.username, us.settings_json,
                            COALESCE(ucc.enabled, TRUE) AS capital_connected,
                            COALESCE(ucc.auto_trade_enabled, TRUE) AS user_auto_enabled,
+                           COALESCE(NULLIF(ucc.auto_trade_grades,''), 'A+,A') AS auto_trade_grades,
                            COALESCE(ucc.use_benzino_settings, TRUE) AS use_benzino_settings
                     FROM user_settings us
                     JOIN user_watchlists uw
@@ -4304,6 +4307,12 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
         username = str(row.get("username") or fallback["username"]).strip().lower()
         if row.get("capital_connected") is False or row.get("user_auto_enabled") is False:
             return {**fallback, "username": username, "skip_reason": "user_capital_autotrading_disabled"}
+        raw_grades = str(row.get("auto_trade_grades") or "A+,A")
+        user_grades = {g.strip().upper() for g in raw_grades.split(",") if g.strip()}
+        # Environment is only a platform safety ceiling; the user setting is the actual selector.
+        allowed_user_grades = user_grades & set(CAPITAL_AUTO_TRADE_GRADES)
+        if grade not in allowed_user_grades:
+            return {**fallback, "username": username, "auto_trade_allowed": False, "skip_reason": f"grade_not_selected:{grade}", "selected_grades": sorted(allowed_user_grades)}
         # Watchlist used for best-session analysis.
         watch = load_user_watchlist(username)
         watch_assets = {a.upper() for a in watch.keys()} or {asset}
@@ -4331,6 +4340,7 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
             "session_profile": session_profile,
             "current_session": current_session,
             "auto_trades_taken_today": taken_today,
+            "selected_grades": sorted(allowed_user_grades),
         }
     return fallback
 

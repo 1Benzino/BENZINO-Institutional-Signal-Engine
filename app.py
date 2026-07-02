@@ -291,6 +291,7 @@ def init_tables() -> None:
         account_type TEXT DEFAULT 'DEMO',
         enabled BOOLEAN DEFAULT FALSE,
         auto_trade_enabled BOOLEAN DEFAULT FALSE,
+        auto_trade_grades TEXT DEFAULT 'A+,A',
         use_benzino_settings BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -472,6 +473,7 @@ def init_tables() -> None:
                     )
                 """)
                 cur.execute("ALTER TABLE user_capital_connections ADD COLUMN IF NOT EXISTS auto_trade_enabled BOOLEAN DEFAULT FALSE")
+                cur.execute("ALTER TABLE user_capital_connections ADD COLUMN IF NOT EXISTS auto_trade_grades TEXT DEFAULT 'A+,A'")
                 cur.execute("ALTER TABLE user_capital_connections ADD COLUMN IF NOT EXISTS auto_trading_enabled BOOLEAN DEFAULT FALSE")
                 cur.execute("UPDATE user_capital_connections SET auto_trade_enabled = COALESCE(auto_trade_enabled, auto_trading_enabled, FALSE), auto_trading_enabled = COALESCE(auto_trading_enabled, auto_trade_enabled, FALSE)")
                 cur.execute("ALTER TABLE capital_auto_orders ADD COLUMN IF NOT EXISTS ftmo_leverage NUMERIC DEFAULT 100")
@@ -7059,13 +7061,13 @@ def render_settings(username: str, settings: dict) -> None:
 
 
     with tab_capital:
-        st.caption("Connect your own Capital.com demo account. Auto-trading uses your BENZINO watchlist, selected timeframe, A/A+ only, best session only, and max 4 demo trades per day. API credentials are stored in Supabase for the scanner to use.")
+        st.caption("Connect your own Capital.com demo account. Auto-trading uses your BENZINO watchlist, selected timeframe, selected demo grades, best session only, and max 4 demo trades per day. API credentials are stored in Supabase for the scanner to use.")
         try:
-            cap = read_df("SELECT username, account_type, enabled, auto_trade_enabled, use_benzino_settings, updated_at FROM user_capital_connections WHERE username = %s", (username,))
+            cap = read_df("SELECT username, account_type, enabled, auto_trade_enabled, auto_trade_grades, use_benzino_settings, updated_at FROM user_capital_connections WHERE username = %s", (username,))
             cap_row = cap.iloc[0].to_dict() if not cap.empty else {}
             cc1, cc2, cc3, cc4 = st.columns(4)
             with cc1: metric_card("Capital connection", "Active" if bool(cap_row.get("enabled", False)) else "Inactive", str(cap_row.get("account_type") or "DEMO"))
-            with cc2: metric_card("Auto-trading", "ON" if bool(cap_row.get("auto_trade_enabled", False)) else "OFF", "A/A+ · best session · max 4/day")
+            with cc2: metric_card("Auto-trading", "ON" if bool(cap_row.get("auto_trade_enabled", False)) else "OFF", str(cap_row.get("auto_trade_grades") or "A+,A") + " · best session · max 4/day")
             with cc3: metric_card("Sizing source", "BENZINO" if bool(cap_row.get("use_benzino_settings", True)) else "Capital", "Default keeps FTMO simulation aligned")
             with cc4: metric_card("Last updated", fmt_nairobi(cap_row.get("updated_at", "")) if cap_row else "Never")
 
@@ -7076,6 +7078,14 @@ def render_settings(username: str, settings: dict) -> None:
                 account_type = st.selectbox("Account type", ["DEMO", "LIVE"], index=0 if str(cap_row.get("account_type", "DEMO")).upper() != "LIVE" else 1)
                 enabled = st.checkbox("Connection enabled", value=bool(cap_row.get("enabled", False)))
                 auto_enabled = st.checkbox("Enable auto-trading on my Capital demo", value=bool(cap_row.get("auto_trade_enabled", False)))
+                saved_grades = [g.strip().upper() for g in str(cap_row.get("auto_trade_grades") or "A+,A").split(",") if g.strip()]
+                grade_options = ["A+", "A", "B", "C"]
+                selected_grades = st.multiselect(
+                    "Auto-trade grades to test on demo",
+                    grade_options,
+                    default=[g for g in saved_grades if g in grade_options] or ["A+", "A"],
+                    help="Simulation still records A+/A/B/C. This only controls which grades are executed on your Capital demo account."
+                )
                 use_benzino = st.checkbox("Use BENZINO account size, leverage and risk settings", value=bool(cap_row.get("use_benzino_settings", True)))
                 submitted = st.form_submit_button("Save Capital settings", type="primary")
             if submitted:
@@ -7083,14 +7093,16 @@ def render_settings(username: str, settings: dict) -> None:
                     st.error("Live auto-trading is blocked from the app. Use DEMO while testing.")
                 elif enabled and (not api_key.strip() or not identifier.strip() or not password.strip()) and cap.empty:
                     st.error("Enter API key, identifier and password before enabling the connection.")
+                elif auto_enabled and not selected_grades:
+                    st.error("Choose at least one grade to auto-trade on your demo account.")
                 else:
                     # Preserve existing secrets if the user leaves password/API fields blank during an update.
                     existing = read_df("SELECT api_key, identifier, password FROM user_capital_connections WHERE username = %s", (username,))
                     old = existing.iloc[0].to_dict() if not existing.empty else {}
                     execute(
                         """
-                        INSERT INTO user_capital_connections(username, api_key, identifier, password, account_type, enabled, auto_trade_enabled, use_benzino_settings, updated_at)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                        INSERT INTO user_capital_connections(username, api_key, identifier, password, account_type, enabled, auto_trade_enabled, auto_trade_grades, use_benzino_settings, updated_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
                         ON CONFLICT (username) DO UPDATE
                         SET api_key = EXCLUDED.api_key,
                             identifier = EXCLUDED.identifier,
@@ -7098,10 +7110,11 @@ def render_settings(username: str, settings: dict) -> None:
                             account_type = EXCLUDED.account_type,
                             enabled = EXCLUDED.enabled,
                             auto_trade_enabled = EXCLUDED.auto_trade_enabled,
+                            auto_trade_grades = EXCLUDED.auto_trade_grades,
                             use_benzino_settings = EXCLUDED.use_benzino_settings,
                             updated_at = NOW()
                         """,
-                        (username, api_key.strip() or old.get("api_key", ""), identifier.strip() or old.get("identifier", ""), password.strip() or old.get("password", ""), account_type, enabled, auto_enabled, use_benzino),
+                        (username, api_key.strip() or old.get("api_key", ""), identifier.strip() or old.get("identifier", ""), password.strip() or old.get("password", ""), account_type, enabled, auto_enabled, ",".join(selected_grades), use_benzino),
                     )
                     st.success("Capital settings saved.")
                     st.rerun()
