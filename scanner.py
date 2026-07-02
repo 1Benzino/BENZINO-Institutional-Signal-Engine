@@ -41,7 +41,9 @@ import warnings
 import traceback
 import math
 import re
+from decimal import Decimal
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
@@ -549,7 +551,7 @@ CAPITAL_ACTIVITY_LOOKBACK_SECONDS = int(os.environ.get("CAPITAL_ACTIVITY_LOOKBAC
 CAPITAL_MATCH_WINDOW_HOURS = int(os.environ.get("CAPITAL_MATCH_WINDOW_HOURS", "2"))
 CAPITAL_AUTO_TRADE_ENABLED = os.environ.get("CAPITAL_AUTO_TRADE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "y"}
 CAPITAL_AUTO_TRADE_REQUIRE_DEMO = os.environ.get("CAPITAL_AUTO_TRADE_REQUIRE_DEMO", "true").strip().lower() in {"1", "true", "yes", "y"}
-CAPITAL_AUTO_TRADE_GRADES = {g.strip().upper() for g in os.environ.get("CAPITAL_AUTO_TRADE_GRADES", "A+,A,B,C").split(",") if g.strip()}
+CAPITAL_AUTO_TRADE_GRADES = {g.strip().upper() for g in os.environ.get("CAPITAL_AUTO_TRADE_GRADES", "A+,A").split(",") if g.strip()}
 CAPITAL_AUTO_TRADE_TIMEFRAMES = {t.strip().lower() for t in os.environ.get("CAPITAL_AUTO_TRADE_TIMEFRAMES", "15m,1h,4h,1d").split(",") if t.strip()}
 CAPITAL_AUTO_TRADE_OWNER = os.environ.get("CAPITAL_AUTO_TRADE_OWNER", "").strip()
 CAPITAL_AUTO_TRADE_MIN_SIZE = float(os.environ.get("CAPITAL_AUTO_TRADE_MIN_SIZE", "0.01"))
@@ -560,6 +562,9 @@ CAPITAL_STRICT_1M_REPLAY_ONLY = os.environ.get("CAPITAL_STRICT_1M_REPLAY_ONLY", 
 CAPITAL_MARGIN_BUFFER_PCT = float(os.environ.get("CAPITAL_MARGIN_BUFFER_PCT", "0.95"))
 CAPITAL_FTMO_NORMALIZE_PNL = os.environ.get("CAPITAL_FTMO_NORMALIZE_PNL", "true").strip().lower() in {"1", "true", "yes", "y"}
 FTMO_COMPARISON_LEVERAGE = float(os.environ.get("FTMO_COMPARISON_LEVERAGE", "100"))
+CAPITAL_AUTO_TRADE_MAX_PER_DAY = int(os.environ.get("CAPITAL_AUTO_TRADE_MAX_PER_DAY", "4"))
+CAPITAL_AUTO_TRADE_MIN_SESSION_TRADES = int(os.environ.get("CAPITAL_AUTO_TRADE_MIN_SESSION_TRADES", "20"))
+NAIROBI_TZ = ZoneInfo("Africa/Nairobi")
 
 # Capital.com execution leverage is broker-limited by asset class. BENZINO keeps
 # FTMO simulation at 1:100, then stores an FTMO-equivalent normalized P/L for
@@ -723,6 +728,19 @@ def init_tables() -> None:
         updated_at TIMESTAMPTZ DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS user_capital_connections (
+        username TEXT PRIMARY KEY,
+        api_key TEXT,
+        identifier TEXT,
+        password TEXT,
+        account_type TEXT DEFAULT 'DEMO',
+        enabled BOOLEAN DEFAULT FALSE,
+        auto_trading_enabled BOOLEAN DEFAULT FALSE,
+        use_benzino_settings BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS scanner_runtime_log (
         run_id TEXT PRIMARY KEY,
         started_at TIMESTAMPTZ,
@@ -808,6 +826,9 @@ def init_tables() -> None:
         status TEXT,
         error TEXT,
         raw_json JSONB,
+        ftmo_leverage NUMERIC DEFAULT 100,
+        capital_leverage NUMERIC,
+        ftmo_normalization_factor NUMERIC DEFAULT 1,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
     );
@@ -875,6 +896,31 @@ def init_tables() -> None:
                 cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS auto_trade BOOLEAN DEFAULT FALSE")
                 cur.execute("ALTER TABLE capital_auto_orders ADD COLUMN IF NOT EXISTS deal_id TEXT")
                 cur.execute("ALTER TABLE capital_auto_orders ADD COLUMN IF NOT EXISTS raw_json JSONB")
+                cur.execute("ALTER TABLE capital_auto_orders ADD COLUMN IF NOT EXISTS ftmo_leverage NUMERIC DEFAULT 100")
+                cur.execute("ALTER TABLE capital_auto_orders ADD COLUMN IF NOT EXISTS capital_leverage NUMERIC")
+                cur.execute("ALTER TABLE capital_auto_orders ADD COLUMN IF NOT EXISTS ftmo_normalization_factor NUMERIC DEFAULT 1")
+                cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS pnl_ftmo_equiv NUMERIC")
+                cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS ftmo_leverage NUMERIC DEFAULT 100")
+                cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS capital_leverage NUMERIC")
+                cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS ftmo_normalization_factor NUMERIC DEFAULT 1")
+                cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS actual_pnl_ftmo_equiv NUMERIC")
+                cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS ftmo_leverage NUMERIC DEFAULT 100")
+                cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS capital_leverage NUMERIC")
+                cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS ftmo_normalization_factor NUMERIC DEFAULT 1")
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS user_capital_connections (
+                        username TEXT PRIMARY KEY,
+                        api_key TEXT,
+                        identifier TEXT,
+                        password TEXT,
+                        account_type TEXT DEFAULT 'DEMO',
+                        enabled BOOLEAN DEFAULT FALSE,
+                        auto_trading_enabled BOOLEAN DEFAULT FALSE,
+                        use_benzino_settings BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
                 # Dashboard uses this table when replaying simulated FTMO challenge cycles.
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS prop_challenge_history (
@@ -938,6 +984,11 @@ def sanitize_for_json(value):
         return {str(k): sanitize_for_json(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [sanitize_for_json(v) for v in value]
+    if isinstance(value, Decimal):
+        try:
+            return float(value)
+        except Exception:
+            return None
     if isinstance(value, (np.integer,)):
         return int(value)
     if isinstance(value, (np.floating, float)):
@@ -1500,7 +1551,7 @@ def capital_headers(authenticated: bool = True) -> dict:
         "Accept": "application/json",
     }
     if authenticated:
-        if not _CAPITAL_SESSION.get("cst") or time.time() - float(_CAPITAL_SESSION.get("ts") or 0) > 540:
+        if not _CAPITAL_SESSION.get("cst") or time.time() - float(_CAPITAL_SESSION.get("ts") or 0) > 3300:
             capital_start_session()
         headers["CST"] = str(_CAPITAL_SESSION.get("cst") or "")
         headers["X-SECURITY-TOKEN"] = str(_CAPITAL_SESSION.get("security_token") or "")
@@ -4053,15 +4104,107 @@ def _safe_float_setting(settings: dict, keys: list[str], default: float) -> floa
     return float(default)
 
 
+def prop_session_from_timestamp_scanner(ts) -> str:
+    try:
+        dt = pd.to_datetime(ts, utc=True)
+        hour = dt.tz_convert(NAIROBI_TZ).hour
+    except Exception:
+        return "Unknown"
+    if 0 <= hour < 8:
+        return "Asia"
+    if 8 <= hour < 16:
+        return "London"
+    return "New York"
+
+
+def capital_best_session_profile_for_user(username: str, timeframe: str, assets: set[str]) -> dict:
+    """Dynamic best session from closed A/A+ simulated trades only."""
+    username = str(username or "").strip().lower()
+    timeframe = _normalize_timeframe(timeframe)
+    if not assets:
+        return {"best_session": "", "sample_ready": False, "trade_count": 0, "reason": "empty_watchlist"}
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT asset, timeframe, created_at, exit_at, r_multiple, exit_reason, status, grade
+                FROM scanner_signals
+                WHERE asset = ANY(%s)
+                  AND timeframe = %s
+                  AND signal IN ('BUY','SELL')
+                  AND grade IN ('A+','A')
+                  AND exit_at IS NOT NULL
+                  AND r_multiple IS NOT NULL
+                """,
+                (list(sorted(assets)), timeframe),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    except Exception as exc:
+        print(f"[CapitalAuto] Best-session lookup failed for {username}: {exc}")
+        return {"best_session": "", "sample_ready": False, "trade_count": 0, "reason": "lookup_failed"}
+    buckets: dict[str, list[float]] = {}
+    for r in rows:
+        sess = prop_session_from_timestamp_scanner(r.get("exit_at") or r.get("created_at"))
+        if sess == "Unknown":
+            continue
+        try:
+            rr = float(r.get("r_multiple") or 0)
+        except Exception:
+            rr = 0.0
+        buckets.setdefault(sess, []).append(rr)
+    ranked = []
+    for sess, vals in buckets.items():
+        if not vals:
+            continue
+        gross_profit = sum(v for v in vals if v > 0)
+        gross_loss = abs(sum(v for v in vals if v < 0))
+        pf = gross_profit / gross_loss if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
+        wr = 100.0 * (sum(1 for v in vals if v > 0) / len(vals))
+        net = sum(vals)
+        ranked.append({"best_session": sess, "profit_factor": pf, "win_rate": wr, "net_r": net, "trade_count": len(vals), "sample_ready": len(vals) >= CAPITAL_AUTO_TRADE_MIN_SESSION_TRADES})
+    if not ranked:
+        return {"best_session": "", "sample_ready": False, "trade_count": 0, "reason": "no_closed_A_trades"}
+    eligible = [x for x in ranked if x["sample_ready"]]
+    best = sorted(eligible or ranked, key=lambda x: (x["profit_factor"], x["win_rate"], x["net_r"], x["trade_count"]), reverse=True)[0]
+    if not best.get("sample_ready"):
+        best["reason"] = f"best_session_sample_below_{CAPITAL_AUTO_TRADE_MIN_SESSION_TRADES}"
+    return best
+
+
+def capital_auto_trades_taken_today(username: str) -> int:
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM capital_auto_orders
+                WHERE LOWER(COALESCE(scan_owner,'')) = %s
+                  AND grade IN ('A+','A')
+                  AND status IN ('OPENED','ACCEPTED','CONFIRMED','OPEN')
+                  AND (created_at AT TIME ZONE 'Africa/Nairobi')::date = (NOW() AT TIME ZONE 'Africa/Nairobi')::date
+                """,
+                (str(username or "").lower(),),
+            )
+            row = cur.fetchone() or {}
+        conn.close()
+        return int(row.get("n") or 0)
+    except Exception as exc:
+        print(f"[CapitalAuto] daily cap lookup failed for {username}: {exc}")
+        return CAPITAL_AUTO_TRADE_MAX_PER_DAY
+
+
 def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
     """Resolve the user settings that should size this auto-trade.
 
-    The scanner generates one master signal row, but execution should use the
-    user's own dashboard settings. Selection logic:
-      1. If CAPITAL_AUTO_TRADE_OWNER is set, use that username.
-      2. Otherwise, use the first user whose watchlist contains the asset and
-         whose preferred timeframe matches the signal timeframe.
-      3. If no user settings are found, fall back to ACCOUNT_SIZE/RISK_PER_TRADE.
+    Auto-trading is stricter than simulation:
+      • only the user's watchlist
+      • only the user's selected timeframe
+      • only A/A+
+      • only the user's dynamic best session
+      • max 4 accepted auto-orders per Nairobi day
     """
     asset = str(getattr(sig, "asset", "") or "").strip().upper()
     timeframe = _normalize_timeframe(getattr(sig, "timeframe", "") or DEFAULT_USER_TIMEFRAME)
@@ -4072,6 +4215,8 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
         "risk_pct": float(RISK_PER_TRADE) * 100.0,
         "leverage": float(LEVERAGE),
         "source": "scanner_fallback",
+        "auto_trade_allowed": False,
+        "skip_reason": "no_user_match",
     }
     try:
         conn = db_connect()
@@ -4079,22 +4224,37 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
             if owner_filter:
                 cur.execute(
                     """
-                    SELECT us.username, us.settings_json
-                    FROM user_settings us
-                    WHERE LOWER(us.username) = %s
-                    LIMIT 1
-                    """,
-                    (owner_filter,),
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT us.username, us.settings_json
+                    SELECT us.username, us.settings_json,
+                           COALESCE(ucc.enabled, TRUE) AS capital_connected,
+                           COALESCE(ucc.auto_trading_enabled, TRUE) AS user_auto_enabled,
+                           COALESCE(ucc.use_benzino_settings, TRUE) AS use_benzino_settings
                     FROM user_settings us
                     JOIN user_watchlists uw
                       ON uw.scan_owner = us.username
                      AND uw.enabled = TRUE
                      AND UPPER(uw.asset) = %s
+                    LEFT JOIN user_capital_connections ucc
+                      ON LOWER(ucc.username) = LOWER(us.username)
+                    WHERE LOWER(us.username) = %s
+                    LIMIT 1
+                    """,
+                    (asset, owner_filter),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT us.username, us.settings_json,
+                           COALESCE(ucc.enabled, TRUE) AS capital_connected,
+                           COALESCE(ucc.auto_trading_enabled, TRUE) AS user_auto_enabled,
+                           COALESCE(ucc.use_benzino_settings, TRUE) AS use_benzino_settings
+                    FROM user_settings us
+                    JOIN user_watchlists uw
+                      ON uw.scan_owner = us.username
+                     AND uw.enabled = TRUE
+                     AND UPPER(uw.asset) = %s
+                    LEFT JOIN user_capital_connections ucc
+                      ON LOWER(ucc.username) = LOWER(us.username)
+                    WHERE COALESCE(ucc.auto_trading_enabled, TRUE) = TRUE
                     ORDER BY us.updated_at DESC NULLS LAST, us.username ASC
                     """,
                     (asset,),
@@ -4115,19 +4275,38 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
         allowed_tfs = _extract_timeframes_from_settings(settings)
         if timeframe not in allowed_tfs:
             continue
+        username = str(row.get("username") or fallback["username"]).strip().lower()
+        if row.get("capital_connected") is False or row.get("user_auto_enabled") is False:
+            return {**fallback, "username": username, "skip_reason": "user_capital_autotrading_disabled"}
+        # Watchlist used for best-session analysis.
+        watch = load_user_watchlist(username)
+        watch_assets = {a.upper() for a in watch.keys()} or {asset}
+        session_profile = capital_best_session_profile_for_user(username, timeframe, watch_assets)
+        best_session = str(session_profile.get("best_session") or "")
+        current_session = prop_session_from_timestamp_scanner(getattr(sig, "candle_close", "") or getattr(sig, "created_at", ""))
+        if not session_profile.get("sample_ready"):
+            return {**fallback, "username": username, "auto_trade_allowed": False, "skip_reason": session_profile.get("reason") or "best_session_not_ready", "session_profile": session_profile}
+        if current_session != best_session:
+            return {**fallback, "username": username, "auto_trade_allowed": False, "skip_reason": f"outside_best_session:{current_session}!={best_session}", "session_profile": session_profile}
+        taken_today = capital_auto_trades_taken_today(username)
+        if taken_today >= CAPITAL_AUTO_TRADE_MAX_PER_DAY:
+            return {**fallback, "username": username, "auto_trade_allowed": False, "skip_reason": "daily_auto_trade_cap_reached", "session_profile": session_profile}
         account_size = _safe_float_setting(settings, ["account_size", "account_balance", "starting_balance"], ACCOUNT_SIZE)
-        # In app.py risk_pct is stored as a percent, e.g. 1.0 means 1%.
         risk_pct = _safe_float_setting(settings, ["risk_pct", "risk_per_trade_pct"], float(RISK_PER_TRADE) * 100.0)
         leverage = _safe_float_setting(settings, ["leverage"], LEVERAGE)
         return {
-            "username": str(row.get("username") or fallback["username"]),
+            "username": username,
             "account_size": max(0.0, float(account_size)),
             "risk_pct": max(0.0, float(risk_pct)),
             "leverage": max(1.0, float(leverage)),
             "source": "user_settings",
+            "auto_trade_allowed": True,
+            "skip_reason": "",
+            "session_profile": session_profile,
+            "current_session": current_session,
+            "auto_trades_taken_today": taken_today,
         }
     return fallback
-
 
 def calculate_capital_position_size(sig: ScanResult, sizing: dict) -> float:
     """Calculate Capital.com order size from the user's risk settings.
@@ -4185,10 +4364,10 @@ def record_capital_auto_order(sig: ScanResult, *, status: str, deal_reference: s
         with conn:
             with conn.cursor() as cur:
                 cur.execute(sql, (
-                    sig.signal_id, deal_reference, deal_id, SCAN_OWNER, "demo" if CAPITAL_DEMO else "live",
+                    sig.signal_id, deal_reference, deal_id, str(((raw or {}).get("sizing") or {}).get("username") or SCAN_OWNER), "demo" if CAPITAL_DEMO else "live",
                     sig.asset, sig.timeframe, sig.signal, sig.grade, epic, float(size or 0),
                     float(sig.entry), float(sig.sl), float(sig.tp), status, error,
-                    json.dumps(sanitize_for_json(raw or {}), allow_nan=False),
+                    json.dumps(sanitize_for_json(raw or {}), allow_nan=False, default=str),
                     float((raw or {}).get("ftmo_leverage") or FTMO_COMPARISON_LEVERAGE),
                     float((raw or {}).get("capital_leverage") or capital_effective_leverage_for_asset(sig.asset, (raw or {}).get("broker_constraints") or {})),
                     float((raw or {}).get("ftmo_normalization_factor") or ftmo_normalization_factor(sig.asset, (raw or {}).get("broker_constraints") or {})),
@@ -4207,45 +4386,59 @@ def capital_confirm_deal(deal_reference: str) -> dict | None:
 
 
 def adjust_levels_for_capital_constraints(sig: ScanResult, market_info: dict, *, error_text: str = "") -> tuple[float, float]:
-    """Return broker-valid SL/TP where possible while preserving 1:2 intent.
+    """Return broker-valid SL/TP while preserving the 1:2 direction.
 
-    Capital sometimes rejects stops that are too close/far with a boundary value
-    in the error message. We use that boundary if present; otherwise use saved
-    min/max stop-distance metadata from capital_epic_map.
+    Guarantees after adjustment:
+      BUY  -> SL < entry < TP
+      SELL -> TP < entry < SL
     """
     entry = float(sig.entry)
     sl = float(sig.sl)
-    tp = float(sig.tp)
     direction = str(sig.signal or "").upper()
     text = str(error_text or "")
     nums = re.findall(r"[-+]?\d+(?:\.\d+)?", text)
     boundary = float(nums[-1]) if nums else None
+    min_stop = float(market_info.get("min_stop_distance") or market_info.get("min_limit_distance") or 0)
+    max_stop = float(market_info.get("max_stop_distance") or market_info.get("max_limit_distance") or 0)
+    if min_stop <= 0:
+        min_stop = max(abs(entry) * 0.00005, 1e-8)
 
+    # Use broker-provided boundary when Capital tells us the exact valid level.
     if "invalid.stoploss.maxvalue" in text and boundary is not None:
         sl = min(sl, boundary)
     elif "invalid.stoploss.minvalue" in text and boundary is not None:
         sl = max(sl, boundary)
+
+    dist = abs(entry - sl)
+    if dist <= 0:
+        dist = min_stop
+    if min_stop and dist < min_stop:
+        dist = min_stop
+    if max_stop and max_stop > 0 and dist > max_stop:
+        dist = max_stop
+
+    if direction == "BUY":
+        sl = min(entry - dist, entry - min_stop)
+        risk = abs(entry - sl)
+        tp = entry + (2.0 * risk)
+        if min_stop and (tp - entry) < min_stop:
+            tp = entry + min_stop
     else:
-        min_stop = float(market_info.get("min_stop_distance") or 0)
-        max_stop = float(market_info.get("max_stop_distance") or 0)
-        dist = abs(entry - sl)
-        if min_stop and dist < min_stop:
-            dist = min_stop
-        if max_stop and dist > max_stop:
-            dist = max_stop
-        if direction == "BUY":
-            sl = entry - dist
-        else:
-            sl = entry + dist
+        sl = max(entry + dist, entry + min_stop)
+        risk = abs(sl - entry)
+        tp = entry - (2.0 * risk)
+        if min_stop and (entry - tp) < min_stop:
+            tp = entry - min_stop
 
-    risk = abs(entry - sl)
-    if risk > 0:
-        if direction == "BUY":
-            tp = entry + 2.0 * risk
-        else:
-            tp = entry - 2.0 * risk
+    # Final safety guard for Capital profitLevel validation.
+    if direction == "BUY" and not (sl < entry < tp):
+        sl = entry - max(min_stop, abs(entry - sl) or min_stop)
+        tp = entry + 2.0 * abs(entry - sl)
+    if direction == "SELL" and not (tp < entry < sl):
+        sl = entry + max(min_stop, abs(entry - sl) or min_stop)
+        tp = entry - 2.0 * abs(sl - entry)
+
     return float(sl), float(tp)
-
 
 def build_capital_size_attempts(base_size: float, market_info: dict) -> list[float]:
     min_size = float(market_info.get("min_size") or CAPITAL_AUTO_TRADE_MIN_SIZE or 0.01)
@@ -4302,6 +4495,11 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
         return False
 
     sizing = load_auto_trade_user_settings_for_signal(sig)
+    if not bool(sizing.get("auto_trade_allowed")):
+        reason = str(sizing.get("skip_reason") or "auto_trade_not_allowed")
+        record_capital_auto_order(sig, status="SKIPPED", epic=epic, size=0, error=reason, raw={"sizing": sizing})
+        print(f"[CapitalAuto] {sig.asset} {timeframe} {direction} {grade}: skipped · {reason}.")
+        return False
     trade_size = calculate_capital_position_size(sig, sizing)
     if trade_size <= 0:
         record_capital_auto_order(sig, status="FAILED", epic=epic, size=0, error="Dynamic size calculation returned 0", raw={"sizing": sizing})

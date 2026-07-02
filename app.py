@@ -60,7 +60,7 @@ except Exception:  # pragma: no cover
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "v7.4-polish-no-trade-prop-expiry"
+APP_VERSION = "v7.5-prop-v2-multiuser-capital"
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "assets"
 LOGO_PATH = ASSETS_DIR / "benzino_logo.png"
@@ -283,6 +283,18 @@ def init_tables() -> None:
         all_signals_alerts BOOLEAN DEFAULT FALSE,
         updated_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS user_capital_connections (
+        username TEXT PRIMARY KEY,
+        api_key TEXT,
+        identifier TEXT,
+        password TEXT,
+        account_type TEXT DEFAULT 'DEMO',
+        enabled BOOLEAN DEFAULT FALSE,
+        auto_trading_enabled BOOLEAN DEFAULT FALSE,
+        use_benzino_settings BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
     CREATE TABLE IF NOT EXISTS scanner_signals (
         signal_id TEXT PRIMARY KEY,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -445,6 +457,23 @@ def init_tables() -> None:
                 cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT")
                 cur.execute("ALTER TABLE user_telegram_settings ADD COLUMN IF NOT EXISTS alerts_enabled BOOLEAN DEFAULT FALSE")
                 cur.execute("ALTER TABLE user_telegram_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()")
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS user_capital_connections (
+                        username TEXT PRIMARY KEY,
+                        api_key TEXT,
+                        identifier TEXT,
+                        password TEXT,
+                        account_type TEXT DEFAULT 'DEMO',
+                        enabled BOOLEAN DEFAULT FALSE,
+                        auto_trading_enabled BOOLEAN DEFAULT FALSE,
+                        use_benzino_settings BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+                cur.execute("ALTER TABLE capital_auto_orders ADD COLUMN IF NOT EXISTS ftmo_leverage NUMERIC DEFAULT 100")
+                cur.execute("ALTER TABLE capital_auto_orders ADD COLUMN IF NOT EXISTS capital_leverage NUMERIC")
+                cur.execute("ALTER TABLE capital_auto_orders ADD COLUMN IF NOT EXISTS ftmo_normalization_factor NUMERIC DEFAULT 1")
                 # Admin policy: the earliest account becomes the only admin.
                 # Every later profile remains a normal user, regardless of username.
                 cur.execute("""
@@ -6718,7 +6747,7 @@ def prop_firm_win_rate_for_admin(username: str, timeframe: str = "1h") -> str:
 def render_settings(username: str, settings: dict) -> None:
     page_header("Settings", "Profile, watchlist, Telegram routing, activation date, and reset tools.")
 
-    tab_profile, tab_watchlist, tab_telegram, tab_health, tab_reset = st.tabs(["Profile", "Watchlist", "Telegram", "System Health", "Reset"])
+    tab_profile, tab_watchlist, tab_telegram, tab_capital, tab_health, tab_reset = st.tabs(["Profile", "Watchlist", "Telegram", "Capital", "System Health", "Reset"])
     with tab_profile:
         users = read_df("SELECT username, email, created_at, role FROM users WHERE username = %s", (username,))
         created = users.iloc[0]["created_at"] if not users.empty else "Unknown"
@@ -7012,6 +7041,65 @@ def render_settings(username: str, settings: dict) -> None:
             st.caption("Activate Settings saves the chat ID and alert route in one step. Only one route can be active at a time.")
         except Exception as exc:
             st.error(f"Telegram settings error: {exc}")
+
+
+    with tab_capital:
+        st.caption("Connect your own Capital.com demo account. Auto-trading uses your BENZINO watchlist, selected timeframe, A/A+ only, best session only, and max 4 demo trades per day. API credentials are stored in Supabase for the scanner to use.")
+        try:
+            cap = read_df("SELECT username, account_type, enabled, auto_trading_enabled, use_benzino_settings, updated_at FROM user_capital_connections WHERE username = %s", (username,))
+            cap_row = cap.iloc[0].to_dict() if not cap.empty else {}
+            cc1, cc2, cc3, cc4 = st.columns(4)
+            with cc1: metric_card("Capital connection", "Active" if bool(cap_row.get("enabled", False)) else "Inactive", str(cap_row.get("account_type") or "DEMO"))
+            with cc2: metric_card("Auto-trading", "ON" if bool(cap_row.get("auto_trading_enabled", False)) else "OFF", "A/A+ · best session · max 4/day")
+            with cc3: metric_card("Sizing source", "BENZINO" if bool(cap_row.get("use_benzino_settings", True)) else "Capital", "Default keeps FTMO simulation aligned")
+            with cc4: metric_card("Last updated", fmt_nairobi(cap_row.get("updated_at", "")) if cap_row else "Never")
+
+            with st.form("capital_connection_form", clear_on_submit=False):
+                api_key = st.text_input("Capital API key", type="password", help="Use a demo API key while testing.")
+                identifier = st.text_input("Capital identifier / login email")
+                password = st.text_input("Capital password", type="password")
+                account_type = st.selectbox("Account type", ["DEMO", "LIVE"], index=0 if str(cap_row.get("account_type", "DEMO")).upper() != "LIVE" else 1)
+                enabled = st.checkbox("Connection enabled", value=bool(cap_row.get("enabled", False)))
+                auto_enabled = st.checkbox("Enable auto-trading on my Capital demo", value=bool(cap_row.get("auto_trading_enabled", False)))
+                use_benzino = st.checkbox("Use BENZINO account size, leverage and risk settings", value=bool(cap_row.get("use_benzino_settings", True)))
+                submitted = st.form_submit_button("Save Capital settings", type="primary")
+            if submitted:
+                if auto_enabled and account_type.upper() != "DEMO":
+                    st.error("Live auto-trading is blocked from the app. Use DEMO while testing.")
+                elif enabled and (not api_key.strip() or not identifier.strip() or not password.strip()) and cap.empty:
+                    st.error("Enter API key, identifier and password before enabling the connection.")
+                else:
+                    # Preserve existing secrets if the user leaves password/API fields blank during an update.
+                    existing = read_df("SELECT api_key, identifier, password FROM user_capital_connections WHERE username = %s", (username,))
+                    old = existing.iloc[0].to_dict() if not existing.empty else {}
+                    execute(
+                        """
+                        INSERT INTO user_capital_connections(username, api_key, identifier, password, account_type, enabled, auto_trading_enabled, use_benzino_settings, updated_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                        ON CONFLICT (username) DO UPDATE
+                        SET api_key = EXCLUDED.api_key,
+                            identifier = EXCLUDED.identifier,
+                            password = EXCLUDED.password,
+                            account_type = EXCLUDED.account_type,
+                            enabled = EXCLUDED.enabled,
+                            auto_trading_enabled = EXCLUDED.auto_trading_enabled,
+                            use_benzino_settings = EXCLUDED.use_benzino_settings,
+                            updated_at = NOW()
+                        """,
+                        (username, api_key.strip() or old.get("api_key", ""), identifier.strip() or old.get("identifier", ""), password.strip() or old.get("password", ""), account_type, enabled, auto_enabled, use_benzino),
+                    )
+                    st.success("Capital settings saved.")
+                    st.rerun()
+
+            execs = load_capital_executed_trades(limit=APP_TABLE_MAX_ROWS)
+            comps = load_capital_comparisons(limit=APP_TABLE_MAX_ROWS)
+            if not comps.empty:
+                own = comps.copy()
+                render_benzino_aggrid(own, key="capital_settings_comparison_table", title="My Capital comparison rows", height=360, page_size=10, pinned=["asset", "direction"], numeric_cols_right=["simulated_r", "actual_pnl", "actual_pnl_ftmo_equiv", "ftmo_normalization_factor"], enable_search=True)
+            else:
+                st.info("No Capital comparison rows yet.")
+        except Exception as exc:
+            st.error(f"Capital settings error: {exc}")
 
     with tab_health:
         render_system_health_panel()
