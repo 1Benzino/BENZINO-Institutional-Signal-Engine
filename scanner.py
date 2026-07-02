@@ -552,6 +552,8 @@ CAPITAL_MATCH_WINDOW_HOURS = int(os.environ.get("CAPITAL_MATCH_WINDOW_HOURS", "2
 CAPITAL_AUTO_TRADE_ENABLED = os.environ.get("CAPITAL_AUTO_TRADE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "y"}
 CAPITAL_AUTO_TRADE_REQUIRE_DEMO = os.environ.get("CAPITAL_AUTO_TRADE_REQUIRE_DEMO", "true").strip().lower() in {"1", "true", "yes", "y"}
 CAPITAL_AUTO_TRADE_GRADES = {g.strip().upper() for g in os.environ.get("CAPITAL_AUTO_TRADE_GRADES", "A+,A").split(",") if g.strip()}
+# Demo auto-trading is intentionally stricter than simulation: only A/A+ can be executed.
+CAPITAL_AUTO_TRADE_GRADES = CAPITAL_AUTO_TRADE_GRADES.intersection({"A+", "A"}) or {"A+", "A"}
 CAPITAL_AUTO_TRADE_TIMEFRAMES = {t.strip().lower() for t in os.environ.get("CAPITAL_AUTO_TRADE_TIMEFRAMES", "15m,1h,4h,1d").split(",") if t.strip()}
 CAPITAL_AUTO_TRADE_OWNER = os.environ.get("CAPITAL_AUTO_TRADE_OWNER", "").strip()
 CAPITAL_AUTO_TRADE_MIN_SIZE = float(os.environ.get("CAPITAL_AUTO_TRADE_MIN_SIZE", "0.01"))
@@ -735,7 +737,7 @@ def init_tables() -> None:
         password TEXT,
         account_type TEXT DEFAULT 'DEMO',
         enabled BOOLEAN DEFAULT FALSE,
-        auto_trading_enabled BOOLEAN DEFAULT FALSE,
+        auto_trade_enabled BOOLEAN DEFAULT FALSE,
         use_benzino_settings BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -915,7 +917,7 @@ def init_tables() -> None:
                         password TEXT,
                         account_type TEXT DEFAULT 'DEMO',
                         enabled BOOLEAN DEFAULT FALSE,
-                        auto_trading_enabled BOOLEAN DEFAULT FALSE,
+                        auto_trade_enabled BOOLEAN DEFAULT FALSE,
                         use_benzino_settings BOOLEAN DEFAULT TRUE,
                         created_at TIMESTAMPTZ DEFAULT NOW(),
                         updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -999,6 +1001,27 @@ def sanitize_for_json(value):
     if isinstance(value, (np.bool_, bool)):
         return bool(value)
     return value
+
+
+def jsonb_dumps(value) -> str:
+    """JSONB-safe dumps for Capital payloads containing Decimal/numpy/pandas objects."""
+    def fallback(obj):
+        if isinstance(obj, Decimal):
+            return float(obj)
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating, float)):
+            x = float(obj)
+            return None if math.isnan(x) or math.isinf(x) else x
+        if isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
+        try:
+            if pd.isna(obj):
+                return None
+        except Exception:
+            pass
+        return str(obj)
+    return json.dumps(sanitize_for_json(value), allow_nan=False, default=fallback)
 
 
 def save_signal(sig: ScanResult) -> bool:
@@ -1577,7 +1600,9 @@ def capital_start_session() -> bool:
         _CAPITAL_SESSION["ts"] = time.time()
         ok = bool(_CAPITAL_SESSION["cst"] and _CAPITAL_SESSION["security_token"])
         if ok:
-            print(f"[Capital] Session active ({'demo' if CAPITAL_DEMO else 'live'}).")
+            if not _CAPITAL_SESSION.get("printed_active"):
+                print(f"[Capital] Session active ({'demo' if CAPITAL_DEMO else 'live'}).")
+                _CAPITAL_SESSION["printed_active"] = True
         else:
             print("[Capital] Session response did not include CST / X-SECURITY-TOKEN.")
         return ok
@@ -4226,7 +4251,7 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
                     """
                     SELECT us.username, us.settings_json,
                            COALESCE(ucc.enabled, TRUE) AS capital_connected,
-                           COALESCE(ucc.auto_trading_enabled, TRUE) AS user_auto_enabled,
+                           COALESCE(ucc.auto_trade_enabled, TRUE) AS user_auto_enabled,
                            COALESCE(ucc.use_benzino_settings, TRUE) AS use_benzino_settings
                     FROM user_settings us
                     JOIN user_watchlists uw
@@ -4245,16 +4270,17 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
                     """
                     SELECT us.username, us.settings_json,
                            COALESCE(ucc.enabled, TRUE) AS capital_connected,
-                           COALESCE(ucc.auto_trading_enabled, TRUE) AS user_auto_enabled,
+                           COALESCE(ucc.auto_trade_enabled, TRUE) AS user_auto_enabled,
                            COALESCE(ucc.use_benzino_settings, TRUE) AS use_benzino_settings
                     FROM user_settings us
                     JOIN user_watchlists uw
                       ON uw.scan_owner = us.username
                      AND uw.enabled = TRUE
                      AND UPPER(uw.asset) = %s
-                    LEFT JOIN user_capital_connections ucc
+                    JOIN user_capital_connections ucc
                       ON LOWER(ucc.username) = LOWER(us.username)
-                    WHERE COALESCE(ucc.auto_trading_enabled, TRUE) = TRUE
+                    WHERE COALESCE(ucc.enabled, FALSE) = TRUE
+                      AND COALESCE(ucc.auto_trade_enabled, FALSE) = TRUE
                     ORDER BY us.updated_at DESC NULLS LAST, us.username ASC
                     """,
                     (asset,),
@@ -4367,7 +4393,7 @@ def record_capital_auto_order(sig: ScanResult, *, status: str, deal_reference: s
                     sig.signal_id, deal_reference, deal_id, str(((raw or {}).get("sizing") or {}).get("username") or SCAN_OWNER), "demo" if CAPITAL_DEMO else "live",
                     sig.asset, sig.timeframe, sig.signal, sig.grade, epic, float(size or 0),
                     float(sig.entry), float(sig.sl), float(sig.tp), status, error,
-                    json.dumps(sanitize_for_json(raw or {}), allow_nan=False, default=str),
+                    jsonb_dumps(raw or {}),
                     float((raw or {}).get("ftmo_leverage") or FTMO_COMPARISON_LEVERAGE),
                     float((raw or {}).get("capital_leverage") or capital_effective_leverage_for_asset(sig.asset, (raw or {}).get("broker_constraints") or {})),
                     float((raw or {}).get("ftmo_normalization_factor") or ftmo_normalization_factor(sig.asset, (raw or {}).get("broker_constraints") or {})),
@@ -4437,6 +4463,17 @@ def adjust_levels_for_capital_constraints(sig: ScanResult, market_info: dict, *,
     if direction == "SELL" and not (tp < entry < sl):
         sl = entry + max(min_stop, abs(entry - sl) or min_stop)
         tp = entry - 2.0 * abs(sl - entry)
+
+    # Capital rejects non-positive stop/profit levels. Low-priced instruments
+    # such as NATGAS can produce an invalid TP if broker distances are larger
+    # than the current price. Return zeros so the caller can skip cleanly rather
+    # than sending an invalid order repeatedly.
+    if entry <= 0 or sl <= 0 or tp <= 0:
+        return 0.0, 0.0
+    if direction == "BUY" and not (sl < entry < tp):
+        return 0.0, 0.0
+    if direction == "SELL" and not (tp < entry < sl):
+        return 0.0, 0.0
 
     return float(sl), float(tp)
 
@@ -4531,6 +4568,10 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
     last_payload = {}
     last_error = "POST /positions failed"
     adj_sl, adj_tp = adjust_levels_for_capital_constraints(sig, market_info)
+    if CAPITAL_AUTO_TRADE_USE_STOPS and (adj_sl <= 0 or adj_tp <= 0):
+        record_capital_auto_order(sig, status="SKIPPED", epic=epic, size=trade_size, error="Broker stop/TP constraints make a valid positive SL/TP impossible", raw={"sizing": sizing, "broker_constraints": market_info})
+        print(f"[CapitalAuto] {sig.asset} {timeframe} {direction} {grade}: skipped · invalid broker SL/TP constraints.")
+        return False
 
     for attempt_size in size_attempts:
         payload = {
@@ -4546,8 +4587,11 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
 
         _CAPITAL_LAST_ERROR["text"] = ""
         response = capital_request("POST", "/positions", json_body=payload, retries=1)
-        if not isinstance(response, dict) and "invalid.stoploss" in str(_CAPITAL_LAST_ERROR.get("text", "")):
+        if not isinstance(response, dict) and ("invalid.stoploss" in str(_CAPITAL_LAST_ERROR.get("text", "")) or "profitlevel" in str(_CAPITAL_LAST_ERROR.get("text", "")).lower()):
             adj_sl, adj_tp = adjust_levels_for_capital_constraints(sig, market_info, error_text=_CAPITAL_LAST_ERROR.get("text", ""))
+            if CAPITAL_AUTO_TRADE_USE_STOPS and (adj_sl <= 0 or adj_tp <= 0):
+                last_error = "Broker stop/TP constraints make a valid positive SL/TP impossible"
+                break
             if CAPITAL_AUTO_TRADE_USE_STOPS:
                 payload["stopLevel"] = float(adj_sl)
                 payload["profitLevel"] = float(adj_tp)

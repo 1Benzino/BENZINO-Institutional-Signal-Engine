@@ -290,7 +290,7 @@ def init_tables() -> None:
         password TEXT,
         account_type TEXT DEFAULT 'DEMO',
         enabled BOOLEAN DEFAULT FALSE,
-        auto_trading_enabled BOOLEAN DEFAULT FALSE,
+        auto_trade_enabled BOOLEAN DEFAULT FALSE,
         use_benzino_settings BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -465,12 +465,15 @@ def init_tables() -> None:
                         password TEXT,
                         account_type TEXT DEFAULT 'DEMO',
                         enabled BOOLEAN DEFAULT FALSE,
-                        auto_trading_enabled BOOLEAN DEFAULT FALSE,
+                        auto_trade_enabled BOOLEAN DEFAULT FALSE,
                         use_benzino_settings BOOLEAN DEFAULT TRUE,
                         created_at TIMESTAMPTZ DEFAULT NOW(),
                         updated_at TIMESTAMPTZ DEFAULT NOW()
                     )
                 """)
+                cur.execute("ALTER TABLE user_capital_connections ADD COLUMN IF NOT EXISTS auto_trade_enabled BOOLEAN DEFAULT FALSE")
+                cur.execute("ALTER TABLE user_capital_connections ADD COLUMN IF NOT EXISTS auto_trading_enabled BOOLEAN DEFAULT FALSE")
+                cur.execute("UPDATE user_capital_connections SET auto_trade_enabled = COALESCE(auto_trade_enabled, auto_trading_enabled, FALSE), auto_trading_enabled = COALESCE(auto_trading_enabled, auto_trade_enabled, FALSE)")
                 cur.execute("ALTER TABLE capital_auto_orders ADD COLUMN IF NOT EXISTS ftmo_leverage NUMERIC DEFAULT 100")
                 cur.execute("ALTER TABLE capital_auto_orders ADD COLUMN IF NOT EXISTS capital_leverage NUMERIC")
                 cur.execute("ALTER TABLE capital_auto_orders ADD COLUMN IF NOT EXISTS ftmo_normalization_factor NUMERIC DEFAULT 1")
@@ -2393,14 +2396,20 @@ def render_balance_curve(df: pd.DataFrame, settings: dict, title: str = "Balance
             overall["Grade Group"] = "All trades"
             overall["grade_balance_after"] = account + pd.to_numeric(overall["pnl_cash"], errors="coerce").fillna(0.0).cumsum()
             pieces.append(overall)
-        for group_name, group_df in closed.groupby("Grade Group", sort=False):
+        grade_group_order = ["All trades", "A+/A only", "B only", "C only"]
+        for group_name in ["A+/A only", "B only", "C only"]:
+            group_df = closed[closed["Grade Group"].eq(group_name)].copy()
+            if group_df.empty:
+                continue
             group_df = group_df.sort_values("created_at").copy()
             group_df["grade_balance_after"] = account + pd.to_numeric(group_df["pnl_cash"], errors="coerce").fillna(0.0).cumsum()
             pieces.append(group_df)
         chart_df = pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame()
         if chart_df.empty:
             return
-        fig = px.line(chart_df, x="created_at", y="grade_balance_after", color="Grade Group", title=title)
+        chart_df["Grade Group"] = pd.Categorical(chart_df["Grade Group"], categories=grade_group_order, ordered=True)
+        chart_df = chart_df.sort_values(["Grade Group", "created_at"])
+        fig = px.line(chart_df, x="created_at", y="grade_balance_after", color="Grade Group", title=title, category_orders={"Grade Group": grade_group_order})
         fig.update_layout(yaxis_title="Balance after", xaxis_title="created_at", height=380, margin=dict(l=20, r=20, t=20, b=35))
     else:
         fig = px.line(closed, x="created_at", y="balance_after", color="timeframe" if "timeframe" in closed.columns else None, title=title)
@@ -6599,10 +6608,16 @@ def render_workflow(username: str, settings: dict) -> None:
         if closed_trades.empty:
             st.info("No closed trades yet. Explain AI will populate once TP, SL, or expiry outcomes are recorded.")
         else:
-            review_queue = closed_trades.sort_values("created_at", ascending=False).copy()
-            review_display = prepare_signal_table(review_queue, limit=200)
+            review_queue = closed_trades.sort_values("created_at", ascending=False).copy().reset_index(drop=True)
+            # Load the full closed-trade lesson history first; filtering/search should not be limited before the user interacts.
+            review_display = prepare_signal_table(review_queue, limit=None).reset_index(drop=True)
             # Preserve the real DB signal_id for row selection; prepare_signal_table may display the public Benzino ID.
-            review_display["Raw Signal ID"] = review_queue.reset_index(drop=True)["signal_id"].astype(str).values
+            if "signal_id" in review_queue.columns and len(review_queue) == len(review_display):
+                review_display["Raw Signal ID"] = review_queue["signal_id"].astype(str).values
+            elif "Signal ID" in review_display.columns:
+                review_display["Raw Signal ID"] = review_display["Signal ID"].astype(str).values
+            else:
+                review_display["Raw Signal ID"] = ""
             preferred_cols = ["Asset", "Timeframe", "Signal", "Grade", "Status", "Outcome", "R Multiple", "Entry", "SL", "TP", "Session", "Created At", "Raw Signal ID"]
             review_display = review_display[[c for c in preferred_cols if c in review_display.columns] + [c for c in review_display.columns if c not in preferred_cols and c != "Review Case"]]
 
@@ -7046,11 +7061,11 @@ def render_settings(username: str, settings: dict) -> None:
     with tab_capital:
         st.caption("Connect your own Capital.com demo account. Auto-trading uses your BENZINO watchlist, selected timeframe, A/A+ only, best session only, and max 4 demo trades per day. API credentials are stored in Supabase for the scanner to use.")
         try:
-            cap = read_df("SELECT username, account_type, enabled, auto_trading_enabled, use_benzino_settings, updated_at FROM user_capital_connections WHERE username = %s", (username,))
+            cap = read_df("SELECT username, account_type, enabled, auto_trade_enabled, use_benzino_settings, updated_at FROM user_capital_connections WHERE username = %s", (username,))
             cap_row = cap.iloc[0].to_dict() if not cap.empty else {}
             cc1, cc2, cc3, cc4 = st.columns(4)
             with cc1: metric_card("Capital connection", "Active" if bool(cap_row.get("enabled", False)) else "Inactive", str(cap_row.get("account_type") or "DEMO"))
-            with cc2: metric_card("Auto-trading", "ON" if bool(cap_row.get("auto_trading_enabled", False)) else "OFF", "A/A+ · best session · max 4/day")
+            with cc2: metric_card("Auto-trading", "ON" if bool(cap_row.get("auto_trade_enabled", False)) else "OFF", "A/A+ · best session · max 4/day")
             with cc3: metric_card("Sizing source", "BENZINO" if bool(cap_row.get("use_benzino_settings", True)) else "Capital", "Default keeps FTMO simulation aligned")
             with cc4: metric_card("Last updated", fmt_nairobi(cap_row.get("updated_at", "")) if cap_row else "Never")
 
@@ -7060,7 +7075,7 @@ def render_settings(username: str, settings: dict) -> None:
                 password = st.text_input("Capital password", type="password")
                 account_type = st.selectbox("Account type", ["DEMO", "LIVE"], index=0 if str(cap_row.get("account_type", "DEMO")).upper() != "LIVE" else 1)
                 enabled = st.checkbox("Connection enabled", value=bool(cap_row.get("enabled", False)))
-                auto_enabled = st.checkbox("Enable auto-trading on my Capital demo", value=bool(cap_row.get("auto_trading_enabled", False)))
+                auto_enabled = st.checkbox("Enable auto-trading on my Capital demo", value=bool(cap_row.get("auto_trade_enabled", False)))
                 use_benzino = st.checkbox("Use BENZINO account size, leverage and risk settings", value=bool(cap_row.get("use_benzino_settings", True)))
                 submitted = st.form_submit_button("Save Capital settings", type="primary")
             if submitted:
@@ -7074,7 +7089,7 @@ def render_settings(username: str, settings: dict) -> None:
                     old = existing.iloc[0].to_dict() if not existing.empty else {}
                     execute(
                         """
-                        INSERT INTO user_capital_connections(username, api_key, identifier, password, account_type, enabled, auto_trading_enabled, use_benzino_settings, updated_at)
+                        INSERT INTO user_capital_connections(username, api_key, identifier, password, account_type, enabled, auto_trade_enabled, use_benzino_settings, updated_at)
                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
                         ON CONFLICT (username) DO UPDATE
                         SET api_key = EXCLUDED.api_key,
@@ -7082,7 +7097,7 @@ def render_settings(username: str, settings: dict) -> None:
                             password = EXCLUDED.password,
                             account_type = EXCLUDED.account_type,
                             enabled = EXCLUDED.enabled,
-                            auto_trading_enabled = EXCLUDED.auto_trading_enabled,
+                            auto_trade_enabled = EXCLUDED.auto_trade_enabled,
                             use_benzino_settings = EXCLUDED.use_benzino_settings,
                             updated_at = NOW()
                         """,
@@ -7092,7 +7107,7 @@ def render_settings(username: str, settings: dict) -> None:
                     st.rerun()
 
             execs = load_capital_executed_trades(limit=APP_TABLE_MAX_ROWS)
-            comps = load_capital_comparisons(limit=APP_TABLE_MAX_ROWS)
+            comps = load_capital_trade_comparisons(limit=APP_TABLE_MAX_ROWS)
             if not comps.empty:
                 own = comps.copy()
                 render_benzino_aggrid(own, key="capital_settings_comparison_table", title="My Capital comparison rows", height=360, page_size=10, pinned=["asset", "direction"], numeric_cols_right=["simulated_r", "actual_pnl", "actual_pnl_ftmo_equiv", "ftmo_normalization_factor"], enable_search=True)
