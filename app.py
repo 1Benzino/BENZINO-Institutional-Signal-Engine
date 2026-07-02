@@ -5378,8 +5378,6 @@ def render_market_news(username: str, settings: dict) -> None:
         return
 
     watchlist_assets = tuple(load_user_watchlist(username).keys() or DEFAULT_ASSETS)
-    st.caption("News is pulled from your saved watchlist and refreshed every 15 minutes.")
-
     news_df = fetch_news_for_watchlist(watchlist_assets, api_key)
     if news_df.empty:
         st.info("No news returned for the current watchlist yet.")
@@ -5402,9 +5400,6 @@ def render_market_news(username: str, settings: dict) -> None:
         view = view[view["Sentiment"].astype(str).eq(sentiment_filter)]
 
     table_view = view[["Asset", "Headline", "Source", "Published", "Sentiment", "Impact", "Impact Score", "Description", "Content", "URL"]].copy()
-
-    st.markdown("<div class='benzino-panel-title'>Watchlist News</div>", unsafe_allow_html=True)
-    st.caption("Select a headline row to open a detail window with summary, impact reasoning, and the full-article link.")
 
     if AgGrid is not None and GridOptionsBuilder is not None:
         display_view = table_view[["Asset", "Headline", "Source", "Published", "Sentiment", "Impact", "Impact Score"]].copy()
@@ -5433,7 +5428,7 @@ def render_market_news(username: str, settings: dict) -> None:
         news_response = AgGrid(
             display_view,
             gridOptions=gb.build(),
-            height=560,
+            height=720,
             fit_columns_on_grid_load=False,
             theme="balham",
             allow_unsafe_jscode=True,
@@ -5458,7 +5453,7 @@ def render_market_news(username: str, settings: dict) -> None:
             key="market_news_table",
             title="Watchlist News",
             height=560,
-            page_size=12,
+            page_size=18,
             pinned=["Asset"],
             badge_cols={"Sentiment": "status", "Impact": "grade"},
             numeric_cols_right=["Impact Score"],
@@ -5466,7 +5461,7 @@ def render_market_news(username: str, settings: dict) -> None:
 
 
 def render_workflow(username: str, settings: dict) -> None:
-    page_header("Workflow", "User journal, prop-firm mode, No Trade tracker, Coach AI, and Explain AI.")
+    page_header("Workflow", "")
     raw_df = enrich_position_sizing(load_signals_for_user(username, settings), settings)
     system_raw_df = load_all_system_signals(settings)
     system_df = apply_timeframe_view(system_raw_df, settings)
@@ -6860,24 +6855,66 @@ def render_workflow(username: str, settings: dict) -> None:
                 q = str(explain_review_search).lower().strip()
                 review_display = review_display[review_display.astype(str).apply(lambda col: col.str.lower().str.contains(q, na=False)).any(axis=1)]
 
-            st.caption("Select a row to open the lesson window. In AgGrid, double-clicking visually selects the row; in Streamlit's fallback table, use the row selector.")
             selected_sid = ""
-            event = st.dataframe(
-                review_display.drop(columns=["Raw Signal ID"], errors="ignore"),
-                width="stretch",
-                hide_index=True,
-                selection_mode="single-row",
-                on_select="rerun",
-                key="explain_ai_closed_trade_table",
-            )
-            try:
-                selected_rows = event.selection.rows
-            except Exception:
-                selected_rows = []
-            if selected_rows:
-                idx = selected_rows[0]
-                if 0 <= idx < len(review_display):
-                    selected_sid = str(review_display.iloc[idx].get("Raw Signal ID") or "")
+            display_cols = review_display.drop(columns=["Raw Signal ID"], errors="ignore")
+
+            if AgGrid is not None and GridOptionsBuilder is not None:
+                ag_view = review_display.copy()
+                gb = GridOptionsBuilder.from_dataframe(ag_view)
+                gb.configure_default_column(sortable=True, filter=True, resizable=True, wrapText=False, autoHeight=False)
+                gb.configure_selection(selection_mode="single", use_checkbox=False)
+                gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=12)
+                gb.configure_grid_options(
+                    rowHeight=52,
+                    headerHeight=44,
+                    suppressMenuHide=True,
+                    domLayout="normal",
+                    animateRows=True,
+                    enableCellTextSelection=True,
+                    quickFilterText=None,
+                )
+                renderers = aggrid_badge_renderers()
+                if "Asset" in ag_view.columns:
+                    gb.configure_column("Asset", pinned="left")
+                if "Raw Signal ID" in ag_view.columns:
+                    gb.configure_column("Raw Signal ID", hide=True)
+                for _col, _renderer in {"Signal": "signal", "Grade": "grade", "Status": "status", "Outcome": "outcome"}.items():
+                    if _col in ag_view.columns and _renderer in renderers:
+                        gb.configure_column(_col, cellRenderer=renderers[_renderer])
+                explain_response = AgGrid(
+                    ag_view,
+                    gridOptions=gb.build(),
+                    height=640,
+                    fit_columns_on_grid_load=False,
+                    theme="balham",
+                    allow_unsafe_jscode=True,
+                    custom_css=benzino_aggrid_css(),
+                    key="explain_ai_closed_trade_aggrid",
+                )
+                selected = explain_response.get("selected_rows", [])
+                if isinstance(selected, pd.DataFrame):
+                    selected_records = selected.to_dict("records")
+                else:
+                    selected_records = selected or []
+                if selected_records:
+                    selected_sid = str(selected_records[0].get("Raw Signal ID") or selected_records[0].get("Signal ID") or "")
+            else:
+                event = st.dataframe(
+                    display_cols,
+                    width="stretch",
+                    hide_index=True,
+                    selection_mode="single-row",
+                    on_select="rerun",
+                    key="explain_ai_closed_trade_table",
+                )
+                try:
+                    selected_rows = event.selection.rows
+                except Exception:
+                    selected_rows = []
+                if selected_rows:
+                    idx = selected_rows[0]
+                    if 0 <= idx < len(review_display):
+                        selected_sid = str(review_display.iloc[idx].get("Raw Signal ID") or "")
 
             if selected_sid:
                 row_df = review_queue[review_queue["signal_id"].astype(str).eq(selected_sid)]
