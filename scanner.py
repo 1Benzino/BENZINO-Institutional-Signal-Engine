@@ -40,6 +40,7 @@ import json
 import warnings
 import traceback
 import math
+import re
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
@@ -534,9 +535,9 @@ SHADOW_BACKFILL_LIMIT = int(os.environ.get("SHADOW_BACKFILL_LIMIT", "800"))
 
 # One-off / safety replay controls.
 # When true, the scanner replays existing resolved Supabase outcomes using the
-# new 1-minute replay engine where Yahoo 1m data is available, falling back to
-# the stored signal timeframe when it is not. This lets you improve current
-# Supabase TP/SL/expiry data without restarting the test.
+# Capital.com 1-minute replay engine only. If Capital 1-minute data is not
+# available, the row stays open/unchecked for a later run; timeframe candle
+# fallback is intentionally disabled for clean Capital-only audit data.
 REPLAY_EXISTING_OUTCOMES = os.environ.get("REPLAY_EXISTING_OUTCOMES", "true").strip().lower() in {"1", "true", "yes", "y"}
 REPLAY_EXISTING_OUTCOMES_DAYS = int(os.environ.get("REPLAY_EXISTING_OUTCOMES_DAYS", "30"))
 REPLAY_EXISTING_OUTCOMES_LIMIT = int(os.environ.get("REPLAY_EXISTING_OUTCOMES_LIMIT", "300"))
@@ -986,9 +987,10 @@ def force_open_graded_setups() -> int:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(sql)
-                rows = cur.fetchall()
+                # UPDATE without RETURNING has no result set. rowcount is the
+                # correct value here; calling fetchall() causes "no results to fetch".
+                count = int(cur.rowcount or 0)
         conn.close()
-        count = len(rows or [])
         if count:
             print(f"[DB] Auto-open migration fixed {count} graded shadow row(s).")
         return count
@@ -3243,6 +3245,42 @@ def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] 
     return resolved
 
 
+
+def get_replay_backfill_progress(max_age_days: int | None = None) -> dict:
+    """Return Capital replay backlog/progress stats for user-visible logs."""
+    days = int(max_age_days if max_age_days is not None else REPLAY_EXISTING_OUTCOMES_DAYS)
+    sql = """
+        SELECT
+            COUNT(*) FILTER (WHERE replay_checked_at IS NULL) AS remaining,
+            COUNT(*) FILTER (WHERE replay_checked_at IS NOT NULL) AS checked,
+            COUNT(*) AS total
+        FROM scanner_signals
+        WHERE created_at >= NOW() - (%s::int * INTERVAL '1 day')
+          AND UPPER(TRIM(COALESCE(signal, ''))) IN ('BUY', 'SELL')
+          AND COALESCE(entry, 0) > 0
+          AND ABS(COALESCE(entry,0) - COALESCE(sl,0)) > 0.00000001
+          AND ABS(COALESCE(sl,0) - COALESCE(tp,0)) > 0.00000001
+          AND (
+                UPPER(TRIM(COALESCE(status,''))) IN ('CLOSED_TP','CLOSED_SL','EXPIRED','CLOSED')
+             OR shadow_outcome IS NOT NULL
+          )
+    """
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute(sql, (days,))
+            row = cur.fetchone() or {}
+        conn.close()
+        remaining = int(row.get("remaining") or 0)
+        checked = int(row.get("checked") or 0)
+        total = int(row.get("total") or 0)
+        pct = (checked / total * 100.0) if total else 100.0
+        runs_left = math.ceil(remaining / max(1, int(REPLAY_EXISTING_OUTCOMES_LIMIT))) if remaining else 0
+        return {"remaining": remaining, "checked": checked, "total": total, "pct": pct, "runs_left": runs_left}
+    except Exception as exc:
+        print(f"[Replay1mBackfill] Progress query failed: {exc}")
+        return {"remaining": 0, "checked": 0, "total": 0, "pct": 0.0, "runs_left": 0}
+
 def fetch_existing_outcomes_for_replay(max_age_days: int = 30, limit: int = 5000) -> list[dict]:
     """Fetch already-resolved rows that can be improved with 1-minute replay.
 
@@ -3395,6 +3433,13 @@ def replay_existing_resolved_outcomes(max_age_days: int | None = None, limit: in
     """
     days = int(max_age_days if max_age_days is not None else REPLAY_EXISTING_OUTCOMES_DAYS)
     lim = int(limit if limit is not None else REPLAY_EXISTING_OUTCOMES_LIMIT)
+    progress = get_replay_backfill_progress(days)
+    if progress.get("total", 0):
+        print(
+            f"[Replay1mBackfill] Progress: {progress['checked']:,}/{progress['total']:,} checked "
+            f"({progress['pct']:.1f}%). Remaining: {progress['remaining']:,}. "
+            f"Estimated runs left at {lim:,}/run: {progress['runs_left']:,}."
+        )
     rows = fetch_existing_outcomes_for_replay(days, lim)
     if not rows:
         print("[Replay1mBackfill] No existing resolved outcomes to replay.")
