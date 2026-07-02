@@ -1599,17 +1599,44 @@ def _capital_market_score(symbol: str, market: dict) -> int:
 
 
 
+
+def _as_float(value, default=None):
+    """Convert Capital API numeric values safely, including rule objects like {'value': 1}."""
+    try:
+        if value is None or value == "":
+            return default
+        if isinstance(value, dict):
+            for key in ("value", "min", "max", "amount", "size", "distance"):
+                if key in value:
+                    out = _as_float(value.get(key), None)
+                    if out is not None:
+                        return out
+            return default
+        if isinstance(value, str):
+            m = re.search(r"[-+]?\d+(?:\.\d+)?", value)
+            return float(m.group(0)) if m else default
+        return float(value)
+    except Exception:
+        return default
+
+
 def _deep_find_number(obj, key_fragments: list[str], default=None):
-    """Best-effort recursive extraction of Capital instrument constraints."""
+    """Best-effort recursive extraction of Capital instrument constraints.
+
+    Capital often returns dealing rules as nested objects, for example:
+        {'dealingRules': {'minDealSize': {'value': 1, 'unit': 'POINTS'}}}
+
+    Older extraction only handled direct numeric values, which is why the
+    Supabase columns were being saved as 0/null even though the rule existed.
+    """
     try:
         if isinstance(obj, dict):
             for k, v in obj.items():
                 kl = str(k).lower()
                 if all(f.lower() in kl for f in key_fragments):
-                    try:
-                        return float(v)
-                    except Exception:
-                        pass
+                    out = _as_float(v, None)
+                    if out is not None:
+                        return out
             for v in obj.values():
                 found = _deep_find_number(v, key_fragments, None)
                 if found is not None:
@@ -1624,24 +1651,77 @@ def _deep_find_number(obj, key_fragments: list[str], default=None):
     return default
 
 
+def _rule_value(rules: dict, *names: str, default: float = 0.0) -> float:
+    """Return the first numeric dealing-rule value from a Capital rules dict."""
+    if not isinstance(rules, dict):
+        return float(default)
+    lower_map = {str(k).lower(): v for k, v in rules.items()}
+    for name in names:
+        key = str(name).lower()
+        if key in lower_map:
+            val = _as_float(lower_map[key], None)
+            if val is not None:
+                return float(val)
+    # Loose matching fallback for small schema differences.
+    for name in names:
+        wanted = re.sub(r"[^a-z0-9]", "", str(name).lower())
+        for k, v in lower_map.items():
+            kk = re.sub(r"[^a-z0-9]", "", k)
+            if wanted and wanted in kk:
+                val = _as_float(v, None)
+                if val is not None:
+                    return float(val)
+    return float(default)
+
+
+def _capital_dealing_rules(market: dict | None) -> dict:
+    market = market or {}
+    for candidate in (
+        market.get("dealingRules"),
+        (market.get("instrument") or {}).get("dealingRules") if isinstance(market.get("instrument"), dict) else None,
+        (market.get("market") or {}).get("dealingRules") if isinstance(market.get("market"), dict) else None,
+    ):
+        if isinstance(candidate, dict) and candidate:
+            return candidate
+    return {}
+
+
 def capital_extract_constraints(market: dict | None) -> dict:
     market = market or {}
-    # Capital schemas vary by endpoint/account. These keys cover common names
-    # and recursively inspect dealingRules/snapshot blocks.
-    min_size = (_deep_find_number(market, ["min", "deal", "size"]) or
+    rules = _capital_dealing_rules(market)
+
+    # Prefer explicit Capital dealingRules. Fall back to recursive extraction
+    # because some endpoint responses flatten or rename these fields.
+    min_size = (_rule_value(rules, "minDealSize") or
+                _deep_find_number(market, ["min", "deal", "size"]) or
                 _deep_find_number(market, ["min", "size"]) or 0.0)
-    max_size = (_deep_find_number(market, ["max", "deal", "size"]) or
+    max_size = (_rule_value(rules, "maxDealSize") or
+                _deep_find_number(market, ["max", "deal", "size"]) or
                 _deep_find_number(market, ["max", "size"]) or 0.0)
-    step_size = (_deep_find_number(market, ["step", "size"]) or
+    step_size = (_rule_value(rules, "minStepDistance", "stepDistance", "minStepSize") or
+                 _deep_find_number(market, ["step", "size"]) or
+                 _deep_find_number(market, ["step", "distance"]) or
                  _deep_find_number(market, ["min", "step"]) or 0.0)
-    min_stop = (_deep_find_number(market, ["min", "stop", "distance"]) or
-                _deep_find_number(market, ["min", "stop"]) or 0.0)
-    max_stop = (_deep_find_number(market, ["max", "stop", "distance"]) or
-                _deep_find_number(market, ["max", "stop"]) or 0.0)
-    min_limit = (_deep_find_number(market, ["min", "limit", "distance"]) or
-                 _deep_find_number(market, ["min", "limit"]) or 0.0)
-    max_limit = (_deep_find_number(market, ["max", "limit", "distance"]) or
-                 _deep_find_number(market, ["max", "limit"]) or 0.0)
+
+    # Capital's normal stop/limit rule is the practical minimum distance for
+    # non-guaranteed SL/TP orders. maxStopOrLimitDistance is the practical max.
+    min_stop = (_rule_value(rules, "minNormalStopOrLimitDistance", "minStopOrLimitDistance", "minStopDistance") or
+                _deep_find_number(market, ["min", "normal", "stop", "limit", "distance"]) or
+                _deep_find_number(market, ["min", "stop", "limit", "distance"]) or
+                _deep_find_number(market, ["min", "stop", "distance"]) or 0.0)
+    max_stop = (_rule_value(rules, "maxStopOrLimitDistance", "maxStopDistance") or
+                _deep_find_number(market, ["max", "stop", "limit", "distance"]) or
+                _deep_find_number(market, ["max", "stop", "distance"]) or 0.0)
+    min_limit = (_rule_value(rules, "minNormalStopOrLimitDistance", "minStopOrLimitDistance", "minLimitDistance") or
+                 _deep_find_number(market, ["min", "limit", "distance"]) or min_stop or 0.0)
+    max_limit = (_rule_value(rules, "maxStopOrLimitDistance", "maxLimitDistance") or
+                 _deep_find_number(market, ["max", "limit", "distance"]) or max_stop or 0.0)
+
+    # If Capital omits a step but gives a minimum deal size, using min_size as
+    # the step is safer than sending arbitrary decimals that may be rejected.
+    if not step_size and min_size:
+        step_size = min_size
+
     return {
         "min_size": float(min_size or 0),
         "max_size": float(max_size or 0),
@@ -1651,7 +1731,6 @@ def capital_extract_constraints(market: dict | None) -> dict:
         "min_limit_distance": float(min_limit or 0),
         "max_limit_distance": float(max_limit or 0),
     }
-
 
 def round_to_broker_step(size: float, step: float, *, direction: str = "nearest") -> float:
     try:
@@ -4421,6 +4500,51 @@ def sync_capital_actual_executions() -> int:
 #  MAIN SCAN LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+def refresh_missing_capital_constraints(limit: int = 40) -> None:
+    """One-time-style repair for capital_epic_map rows with 0/null constraints.
+
+    It only touches rows whose broker constraint columns are still empty. Once
+    they have real values, future scanner runs skip this automatically.
+    """
+    if not capital_configured():
+        return
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT asset, epic
+                FROM capital_epic_map
+                WHERE COALESCE(min_size,0) = 0
+                   OR COALESCE(step_size,0) = 0
+                   OR COALESCE(min_stop_distance,0) = 0
+                ORDER BY asset
+                LIMIT %s
+                """,
+                (int(limit),),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    except Exception as exc:
+        print(f"[CapitalConstraints] refresh lookup skipped: {exc}")
+        return
+
+    if not rows:
+        return
+    refreshed = 0
+    still_empty = 0
+    for row in rows:
+        asset = str(row.get("asset") or "").upper().strip()
+        epic = str(row.get("epic") or "").strip()
+        info = capital_refresh_market_constraints(asset, epic)
+        if any(float(info.get(k) or 0) > 0 for k in ("min_size", "step_size", "min_stop_distance")):
+            refreshed += 1
+        else:
+            still_empty += 1
+    print(f"[CapitalConstraints] Refreshed {refreshed}/{len(rows)} missing broker constraint row(s). Still empty: {still_empty}.")
+
+
 def run_scan() -> None:
     run_id = uuid.uuid4().hex
     started = datetime.now(timezone.utc)
@@ -4440,6 +4564,7 @@ def run_scan() -> None:
 
     _TF_CACHE.clear()
     init_tables()
+    refresh_missing_capital_constraints(limit=40)
     if LOCK_HISTORICAL_SIGNAL_PLANS:
         print("[Replay1mBackfill] Historical signal plans locked: entry/sl/tp are preserved; only outcomes are updated.")
     force_open_graded_setups()

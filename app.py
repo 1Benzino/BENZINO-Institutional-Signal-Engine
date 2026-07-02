@@ -80,6 +80,9 @@ BRAND_LOGO_DATA_URI = image_to_data_uri(LOGO_PATH)
 DEFAULT_TIMEZONE = "Africa/Nairobi"
 ADMIN_USERNAMES = set()  # Admin is now assigned by database role: first created profile only.
 VALID_GRADES = {"A+", "A", "B", "C"}
+# Tables must load all relevant Supabase rows first, then filter/search in the app.
+# Keep this high enough for full history while avoiding accidental unbounded memory blowups.
+APP_TABLE_MAX_ROWS = 250000
 SIGNAL_TIMEFRAMES = ["All", "15m", "1h", "4h", "1d"]
 
 # Prop-firm challenge rules used by the Supabase replay simulator.
@@ -1304,7 +1307,7 @@ def load_prop_firm_state() -> dict:
     return row
 
 
-def load_prop_firm_trades(limit: int = 500) -> pd.DataFrame:
+def load_prop_firm_trades(limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFrame:
     """Closed A+/A trades that have actually been posted to the official ledger."""
     df = read_df(
         """
@@ -1321,7 +1324,7 @@ def load_prop_firm_trades(limit: int = 500) -> pd.DataFrame:
     return numeric_cols(df, ["r_multiple", "pnl_cash", "entry", "sl", "tp"])
 
 
-def load_capital_trade_comparisons(limit: int = 500) -> pd.DataFrame:
+def load_capital_trade_comparisons(limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFrame:
     """Actual Capital.com executions matched against simulated BENZINO signals."""
     df = read_df(
         """
@@ -1348,7 +1351,7 @@ def load_capital_trade_comparisons(limit: int = 500) -> pd.DataFrame:
     ])
 
 
-def load_capital_executed_trades(limit: int = 500) -> pd.DataFrame:
+def load_capital_executed_trades(limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFrame:
     """Raw Capital.com execution rows imported by the scanner."""
     df = read_df(
         """
@@ -1372,7 +1375,7 @@ def prop_challenge_scan_owner(username: str, timeframe: str) -> str:
     return f"{normalize_username(username)}:{str(timeframe or '1h').lower()}"
 
 
-def load_prop_challenge_history(username: str, timeframe: str, limit: int = 100) -> pd.DataFrame:
+def load_prop_challenge_history(username: str, timeframe: str, limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFrame:
     """Read completed prop-firm challenge attempts from Supabase."""
     scope = prop_challenge_scan_owner(username, timeframe)
     df = read_df(
@@ -1978,7 +1981,7 @@ def load_signals_for_user(username: str, settings: dict, include_all_admin: bool
     # This limit is now applied AFTER the user/watchlist filter, not before it.
     # 50k is intentionally high so journal history remains stable while still
     # preventing accidental unbounded reads on very large databases.
-    params.append(50000)
+    params.append(APP_TABLE_MAX_ROWS)
     sql = f"""
         SELECT * FROM scanner_signals
         WHERE {' AND '.join(where)}
@@ -1995,7 +1998,7 @@ def load_signals_for_user(username: str, settings: dict, include_all_admin: bool
     return df
 
 
-def load_all_system_signals(settings: dict, limit: int = 50000) -> pd.DataFrame:
+def load_all_system_signals(settings: dict, limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFrame:
     """Load the complete scanner history from Supabase.
 
     This intentionally ignores the logged-in user's watchlist and activation date.
@@ -2831,7 +2834,7 @@ def render_system_health_panel() -> None:
     if "started_at" in view.columns:
         view["started_at"] = view["started_at"].apply(fmt_nairobi)
     render_benzino_aggrid(
-        view.head(50),
+        view,
         key="system_health_runs",
         title="Scanner Run History",
         height=320,
@@ -3261,7 +3264,7 @@ def render_benzino_aggrid(
     return response
 
 
-def prepare_signal_table(df: pd.DataFrame, settings=None, limit: int = 300) -> pd.DataFrame:
+def prepare_signal_table(df: pd.DataFrame, settings=None, limit: int | None = None) -> pd.DataFrame:
     """Consistent signal table columns for dashboard, Explain AI and research tabs."""
     if df is None or df.empty:
         return pd.DataFrame()
@@ -3274,7 +3277,9 @@ def prepare_signal_table(df: pd.DataFrame, settings=None, limit: int = 300) -> p
         fallback = view["signal_id"].astype(str) if "signal_id" in view.columns else display
         view["signal_id"] = display.where(display.str.strip().ne(""), fallback)
 
-    view = sort_signal_rows_newest_first(view).head(limit)
+    view = sort_signal_rows_newest_first(view)
+    if limit is not None:
+        view = view.head(int(limit))
     if "created_at" in view.columns:
         view["Age"] = view["created_at"].apply(age_ago)
         view["Created At"] = view["created_at"].apply(fmt_nairobi)
@@ -4405,7 +4410,7 @@ def render_opportunity_board(username: str, settings: dict) -> None:
             generated["signal_id"] = display.where(display.str.strip().ne(""), fallback)
         if "created_at" in generated.columns:
             generated = generated.sort_values("created_at", ascending=False)
-        generated = generated.head(100).copy()
+        generated = generated.copy()
 
         # Top toolbar: title + real filter controls + search.
         title_col, signal_filter_col, grade_filter_col, search_col = st.columns([5.2, 1.15, 1.15, 2.3], vertical_alignment="center")
@@ -4854,7 +4859,7 @@ def render_asset_deep_dive(username: str, settings: dict) -> None:
     hist = adf.copy()
     hist["created_at_eat"] = hist["created_at"].apply(fmt_nairobi)
     cols = ["created_at", "created_at_eat", "asset", "ticker", "timeframe", "signal", "grade", "status", "confidence", "edge_score", "mtf_score", "rr", "r_multiple", "exit_reason", "session"]
-    hist_view = prepare_signal_table(hist[[c for c in cols if c in hist.columns]].head(100))
+    hist_view = prepare_signal_table(hist[[c for c in cols if c in hist.columns]])
     title_col, sig_col, grade_col, search_col = st.columns([5.0, 1.15, 1.15, 2.4], vertical_alignment="center")
     with title_col:
         st.markdown("<div class='benzino-panel-title'>History for selected asset</div>", unsafe_allow_html=True)
@@ -4972,11 +4977,11 @@ def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
             include_groups=False,
         ).reset_index().sort_values(["trades", "win_rate"], ascending=[False, False])
         st.markdown("**By asset**")
-        render_benzino_aggrid(asset_perf.head(30), key="system_perf_asset", height=240, page_size=10, pinned=["asset"], numeric_cols_right=[c for c in asset_perf.columns if c != "asset"], enable_search=False, show_footer=False, use_pagination=False)
+        render_benzino_aggrid(asset_perf, key="system_perf_asset", height=240, page_size=10, pinned=["asset"], numeric_cols_right=[c for c in asset_perf.columns if c != "asset"], enable_search=False, show_footer=False, use_pagination=False)
 
     st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
     latest_cols = ["created_at", "asset", "asset_group", "timeframe", "signal", "grade", "status", "outcome", "r_multiple", "rr", "session", "signal_id"]
-    latest_source = system_df[[c for c in latest_cols if c in system_df.columns]].head(300).copy()
+    latest_source = system_df[[c for c in latest_cols if c in system_df.columns]].copy()
 
     # Outcome should describe resolved result only. Status already tells the user whether a row is open/closed/shadow.
     if not latest_source.empty:
@@ -5370,7 +5375,7 @@ def render_workflow(username: str, settings: dict) -> None:
                 render_benzino_aggrid(asset_perf.sort_values("trades", ascending=False), key="journal_asset_perf", height=240, page_size=10, pinned=["asset"], numeric_cols_right=[c for c in asset_perf.columns if c != "asset"], enable_search=False, show_footer=False, use_pagination=False)
 
         def _render_journal_signal_grid(source_df: pd.DataFrame, table_title: str, key_prefix: str, cols: list[str], badge_map: dict, numeric_right: list[str]) -> None:
-            prepared = prepare_signal_table(source_df[[c for c in cols if c in source_df.columns]].head(200))
+            prepared = prepare_signal_table(source_df[[c for c in cols if c in source_df.columns]])
             title_col, sig_col, grade_col, status_col, search_col = st.columns([3.6, 1.0, 1.0, 1.15, 2.25], vertical_alignment="center")
             with title_col:
                 st.markdown(f"<div class='benzino-panel-title'>{html.escape(table_title)}</div>", unsafe_allow_html=True)
@@ -5428,8 +5433,8 @@ def render_workflow(username: str, settings: dict) -> None:
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         st.subheader("Capital.com simulated vs actual")
         st.caption("This compares BENZINO's simulated signal outcome against trades BENZINO opened on your Capital.com demo account. Historical signal plans stay locked; the focus here is whether the auto-executed trade matched the simulated result, not manual entry or exit drift.")
-        cap_comp = load_capital_trade_comparisons(limit=500)
-        cap_raw = load_capital_executed_trades(limit=500)
+        cap_comp = load_capital_trade_comparisons(limit=APP_TABLE_MAX_ROWS)
+        cap_raw = load_capital_executed_trades(limit=APP_TABLE_MAX_ROWS)
         if cap_comp.empty and cap_raw.empty:
             st.info("No Capital.com auto-trade executions have been imported yet. Once CAPITAL_AUTO_TRADE_ENABLED is turned on and the scanner opens demo trades, this section will show simulated vs actual results.")
         else:
@@ -6099,7 +6104,7 @@ def render_workflow(username: str, settings: dict) -> None:
             cols = ["closed_at", "asset", "timeframe", "signal", "grade", "status", "outcome", "r_multiple", "pnl_cash", "balance_after", "exit_reason", "entry", "sl", "tp"]
 
             closed_trade_table = prepare_signal_table(
-                view[[c for c in cols if c in view.columns]].sort_values("closed_at", ascending=False).head(300)
+                view[[c for c in cols if c in view.columns]].sort_values("closed_at", ascending=False)
             )
             closed_trade_table = closed_trade_table.rename(columns={
                 "closed_at": "Closed At",
@@ -6131,7 +6136,7 @@ def render_workflow(username: str, settings: dict) -> None:
             )
 
             st.markdown("**Challenge outcomes**")
-            outcome_source = load_prop_challenge_history(username, challenge_tf, limit=1000)
+            outcome_source = load_prop_challenge_history(username, challenge_tf, limit=APP_TABLE_MAX_ROWS)
             if outcome_source is None or outcome_source.empty:
                 outcome_source = pd.DataFrame(prop_sim.get("history", []))
             if outcome_source is None or outcome_source.empty:
@@ -6242,7 +6247,7 @@ def render_workflow(username: str, settings: dict) -> None:
 
 
         st.markdown("**Challenge review history**")
-        history_view = load_prop_challenge_history(username, challenge_tf, limit=100)
+        history_view = load_prop_challenge_history(username, challenge_tf, limit=APP_TABLE_MAX_ROWS)
         if not history_view.empty:
             history_view = history_view.copy()
             history_view["Timeframe"] = challenge_tf
@@ -6427,7 +6432,7 @@ def render_workflow(username: str, settings: dict) -> None:
         if not no_trade_table.empty and "created_at" in no_trades.columns:
             no_trade_table = no_trade_table.loc[no_trades.sort_values("created_at", ascending=False).index.intersection(no_trade_table.index)]
 
-        no_trade_display = prepare_signal_table(no_trade_table, limit=10000)
+        no_trade_display = prepare_signal_table(no_trade_table)
         if not no_trade_display.empty:
             # The database status for No Trade rows is intentionally always SHADOW,
             # so the table uses a more useful research status instead: whether the
@@ -6565,7 +6570,7 @@ def render_workflow(username: str, settings: dict) -> None:
         if closed_trades.empty:
             st.info("No closed trades yet. Explain AI will populate once TP, SL, or expiry outcomes are recorded.")
         else:
-            review_queue = closed_trades.sort_values("created_at", ascending=False).head(200).copy()
+            review_queue = closed_trades.sort_values("created_at", ascending=False).copy()
             review_display = prepare_signal_table(review_queue, limit=200)
             # Preserve the real DB signal_id for row selection; prepare_signal_table may display the public Benzino ID.
             review_display["Raw Signal ID"] = review_queue.reset_index(drop=True)["signal_id"].astype(str).values
