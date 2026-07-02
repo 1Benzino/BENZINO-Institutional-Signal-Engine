@@ -3038,22 +3038,17 @@ def benzino_aggrid_css() -> dict:
 
 
 def price_decimals_for_asset(asset: str | None, value=None) -> int:
-    """TradingView-style display precision for Entry, SL and TP.
+    """Capital/TradingView-style display precision for market prices.
 
-    The database keeps raw precision, but the app should display the same
-    practical quote precision a trader sees on TradingView/broker charts.
+    Supabase keeps raw numeric values. Display formatting should be consistent
+    everywhere in the app and should not use generic 2dp rounding for prices.
     """
     a = str(asset or "").strip().upper().replace("/", "").replace("-", "")
 
-    # Crypto, commodities, indices and equities normally trade visually at 2dp.
-    if a in {"BTCUSD", "ETHUSD", "OIL", "BRENT", "NATGAS", "COPPER", "XAUUSD", "XAGUSD", "SP500", "NAS100", "DOW30", "NVDA", "MU"}:
-        return 2
-
-    # JPY FX pairs use pipette-style 3dp on TradingView/broker displays.
+    # FX: non-JPY pairs normally show 5dp; JPY pairs normally show 3dp.
     if a.endswith("JPY") or "JPY" in a:
         return 3
 
-    # Most non-JPY FX pairs use 5dp.
     known_fx = {
         "EURUSD", "GBPUSD", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD",
         "EURGBP", "EURAUD", "EURNZD", "EURCAD", "EURCHF",
@@ -3063,13 +3058,25 @@ def price_decimals_for_asset(asset: str | None, value=None) -> int:
     if a in known_fx:
         return 5
 
+    # Capital commodities/CFDs: keep the precision traders see on Capital/TradingView.
+    if a == "XAUUSD":
+        return 2
+    if a == "XAGUSD":
+        return 3
+    if a in {"OIL", "BRENT", "NATGAS", "COPPER"}:
+        return 3
+
+    # Indices, shares and crypto are normally displayed at 2dp in the app.
+    if a in {"BTCUSD", "ETHUSD", "SP500", "NAS100", "DOW30", "NVDA", "MU"}:
+        return 2
+
     # Fallback from price scale when an asset label is unavailable.
     try:
         x = abs(float(str(value).replace(",", "")))
-        if x >= 10:
+        if x >= 100:
             return 2
-        if x >= 1:
-            return 5
+        if x >= 10:
+            return 3
         return 5
     except Exception:
         return 2
@@ -3090,16 +3097,62 @@ def format_market_price(value, asset: str | None = None):
 
 
 def is_price_display_column(col_name: str) -> bool:
-    """Only Entry, SL, and TP are allowed to keep market-price precision."""
+    """Columns containing market prices should use asset-specific precision."""
     c = str(col_name or "").strip().lower()
     c = c.replace("_", " ").replace("-", " ")
     c = re.sub(r"\s+", " ", c)
 
     exact = {
         "entry", "sl", "tp",
-        "hypothetical entry", "hypothetical sl", "hypothetical tp",
+        "sim entry", "actual entry", "sim exit", "actual exit",
+        "simulated entry", "simulated exit",
+        "hypothetical entry", "hypothetical sl", "hypothetical tp", "hypothetical exit",
+        "entry price", "exit price", "fill price", "avg fill price",
+        "simulated_entry", "actual_entry", "simulated_exit", "actual_exit",
+        "entry_price", "exit_price", "shadow_exit_price", "shadow exit price",
     }
-    return c in exact
+    if c in exact:
+        return True
+
+    # Conservative pattern match for common price columns while avoiding P/L, R, size, and percentages.
+    price_tokens = (" entry", " exit", " price", " fill")
+    excluded = ("p/l", "pnl", "profit", "loss", "r multiple", "actual r", "sim r", "size", "pct", "%")
+    return any(tok in f" {c}" for tok in price_tokens) and not any(x in c for x in excluded)
+
+
+def render_capital_match_quality_legend() -> None:
+    """Explain Capital comparison match-quality labels to users."""
+    st.markdown(
+        """
+        <div class="soft-card" style="padding:14px 16px;margin:10px 0 16px;">
+            <div style="font-weight:950;color:#E8EDF2;margin-bottom:8px;">Match quality legend</div>
+            <div class="grey-note" style="line-height:1.65;">
+                <b>AUTO_MATCHED</b> — BENZINO opened this Capital demo trade and linked it directly to the originating signal.<br>
+                <b>MANUAL_MATCHED</b> — A manually opened Capital trade clearly matched a BENZINO signal by asset, direction and time window.<br>
+                <b>TIGHT</b> — Legacy/manual-style match: same asset and direction, close timing and close price, but not linked by original order ID.<br>
+                <b>CLOSE_MATCH</b> — Probable match, but less certain than TIGHT.<br>
+                <b>UNMATCHED</b> — Capital trade found, but no reliable BENZINO signal match was found.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def apply_market_price_formatting(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply asset-specific price precision to any recognized price columns."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    asset_col = next((c for c in ["Asset", "asset", "Instrument", "symbol", "Symbol"] if c in out.columns), None)
+    for col in list(out.columns):
+        if not is_price_display_column(col):
+            continue
+        if asset_col:
+            out[col] = out.apply(lambda r, c=col: format_market_price(r.get(c), r.get(asset_col)), axis=1)
+        else:
+            out[col] = out[col].apply(format_market_price)
+    return out
 
 
 
@@ -5379,7 +5432,7 @@ def render_workflow(username: str, settings: dict) -> None:
     open_trades = trades[trades["status"].astype(str).str.upper().eq("OPEN")]
     closed_trades = trades[trades["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])]
 
-    t1, t2, t3, t4, t5, t6 = st.tabs(["User Journal", "System Performance", "Prop Firm", "No Trade Tracker", "Coach AI", "Explain AI"])
+    t1, t2, t3, t_cap, t4, t5, t6 = st.tabs(["User Journal", "System Performance", "Prop Firm", "Capital", "No Trade Tracker", "Coach AI", "Explain AI"])
 
     with t1:
         c1, c2, c3, c4 = st.columns(4)
@@ -5471,74 +5524,6 @@ def render_workflow(username: str, settings: dict) -> None:
         )
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-        st.subheader("Capital.com simulated vs actual")
-        st.caption("This compares BENZINO's simulated signal outcome against trades BENZINO opened on your Capital.com demo account. Historical signal plans stay locked; the focus here is whether the auto-executed trade matched the simulated result, not manual entry or exit drift.")
-        cap_comp = load_capital_trade_comparisons(limit=APP_TABLE_MAX_ROWS)
-        cap_raw = load_capital_executed_trades(limit=APP_TABLE_MAX_ROWS)
-        if cap_comp.empty and cap_raw.empty:
-            st.info("No Capital.com auto-trade executions have been imported yet. Once CAPITAL_AUTO_TRADE_ENABLED is turned on and the scanner opens demo trades, this section will show simulated vs actual results.")
-        else:
-            auto_count = int(pd.Series(cap_comp.get("auto_trade", pd.Series(dtype=bool))).fillna(False).astype(bool).sum()) if not cap_comp.empty else 0
-            matched_count = len(cap_comp)
-            total_actual_pnl = float(pd.to_numeric(cap_comp.get("actual_pnl", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not cap_comp.empty else 0.0
-            avg_sim_r = float(pd.to_numeric(cap_comp.get("simulated_r", pd.Series(dtype=float)), errors="coerce").dropna().mean()) if not cap_comp.empty else 0.0
-            avg_actual_r = float(pd.to_numeric(cap_comp.get("actual_r", pd.Series(dtype=float)), errors="coerce").dropna().mean()) if not cap_comp.empty else 0.0
-            ec1, ec2, ec3, ec4 = st.columns(4)
-            with ec1: metric_card("Auto executions", f"{auto_count:,}", "Opened by BENZINO on Capital.com")
-            with ec2: metric_card("Matched signals", f"{matched_count:,}", "Linked by signal ID")
-            with ec3: metric_card("Avg R", f"Sim {avg_sim_r:+.2f}R / Actual {avg_actual_r:+.2f}R", "Simulation vs execution")
-            with ec4: metric_card("Actual P/L", f"${total_actual_pnl:+,.2f}", "Capital.com reported P/L")
-
-            if not cap_comp.empty:
-                comp = cap_comp.copy()
-                comp["Opened"] = pd.to_datetime(comp.get("opened_at"), errors="coerce", utc=True).dt.tz_convert(NAIROBI_TZ).dt.strftime("%Y-%m-%d %H:%M")
-                comp_display = comp.rename(columns={
-                    "asset": "Asset",
-                    "direction": "Direction",
-                    "match_quality": "Match",
-                    "simulated_entry": "Sim Entry",
-                    "actual_entry": "Actual Entry",
-                    "simulated_exit": "Sim Exit",
-                    "actual_exit": "Actual Exit",
-                    "simulated_r": "Sim R",
-                    "actual_r": "Actual R",
-                    "actual_pnl": "Actual P/L",
-                    "simulated_outcome": "Sim Outcome",
-                    "actual_status": "Actual Status",
-                    "instrument_name": "Instrument",
-                    "environment": "Environment",
-                    "size": "Size",
-                    "currency": "Currency",
-                    "auto_trade": "Auto Trade",
-                })
-                order = ["Opened", "Asset", "Direction", "Match", "Auto Trade", "Sim Entry", "Actual Entry", "Sim Exit", "Actual Exit", "Sim R", "Actual R", "Actual P/L", "Sim Outcome", "Actual Status", "Instrument", "Environment", "Size", "Currency", "signal_id"]
-                comp_display = comp_display[[c for c in order if c in comp_display.columns] + [c for c in comp_display.columns if c not in order]]
-
-                cf1, cf2 = st.columns([0.32, 0.68], vertical_alignment="center")
-                with cf1:
-                    asset_opts = ["All"] + sorted([x for x in comp_display.get("Asset", pd.Series(dtype=str)).dropna().astype(str).unique() if x])
-                    cap_asset_filter = st.selectbox("Execution asset", asset_opts, key="capital_exec_asset_filter")
-                with cf2:
-                    st.markdown("<div class='grey-note' style='margin-top:4px;'>Auto-traded rows are matched by the originating BENZINO signal ID, so entry/exit drift stats are intentionally removed.</div>", unsafe_allow_html=True)
-                if cap_asset_filter != "All" and "Asset" in comp_display.columns:
-                    comp_display = comp_display[comp_display["Asset"].astype(str).eq(cap_asset_filter)]
-
-                render_benzino_aggrid(
-                    comp_display,
-                    key="capital_execution_comparison",
-                    height=360,
-                    page_size=25,
-                    pinned=["Opened", "Asset", "Direction", "Match"],
-                    badge_cols={"Direction":"signal", "Match":"status", "Sim Outcome":"status", "Actual Status":"status", "Auto Trade":"status"},
-                    numeric_cols_right=["Sim Entry", "Actual Entry", "Sim Exit", "Actual Exit", "Sim R", "Actual R", "Actual P/L", "Size"],
-                    enable_search=False,
-                    show_footer=False,
-                )
-            elif not cap_raw.empty:
-                st.warning("Capital.com executions were imported, but none are linked to BENZINO auto-traded signals yet.")
-
-        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-        st.subheader("Expiry breakdown")
         expiry_rules = {
             "15m": {"bars": 56, "approx": "~14 hours"},
             "1h": {"bars": 56, "approx": "~2.3 days"},
@@ -5546,36 +5531,13 @@ def render_workflow(username: str, settings: dict) -> None:
             "1d": {"bars": 20, "approx": "~1 month"},
         }
         selected_tf = str(settings.get("view_timeframe") or settings.get("preferred_timeframe") or "All").lower()
-        if selected_tf not in expiry_rules:
-            selected_tf = "All"
-        expiry_rows = []
-        for tf, meta in expiry_rules.items():
-            expiry_rows.append({
-                "Timeframe": tf,
-                "Expiry Bars": int(meta["bars"]),
-                "Approx Window": meta["approx"],
-                "Currently Selected": "YES" if selected_tf == tf else "NO",
-            })
-        expiry_df = pd.DataFrame(expiry_rows)
         selected_note = (
-            f"The selected {selected_tf} timeframe expires after {expiry_rules[selected_tf]['bars']} bars "
-            f"({expiry_rules[selected_tf]['approx']})."
+            f"Expiry rule: selected {selected_tf} trades expire after {expiry_rules[selected_tf]['bars']} bars "
+            f"({expiry_rules[selected_tf]['approx']}). TP/SL checks use Capital 1-minute replay."
             if selected_tf in expiry_rules
-            else "Select a specific timeframe to see the exact expiry rule applied to that journal view."
+            else "Expiry rule: 15m and 1h expire after 56 bars, 4h after 42 bars, and 1d after 20 bars. TP/SL checks use Capital 1-minute replay."
         )
-        st.caption(selected_note + " TP/SL checks use 1-minute replay where available; otherwise the scanner falls back to the signal timeframe candles.")
-        render_benzino_aggrid(
-            expiry_df,
-            key="journal_expiry_breakdown",
-            height=320,
-            page_size=4,
-            pinned=["Timeframe"],
-            badge_cols={"Currently Selected": "status"},
-            numeric_cols_right=["Expiry Bars"],
-            enable_search=False,
-            show_footer=False,
-            use_pagination=False,
-        )
+        st.caption(selected_note)
 
 
     with t2:
@@ -5612,14 +5574,14 @@ def render_workflow(username: str, settings: dict) -> None:
             prop_start_map = {}
         prop_started_at_raw = str(settings.get("tracking_started_at", "") or "")
 
+        st.markdown("<h2 style='color:#E8EDF2;margin:22px 0 10px;'>Prop Firm Challenge</h2>", unsafe_allow_html=True)
         st.markdown(
             f"""
-            <div class='grey-note' style='margin-top:10px;margin-bottom:18px;'>
-                This tab recalculates the FTMO-style challenge from your current watchlist and selected timeframe
+            <div class='muted' style='font-size:19px;line-height:1.85;margin-bottom:24px;'>
+                This view recalculates the FTMO-style challenge from your current watchlist and selected timeframe
                 <b>({html.escape(str(challenge_tf))})</b>. It uses only <b>A+/A closed trades</b>, a fixed
                 <b>&#36;10,000</b> account, <b>1% risk per trade</b>, a <b>&#36;1,000 Phase 1 target</b>,
                 a <b>&#36;500 Phase 2 target</b>, a <b>5% max daily loss</b>, and a <b>10% max total loss</b>.
-                Phase 2 starts from a fresh <b>&#36;10,000</b> verification account after Phase 1 passes.
                 Completed cycles are rebuilt from Supabase on every load.
             </div>
             """,
@@ -6133,6 +6095,85 @@ def render_workflow(username: str, settings: dict) -> None:
         )
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
+        st.subheader("Today’s Prop Firm activity")
+        st.caption("These tables make it easy to see which Prop Firm v2 trades are currently open today and which qualifying signals were skipped by the best-session or daily-cap rules.")
+
+        today_eat = datetime.now(NAIROBI_TZ).date()
+        best_profile_today = prop_sim.get("best_session", {}) if isinstance(prop_sim, dict) else {}
+        best_session_today = str(best_profile_today.get("best_session") or "All sessions")
+        sample_ready_today = bool(best_profile_today.get("sample_ready"))
+
+        today_open_source = prop_source.copy() if prop_source is not None and not prop_source.empty else pd.DataFrame()
+        if not today_open_source.empty:
+            open_mask = today_open_source.get("status", pd.Series("", index=today_open_source.index)).astype(str).str.upper().eq("OPEN")
+            today_open_source = today_open_source[open_mask].copy()
+        if not today_open_source.empty:
+            created_ts = pd.to_datetime(today_open_source.get("created_at", pd.Series(pd.NaT, index=today_open_source.index)), errors="coerce", utc=True)
+            today_open_source["prop_created_time"] = created_ts
+            today_open_source = today_open_source.dropna(subset=["prop_created_time"]).copy()
+            today_open_source["prop_day"] = today_open_source["prop_created_time"].dt.tz_convert(NAIROBI_TZ).dt.date
+            today_open_source["prop_session"] = today_open_source["prop_created_time"].apply(prop_session_from_timestamp)
+            today_open_source = today_open_source[today_open_source["prop_day"].eq(today_eat)].copy()
+            if sample_ready_today and best_session_today not in {"", "All sessions"}:
+                today_open_source = today_open_source[today_open_source["prop_session"].eq(best_session_today)].copy()
+            today_open_source = today_open_source.sort_values("prop_created_time").head(PROP_MAX_TRADES_PER_DAY).copy()
+
+        today_skipped_source = prop_sim.get("skipped_trades", pd.DataFrame()) if isinstance(prop_sim, dict) else pd.DataFrame()
+        if today_skipped_source is None:
+            today_skipped_source = pd.DataFrame()
+        today_skipped_source = today_skipped_source.copy() if not today_skipped_source.empty else pd.DataFrame()
+        if not today_skipped_source.empty:
+            skip_time = pd.to_datetime(today_skipped_source.get("prop_event_time", today_skipped_source.get("exit_at", pd.Series(pd.NaT, index=today_skipped_source.index))), errors="coerce", utc=True)
+            today_skipped_source["prop_event_time"] = skip_time
+            today_skipped_source = today_skipped_source.dropna(subset=["prop_event_time"]).copy()
+            today_skipped_source["prop_day"] = today_skipped_source["prop_event_time"].dt.tz_convert(NAIROBI_TZ).dt.date
+            today_skipped_source = today_skipped_source[today_skipped_source["prop_day"].eq(today_eat)].copy()
+
+        copen, cskip = st.columns(2)
+        with copen:
+            st.markdown("**Open prop trades today**")
+            if today_open_source.empty:
+                st.info("No open A+/A prop trades taken today for the selected timeframe/session.")
+            else:
+                ov = today_open_source.copy()
+                ov["Opened At"] = ov["prop_created_time"].apply(fmt_nairobi)
+                open_cols_today = ["Opened At", "asset", "timeframe", "signal", "grade", "entry", "sl", "tp", "rr", "prop_session"]
+                open_table = prepare_signal_table(ov[[c for c in open_cols_today if c in ov.columns]]).rename(columns={"prop_session": "Session"})
+                render_benzino_aggrid(
+                    open_table,
+                    key="prop_open_trades_today",
+                    height=300,
+                    page_size=4,
+                    pinned=["Asset", "Signal", "Grade"],
+                    badge_cols={"Signal": "signal", "Grade": "grade"},
+                    numeric_cols_right=["Entry", "SL", "TP", "RR"],
+                    enable_search=False,
+                    show_footer=False,
+                    use_pagination=False,
+                )
+        with cskip:
+            st.markdown("**Skipped prop signals today**")
+            if today_skipped_source.empty:
+                st.info("No A+/A prop signals were skipped today by best-session or daily-cap rules.")
+            else:
+                sv = today_skipped_source.copy()
+                sv["Skipped At"] = sv["prop_event_time"].apply(fmt_nairobi)
+                skipped_cols_today = ["Skipped At", "asset", "timeframe", "signal", "grade", "prop_session", "prop_skip_reason", "r_multiple"]
+                skipped_table = prepare_signal_table(sv[[c for c in skipped_cols_today if c in sv.columns]]).rename(columns={"prop_session": "Session", "prop_skip_reason": "Skip Reason"})
+                render_benzino_aggrid(
+                    skipped_table,
+                    key="prop_skipped_signals_today",
+                    height=300,
+                    page_size=4,
+                    pinned=["Asset", "Signal", "Grade"],
+                    badge_cols={"Signal": "signal", "Grade": "grade", "Skip Reason": "status"},
+                    numeric_cols_right=["R Multiple"],
+                    enable_search=False,
+                    show_footer=False,
+                    use_pagination=False,
+                )
+
+        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         st.subheader("Closed A+/A trades")
         all_closed_view_source = prop_all_replay if 'prop_all_replay' in locals() and prop_all_replay is not None and not prop_all_replay.empty else prop_closed
         if all_closed_view_source is None or all_closed_view_source.empty:
@@ -6375,6 +6416,80 @@ def render_workflow(username: str, settings: dict) -> None:
             )
         else:
             st.info("No completed prop-firm challenges have been archived yet. Passed or failed attempts will appear here automatically.")
+
+    with t_cap:
+        st.subheader("Capital.com")
+        st.caption("Activation stays under Settings. This page shows Capital auto-trade execution, simulated-vs-actual comparison, and imported broker rows for the logged-in user's visible data.")
+        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
+        st.subheader("Simulated vs actual")
+        st.caption("This compares BENZINO's simulated signal outcome against trades BENZINO opened on your Capital.com demo account. Historical signal plans stay locked; the focus here is whether the auto-executed trade matched the simulated result, not manual entry or exit drift.")
+        render_capital_match_quality_legend()
+        cap_comp = load_capital_trade_comparisons(limit=APP_TABLE_MAX_ROWS)
+        cap_raw = load_capital_executed_trades(limit=APP_TABLE_MAX_ROWS)
+        if cap_comp.empty and cap_raw.empty:
+            st.info("No Capital.com auto-trade executions have been imported yet. Once CAPITAL_AUTO_TRADE_ENABLED is turned on and the scanner opens demo trades, this section will show simulated vs actual results.")
+        else:
+            auto_count = int(pd.Series(cap_comp.get("auto_trade", pd.Series(dtype=bool))).fillna(False).astype(bool).sum()) if not cap_comp.empty else 0
+            matched_count = len(cap_comp)
+            total_actual_pnl = float(pd.to_numeric(cap_comp.get("actual_pnl", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not cap_comp.empty else 0.0
+            avg_sim_r = float(pd.to_numeric(cap_comp.get("simulated_r", pd.Series(dtype=float)), errors="coerce").dropna().mean()) if not cap_comp.empty else 0.0
+            avg_actual_r = float(pd.to_numeric(cap_comp.get("actual_r", pd.Series(dtype=float)), errors="coerce").dropna().mean()) if not cap_comp.empty else 0.0
+            ec1, ec2, ec3, ec4 = st.columns(4)
+            with ec1: metric_card("Auto executions", f"{auto_count:,}", "Opened by BENZINO on Capital.com")
+            with ec2: metric_card("Matched signals", f"{matched_count:,}", "Linked by signal ID")
+            with ec3: metric_card("Avg R", f"Sim {avg_sim_r:+.2f}R / Actual {avg_actual_r:+.2f}R", "Simulation vs execution")
+            with ec4: metric_card("Actual P/L", f"${total_actual_pnl:+,.2f}", "Capital.com reported P/L")
+
+            if not cap_comp.empty:
+                comp = cap_comp.copy()
+                comp["Opened"] = pd.to_datetime(comp.get("opened_at"), errors="coerce", utc=True).dt.tz_convert(NAIROBI_TZ).dt.strftime("%Y-%m-%d %H:%M")
+                comp_display = comp.rename(columns={
+                    "asset": "Asset",
+                    "direction": "Direction",
+                    "match_quality": "Match",
+                    "simulated_entry": "Sim Entry",
+                    "actual_entry": "Actual Entry",
+                    "simulated_exit": "Sim Exit",
+                    "actual_exit": "Actual Exit",
+                    "simulated_r": "Sim R",
+                    "actual_r": "Actual R",
+                    "actual_pnl": "Actual P/L",
+                    "simulated_outcome": "Sim Outcome",
+                    "actual_status": "Actual Status",
+                    "instrument_name": "Instrument",
+                    "environment": "Environment",
+                    "size": "Size",
+                    "currency": "Currency",
+                    "auto_trade": "Auto Trade",
+                })
+                order = ["Opened", "Asset", "Direction", "Match", "Auto Trade", "Sim Entry", "Actual Entry", "Sim Exit", "Actual Exit", "Sim R", "Actual R", "Actual P/L", "Sim Outcome", "Actual Status", "Instrument", "Environment", "Size", "Currency", "signal_id"]
+                comp_display = comp_display[[c for c in order if c in comp_display.columns] + [c for c in comp_display.columns if c not in order]]
+                comp_display = apply_market_price_formatting(comp_display)
+
+                cf1, cf2 = st.columns([0.32, 0.68], vertical_alignment="center")
+                with cf1:
+                    asset_opts = ["All"] + sorted([x for x in comp_display.get("Asset", pd.Series(dtype=str)).dropna().astype(str).unique() if x])
+                    cap_asset_filter = st.selectbox("Execution asset", asset_opts, key="capital_exec_asset_filter")
+                with cf2:
+                    st.markdown("<div class='grey-note' style='margin-top:4px;'>Auto-traded rows are matched by the originating BENZINO signal ID, so entry/exit drift stats are intentionally removed.</div>", unsafe_allow_html=True)
+                if cap_asset_filter != "All" and "Asset" in comp_display.columns:
+                    comp_display = comp_display[comp_display["Asset"].astype(str).eq(cap_asset_filter)]
+
+                render_benzino_aggrid(
+                    comp_display,
+                    key="capital_execution_comparison",
+                    height=360,
+                    page_size=25,
+                    pinned=["Opened", "Asset", "Direction", "Match"],
+                    badge_cols={"Direction":"signal", "Match":"status", "Sim Outcome":"status", "Actual Status":"status", "Auto Trade":"status"},
+                    numeric_cols_right=["Sim Entry", "Actual Entry", "Sim Exit", "Actual Exit", "Sim R", "Actual R", "Actual P/L", "Size"],
+                    enable_search=False,
+                    show_footer=False,
+                )
+            elif not cap_raw.empty:
+                st.warning("Capital.com executions were imported, but none are linked to BENZINO auto-traded signals yet.")
+
+
 
     with t4:
         st.caption("All signals the scanner blocked from being journaled as real trades. Includes two types: (1) directional ideas (BUY/SELL) where the grade was too weak or R:R too thin — these are hypothetically tracked against TP/SL/expiry to see if they'd have worked. (2) HOLD rows where the systems genuinely split with no directional consensus — these have no hypothetical outcome since there's no entry thesis, but they're recorded so you can see how often the scanner truly sees no edge.")
@@ -6991,11 +7106,19 @@ def render_settings(username: str, settings: dict) -> None:
 
     with tab_telegram:
         st.caption(
-            "Activating here registers your chat ID with the scanner directly — every 5-minute scan now reads "
-            "this table and routes alerts to you on top of (not instead of) the admin's global Telegram "
-            "destination. 'Watchlist only' sends alerts solely for assets in your saved Watchlist tab; "
+            "Activating here registers your chat ID with the scanner directly. 'Watchlist only' sends alerts solely for assets in your saved Watchlist tab; "
             "'All signals' sends every A+/A/B/C alert the scanner generates, regardless of your watchlist."
         )
+        with st.expander("How to get your Telegram chat ID", expanded=False):
+            st.markdown(
+                """
+                1. Open Telegram and search for **@userinfobot**.  
+                2. Start the bot.  
+                3. Copy the numeric **Id** it gives you.  
+                4. Paste that number into **Telegram chat ID** below.  
+                5. Choose **Watchlist only** or **All signals**, then click **Activate Settings**.
+                """
+            )
         try:
             tg = read_df("SELECT * FROM user_telegram_settings WHERE scan_owner = %s", (username,))
             row = tg.iloc[0].to_dict() if not tg.empty else {}
@@ -7062,6 +7185,19 @@ def render_settings(username: str, settings: dict) -> None:
 
     with tab_capital:
         st.caption("Connect your own Capital.com demo account. Auto-trading uses your BENZINO watchlist, selected timeframe, selected demo grades, best session only, and max 4 demo trades per day. API credentials are stored in Supabase for the scanner to use.")
+        with st.expander("How to get your Capital.com API details", expanded=False):
+            st.markdown(
+                """
+                1. Log in to **Capital.com** and select your **Demo** account.  
+                2. Open **Settings**.  
+                3. Go to **API integrations**.  
+                4. Click **Generate API key**.  
+                5. Copy the API key and paste it below.  
+                6. Use your Capital login email as the **identifier / login email**.  
+                7. Enter your Capital password.  
+                8. Keep **Account type = DEMO**, tick **Connection enabled**, and only enable auto-trading after you are ready to test.
+                """
+            )
         try:
             cap = read_df("SELECT username, account_type, enabled, auto_trade_enabled, auto_trade_grades, use_benzino_settings, updated_at FROM user_capital_connections WHERE username = %s", (username,))
             cap_row = cap.iloc[0].to_dict() if not cap.empty else {}
@@ -7122,7 +7258,7 @@ def render_settings(username: str, settings: dict) -> None:
             execs = load_capital_executed_trades(limit=APP_TABLE_MAX_ROWS)
             comps = load_capital_trade_comparisons(limit=APP_TABLE_MAX_ROWS)
             if not comps.empty:
-                own = comps.copy()
+                own = apply_market_price_formatting(comps.copy())
                 render_benzino_aggrid(own, key="capital_settings_comparison_table", title="My Capital comparison rows", height=360, page_size=10, pinned=["asset", "direction"], numeric_cols_right=["simulated_r", "actual_pnl", "actual_pnl_ftmo_equiv", "ftmo_normalization_factor"], enable_search=True)
             else:
                 st.info("No Capital comparison rows yet.")
