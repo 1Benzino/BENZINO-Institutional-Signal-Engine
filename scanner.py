@@ -555,6 +555,9 @@ CAPITAL_AUTO_TRADE_MIN_SIZE = float(os.environ.get("CAPITAL_AUTO_TRADE_MIN_SIZE"
 CAPITAL_AUTO_TRADE_MAX_SIZE = float(os.environ.get("CAPITAL_AUTO_TRADE_MAX_SIZE", "0"))  # 0 means no cap
 CAPITAL_AUTO_TRADE_USE_STOPS = os.environ.get("CAPITAL_AUTO_TRADE_USE_STOPS", "true").strip().lower() in {"1", "true", "yes", "y"}
 CAPITAL_AUTO_TRADE_SIZE_RETRY = os.environ.get("CAPITAL_AUTO_TRADE_SIZE_RETRY", "true").strip().lower() in {"1", "true", "yes", "y"}
+CAPITAL_STRICT_1M_REPLAY_ONLY = os.environ.get("CAPITAL_STRICT_1M_REPLAY_ONLY", "true").strip().lower() in {"1", "true", "yes", "y"}
+CAPITAL_MARGIN_BUFFER_PCT = float(os.environ.get("CAPITAL_MARGIN_BUFFER_PCT", "0.95"))
+_CAPITAL_LAST_ERROR = {"text": ""}
 
 # Schema migrations are intentionally OFF during normal scanner runs.
 # Running ALTER TABLE / CREATE INDEX every 15 minutes can deadlock with another
@@ -976,7 +979,7 @@ def force_open_graded_setups() -> int:
       AND UPPER(TRIM(COALESCE(signal, ''))) IN ('BUY', 'SELL')
       AND UPPER(TRIM(COALESCE(status, 'SHADOW'))) = 'SHADOW'
       AND exit_at IS NULL
-    RETURNING signal_id;
+    ;
     """
     try:
         conn = db_connect()
@@ -1081,7 +1084,7 @@ def open_trade_for_slot(asset: str, timeframe: str) -> dict | None:
         return None  # fail open — better to risk a rare dup than to block all alerts
 
 
-def close_trade(signal_id: str, exit_price: float, exit_reason: str, r_multiple: float) -> None:
+def close_trade(signal_id: str, exit_price: float, exit_reason: str, r_multiple: float) -> bool:
     """Close an OPEN trade exactly once.
 
     Historical outcomes must be immutable. The old update matched only signal_id,
@@ -1102,11 +1105,12 @@ def close_trade(signal_id: str, exit_price: float, exit_reason: str, r_multiple:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(sql, (status, exit_price, exit_reason, r_multiple, signal_id))
-                if cur.rowcount == 0:
-                    print(f"[DB] close_trade skipped for {signal_id}: trade is no longer OPEN or already has exit_at.")
+                changed = int(cur.rowcount or 0) > 0
         conn.close()
+        return changed
     except Exception as e:
         print(f"[DB] close_trade failed: {e}")
+        return False
 
 
 def bump_bars_open(signal_id: str, bars: int) -> None:
@@ -1528,12 +1532,14 @@ def capital_request(method: str, path: str, *, params: dict | None = None, json_
                 time.sleep(1.0 + attempt)
                 continue
             if resp.status_code >= 400:
+                _CAPITAL_LAST_ERROR["text"] = resp.text[:500]
                 if attempt == retries:
                     print(f"[Capital] {method} {path} failed: HTTP {resp.status_code} {resp.text[:160]}")
                 time.sleep(0.5)
                 continue
             return resp.json()
         except Exception as exc:
+            _CAPITAL_LAST_ERROR["text"] = str(exc)
             if attempt == retries:
                 print(f"[Capital] {method} {path} failed: {exc}")
             time.sleep(0.5)
@@ -1574,6 +1580,123 @@ def _capital_market_score(symbol: str, market: dict) -> int:
     return score
 
 
+
+def _deep_find_number(obj, key_fragments: list[str], default=None):
+    """Best-effort recursive extraction of Capital instrument constraints."""
+    try:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                kl = str(k).lower()
+                if all(f.lower() in kl for f in key_fragments):
+                    try:
+                        return float(v)
+                    except Exception:
+                        pass
+            for v in obj.values():
+                found = _deep_find_number(v, key_fragments, None)
+                if found is not None:
+                    return found
+        elif isinstance(obj, list):
+            for v in obj:
+                found = _deep_find_number(v, key_fragments, None)
+                if found is not None:
+                    return found
+    except Exception:
+        pass
+    return default
+
+
+def capital_extract_constraints(market: dict | None) -> dict:
+    market = market or {}
+    # Capital schemas vary by endpoint/account. These keys cover common names
+    # and recursively inspect dealingRules/snapshot blocks.
+    min_size = (_deep_find_number(market, ["min", "deal", "size"]) or
+                _deep_find_number(market, ["min", "size"]) or 0.0)
+    max_size = (_deep_find_number(market, ["max", "deal", "size"]) or
+                _deep_find_number(market, ["max", "size"]) or 0.0)
+    step_size = (_deep_find_number(market, ["step", "size"]) or
+                 _deep_find_number(market, ["min", "step"]) or 0.0)
+    min_stop = (_deep_find_number(market, ["min", "stop", "distance"]) or
+                _deep_find_number(market, ["min", "stop"]) or 0.0)
+    max_stop = (_deep_find_number(market, ["max", "stop", "distance"]) or
+                _deep_find_number(market, ["max", "stop"]) or 0.0)
+    min_limit = (_deep_find_number(market, ["min", "limit", "distance"]) or
+                 _deep_find_number(market, ["min", "limit"]) or 0.0)
+    max_limit = (_deep_find_number(market, ["max", "limit", "distance"]) or
+                 _deep_find_number(market, ["max", "limit"]) or 0.0)
+    return {
+        "min_size": float(min_size or 0),
+        "max_size": float(max_size or 0),
+        "step_size": float(step_size or 0),
+        "min_stop_distance": float(min_stop or 0),
+        "max_stop_distance": float(max_stop or 0),
+        "min_limit_distance": float(min_limit or 0),
+        "max_limit_distance": float(max_limit or 0),
+    }
+
+
+def round_to_broker_step(size: float, step: float, *, direction: str = "nearest") -> float:
+    try:
+        size = float(size)
+        step = float(step or 0)
+        if step <= 0:
+            return round(size, 6)
+        if direction == "up":
+            return round(math.ceil(size / step) * step, 6)
+        if direction == "down":
+            return round(math.floor(size / step) * step, 6)
+        return round(round(size / step) * step, 6)
+    except Exception:
+        return float(size or 0)
+
+
+def capital_load_market_info(symbol: str) -> dict:
+    symbol = str(symbol or "").strip().upper()
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT epic, market_info, min_size, max_size, step_size,
+                       min_stop_distance, max_stop_distance, min_limit_distance, max_limit_distance
+                FROM capital_epic_map WHERE asset = %s LIMIT 1
+            """, (symbol,))
+            row = cur.fetchone()
+        conn.close()
+        if not row:
+            return {}
+        row = dict(row)
+        out = dict(row.get("market_info") or {}) if isinstance(row.get("market_info"), dict) else {}
+        for k in ["epic","min_size","max_size","step_size","min_stop_distance","max_stop_distance","min_limit_distance","max_limit_distance"]:
+            if row.get(k) not in (None, ""):
+                out[k] = row.get(k)
+        return out
+    except Exception:
+        return {}
+
+
+def capital_available_margin() -> float | None:
+    """Best-effort available funds/margin check. Returns None if endpoint shape differs."""
+    data = capital_request("GET", "/accounts", retries=1)
+    try:
+        accounts = data.get("accounts") if isinstance(data, dict) else None
+        if isinstance(accounts, list) and accounts:
+            acc = accounts[0]
+            bal = acc.get("balance") or acc.get("accountBalance") or {}
+            for key in ("available", "availableToDeal", "deposit", "cash", "balance"):
+                val = bal.get(key) if isinstance(bal, dict) else acc.get(key)
+                if val not in (None, ""):
+                    return float(val)
+    except Exception:
+        return None
+    return None
+
+
+def estimate_margin_required(sig, size: float, leverage: float) -> float:
+    try:
+        return abs(float(size) * float(sig.entry)) / max(1.0, float(leverage or 1))
+    except Exception:
+        return 0.0
+
 def capital_load_saved_epic(symbol: str) -> str | None:
     """Read a previously resolved Capital.com epic from Supabase.
 
@@ -1588,13 +1711,15 @@ def capital_load_saved_epic(symbol: str) -> str | None:
         conn = db_connect()
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT epic FROM capital_epic_map WHERE asset = %s LIMIT 1",
+                "SELECT epic, market_info FROM capital_epic_map WHERE asset = %s LIMIT 1",
                 (symbol,),
             )
             row = cur.fetchone()
         conn.close()
         if row:
             epic = str(row.get("epic") or "").strip()
+            if isinstance(row.get("market_info"), dict):
+                _CAPITAL_MARKET_CACHE[symbol] = row.get("market_info") or {}
             return epic or None
     except Exception as exc:
         # Non-fatal: if the table is absent/unavailable, fall back to live resolve.
@@ -1602,26 +1727,36 @@ def capital_load_saved_epic(symbol: str) -> str | None:
     return None
 
 
-def capital_save_epic(symbol: str, epic: str) -> None:
-    """Persist an asset -> Capital epic mapping for future scanner runs."""
+def capital_save_epic(symbol: str, epic: str, market: dict | None = None) -> None:
+    """Persist an asset -> Capital epic mapping and broker constraints for future scanner runs."""
     symbol = str(symbol or "").strip().upper()
     epic = str(epic or "").strip()
     if not symbol or not epic:
         return
     try:
+        market = market or _CAPITAL_MARKET_CACHE.get(symbol, {}) or {}
+        cons = capital_extract_constraints(market)
         conn = db_connect()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO capital_epic_map(asset, epic, source, updated_at)
-                    VALUES (%s, %s, 'CAPITAL', NOW())
+                    INSERT INTO capital_epic_map(
+                        asset, epic, source, instrument_name, market_info,
+                        min_size, max_size, step_size, min_stop_distance, max_stop_distance,
+                        min_limit_distance, max_limit_distance, updated_at, last_refreshed_at
+                    ) VALUES (%s,%s,'CAPITAL',%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
                     ON CONFLICT (asset) DO UPDATE
-                    SET epic = EXCLUDED.epic,
-                        source = EXCLUDED.source,
-                        updated_at = NOW()
+                    SET epic = EXCLUDED.epic, source = EXCLUDED.source,
+                        instrument_name = EXCLUDED.instrument_name, market_info = EXCLUDED.market_info,
+                        min_size = EXCLUDED.min_size, max_size = EXCLUDED.max_size, step_size = EXCLUDED.step_size,
+                        min_stop_distance = EXCLUDED.min_stop_distance, max_stop_distance = EXCLUDED.max_stop_distance,
+                        min_limit_distance = EXCLUDED.min_limit_distance, max_limit_distance = EXCLUDED.max_limit_distance,
+                        updated_at = NOW(), last_refreshed_at = NOW()
                     """,
-                    (symbol, epic),
+                    (symbol, epic, str(market.get("instrumentName") or market.get("name") or symbol),
+                     json.dumps(sanitize_for_json(market), allow_nan=False),
+                     cons["min_size"], cons["max_size"], cons["step_size"], cons["min_stop_distance"], cons["max_stop_distance"], cons["min_limit_distance"], cons["max_limit_distance"]),
                 )
         conn.close()
     except Exception as exc:
@@ -1661,7 +1796,7 @@ def capital_find_epic(symbol: str) -> str | None:
         if epic:
             _CAPITAL_EPIC_CACHE[symbol] = epic
             _CAPITAL_MARKET_CACHE[symbol] = best or {}
-            capital_save_epic(symbol, epic)
+            capital_save_epic(symbol, epic, best or {})
             print(f"[Capital] {symbol} mapped to epic {epic} and saved.")
             return epic
 
@@ -2001,35 +2136,14 @@ def replay_trade_outcome(row: dict, *, use_minute: bool = True) -> dict | None:
                 r_mult = r_multiple_for_exit(signal, entry, sl, last_price, "EXPIRY")
                 return {"reason": "EXPIRY", "price": last_price, "r": r_mult, "bars_open": expiry_bars, "method": "1m", "exit_time": expiry_ts}
 
-    # Fallback path for older rows or symbols without usable 1m data.
-    df = get_timeframe_df(ticker, timeframe)
-    if df is None or df.empty:
-        return None
-    df = df.copy()
-    df["Date"] = pd.to_datetime(df["Date"], utc=True, errors="coerce")
-    df = df.dropna(subset=["Date"]).sort_values("Date")
-    new_bars = df[df["Date"] > entry_ts]
-    if new_bars.empty:
+    # Strict execution replay: do not use wider timeframe candles as a fallback.
+    # If Capital.com 1-minute data is unavailable, leave the trade open and retry
+    # on the next scanner run. This prevents wrong TP/SL ordering and keeps the
+    # system aligned with the Capital.com feed used on TradingView.
+    if CAPITAL_STRICT_1M_REPLAY_ONLY:
         return None
 
-    bars_open = 0
-    for _, bar in new_bars.iterrows():
-        bars_open += 1
-        high, low = float(bar["High"]), float(bar["Low"])
-        hit_sl, hit_tp = replay_hit_from_bar(signal, high, low, sl, tp)
-        if hit_sl and hit_tp:
-            return {"reason": "SL", "price": sl, "r": -1.0, "bars_open": bars_open, "method": "timeframe_ambiguous", "exit_time": bar["Date"]}
-        if hit_sl:
-            return {"reason": "SL", "price": sl, "r": -1.0, "bars_open": bars_open, "method": "timeframe", "exit_time": bar["Date"]}
-        if hit_tp:
-            r_mult = abs(tp - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0.0
-            return {"reason": "TP", "price": tp, "r": r_mult, "bars_open": bars_open, "method": "timeframe", "exit_time": bar["Date"]}
-        if bars_open >= expiry_bars:
-            last_price = float(bar["Close"])
-            r_mult = r_multiple_for_exit(signal, entry, sl, last_price, "EXPIRY")
-            return {"reason": "EXPIRY", "price": last_price, "r": r_mult, "bars_open": bars_open, "method": "timeframe", "exit_time": bar["Date"]}
-
-    return {"reason": "OPEN", "price": float(new_bars["Close"].iloc[-1]), "r": 0.0, "bars_open": bars_open, "method": "timeframe", "exit_time": new_bars["Date"].iloc[-1]}
+    return None
 
 def trend_direction_from_df(df: pd.DataFrame | None) -> tuple[str, float]:
     """Return BULLISH/BEARISH/NEUTRAL plus a 0-1 trend strength estimate."""
@@ -3822,10 +3936,17 @@ def calculate_capital_position_size(sig: ScanResult, sizing: dict) -> float:
         risk_pct = float(sizing.get("risk_pct") or (RISK_PER_TRADE * 100.0))
         risk_cash = account_size * (risk_pct / 100.0)
         size = risk_cash / stop_distance
-        size = max(float(CAPITAL_AUTO_TRADE_MIN_SIZE), float(size))
-        if CAPITAL_AUTO_TRADE_MAX_SIZE and CAPITAL_AUTO_TRADE_MAX_SIZE > 0:
-            size = min(float(CAPITAL_AUTO_TRADE_MAX_SIZE), size)
-        return round(float(size), 4)
+        market = capital_load_market_info(str(getattr(sig, "asset", "")))
+        min_size = float(market.get("min_size") or CAPITAL_AUTO_TRADE_MIN_SIZE or 0)
+        max_size = float(market.get("max_size") or CAPITAL_AUTO_TRADE_MAX_SIZE or 0)
+        step_size = float(market.get("step_size") or 0)
+        size = max(min_size, float(CAPITAL_AUTO_TRADE_MIN_SIZE), float(size))
+        if max_size and max_size > 0:
+            size = min(max_size, size)
+        size = round_to_broker_step(size, step_size, direction="nearest")
+        if min_size and size < min_size:
+            size = round_to_broker_step(min_size, step_size, direction="up")
+        return round(float(size), 6)
     except Exception:
         return 0.0
 
@@ -3866,6 +3987,72 @@ def capital_confirm_deal(deal_reference: str) -> dict | None:
     return capital_request("GET", f"/confirms/{deal_reference}", retries=3)
 
 
+
+def adjust_levels_for_capital_constraints(sig: ScanResult, market_info: dict, *, error_text: str = "") -> tuple[float, float]:
+    """Return broker-valid SL/TP where possible while preserving 1:2 intent.
+
+    Capital sometimes rejects stops that are too close/far with a boundary value
+    in the error message. We use that boundary if present; otherwise use saved
+    min/max stop-distance metadata from capital_epic_map.
+    """
+    entry = float(sig.entry)
+    sl = float(sig.sl)
+    tp = float(sig.tp)
+    direction = str(sig.signal or "").upper()
+    text = str(error_text or "")
+    nums = re.findall(r"[-+]?\d+(?:\.\d+)?", text)
+    boundary = float(nums[-1]) if nums else None
+
+    if "invalid.stoploss.maxvalue" in text and boundary is not None:
+        sl = min(sl, boundary)
+    elif "invalid.stoploss.minvalue" in text and boundary is not None:
+        sl = max(sl, boundary)
+    else:
+        min_stop = float(market_info.get("min_stop_distance") or 0)
+        max_stop = float(market_info.get("max_stop_distance") or 0)
+        dist = abs(entry - sl)
+        if min_stop and dist < min_stop:
+            dist = min_stop
+        if max_stop and dist > max_stop:
+            dist = max_stop
+        if direction == "BUY":
+            sl = entry - dist
+        else:
+            sl = entry + dist
+
+    risk = abs(entry - sl)
+    if risk > 0:
+        if direction == "BUY":
+            tp = entry + 2.0 * risk
+        else:
+            tp = entry - 2.0 * risk
+    return float(sl), float(tp)
+
+
+def build_capital_size_attempts(base_size: float, market_info: dict) -> list[float]:
+    min_size = float(market_info.get("min_size") or CAPITAL_AUTO_TRADE_MIN_SIZE or 0.01)
+    max_size = float(market_info.get("max_size") or CAPITAL_AUTO_TRADE_MAX_SIZE or 0)
+    step = float(market_info.get("step_size") or 0)
+    attempts = []
+    def add(x, direction="nearest"):
+        try:
+            x = float(x)
+            if max_size and x > max_size:
+                x = max_size
+            x = max(min_size, x)
+            x = round_to_broker_step(x, step, direction=direction)
+            if x > 0 and x not in attempts:
+                attempts.append(x)
+        except Exception:
+            pass
+    add(base_size)
+    add(min_size, "up")
+    for mult in (2, 5, 10):
+        add(min_size * mult, "up")
+    for div in (2, 5, 10, 25, 50, 100):
+        add(base_size / div, "down")
+    return attempts[:10]
+
 def place_capital_auto_trade(sig: ScanResult) -> bool:
     """Place a Capital.com demo trade for one newly accepted BENZINO signal.
 
@@ -3903,14 +4090,21 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
         print(f"[CapitalAuto] {sig.asset} {timeframe}: size calculation failed; order skipped.")
         return False
 
-    size_attempts = [float(trade_size)]
-    if CAPITAL_AUTO_TRADE_SIZE_RETRY:
-        for div in (2, 5, 10, 25, 50, 100):
-            candidate = round(float(trade_size) / div, 6)
-            if candidate >= CAPITAL_AUTO_TRADE_MIN_SIZE and candidate not in size_attempts:
-                size_attempts.append(candidate)
-        if 1.0 >= CAPITAL_AUTO_TRADE_MIN_SIZE and 1.0 not in size_attempts:
-            size_attempts.append(1.0)
+    market_info = capital_load_market_info(sig.asset)
+    size_attempts = build_capital_size_attempts(float(trade_size), market_info) if CAPITAL_AUTO_TRADE_SIZE_RETRY else [float(trade_size)]
+    available_margin = capital_available_margin()
+    if available_margin is not None:
+        lev = float(sizing.get("leverage") or LEVERAGE or 1)
+        capped = []
+        for x in size_attempts:
+            if estimate_margin_required(sig, x, lev) <= available_margin * CAPITAL_MARGIN_BUFFER_PCT:
+                capped.append(x)
+        if capped:
+            size_attempts = capped
+        else:
+            record_capital_auto_order(sig, status="REJECTED", epic=epic, size=trade_size, error="Insufficient margin before order", raw={"available_margin": available_margin, "sizing": sizing})
+            print(f"[CapitalAuto] {sig.asset} {timeframe} {direction} {grade}: skipped · insufficient available margin.")
+            return False
 
     response = None
     confirm = None
@@ -3919,6 +4113,7 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
     confirmed_size = float(trade_size)
     last_payload = {}
     last_error = "POST /positions failed"
+    adj_sl, adj_tp = adjust_levels_for_capital_constraints(sig, market_info)
 
     for attempt_size in size_attempts:
         payload = {
@@ -3928,11 +4123,19 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
             "guaranteedStop": False,
         }
         if CAPITAL_AUTO_TRADE_USE_STOPS:
-            payload["stopLevel"] = float(sig.sl)
-            payload["profitLevel"] = float(sig.tp)
+            payload["stopLevel"] = float(adj_sl)
+            payload["profitLevel"] = float(adj_tp)
         last_payload = payload
 
-        response = capital_request("POST", "/positions", json_body=payload, retries=2)
+        _CAPITAL_LAST_ERROR["text"] = ""
+        response = capital_request("POST", "/positions", json_body=payload, retries=1)
+        if not isinstance(response, dict) and "invalid.stoploss" in str(_CAPITAL_LAST_ERROR.get("text", "")):
+            adj_sl, adj_tp = adjust_levels_for_capital_constraints(sig, market_info, error_text=_CAPITAL_LAST_ERROR.get("text", ""))
+            if CAPITAL_AUTO_TRADE_USE_STOPS:
+                payload["stopLevel"] = float(adj_sl)
+                payload["profitLevel"] = float(adj_tp)
+            last_payload = payload
+            response = capital_request("POST", "/positions", json_body=payload, retries=1)
         if not isinstance(response, dict):
             last_error = "POST /positions failed"
             continue
@@ -3958,7 +4161,7 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
     ok = bool(deal_reference) and (not confirm_status or confirm_status in {"ACCEPTED", "OPEN", "SUCCESS", "CONFIRMED"})
     status = "OPENED" if ok else "REJECTED"
     error = "" if ok else last_error
-    record_capital_auto_order(sig, status=status, deal_reference=deal_reference, deal_id=deal_id, epic=epic, size=confirmed_size, error=error, raw={"payload": last_payload, "original_size": trade_size, "sizing": sizing, "response": response or {}, "confirm": confirm or {}})
+    record_capital_auto_order(sig, status=status, deal_reference=deal_reference, deal_id=deal_id, epic=epic, size=confirmed_size, error=error, raw={"payload": last_payload, "original_size": trade_size, "adjusted_sl": adj_sl, "adjusted_tp": adj_tp, "broker_constraints": market_info, "sizing": sizing, "response": response or {}, "confirm": confirm or {}})
     user_label = str(sizing.get("username") or SCAN_OWNER)
     if ok:
         print(f"[CapitalAuto] {sig.asset} {timeframe} {direction} {grade}: demo trade opened for {user_label} · size {confirmed_size} · ref {deal_reference}.")

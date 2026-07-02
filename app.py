@@ -88,6 +88,8 @@ CHALLENGE_PHASE1_TARGET_PCT = 0.10
 CHALLENGE_PHASE2_TARGET_PCT = 0.05
 CHALLENGE_MAX_DAILY_LOSS_PCT = 0.05
 CHALLENGE_MAX_TOTAL_LOSS_PCT = 0.10
+PROP_MAX_TRADES_PER_DAY = 4
+PROP_MIN_SESSION_TRADES = 20
 
 ASSET_UNIVERSE = {
     "XAUUSD": {"name": "XAUUSD", "ticker": "GC=F", "group": "Commodities"},
@@ -1488,6 +1490,89 @@ def rebuild_prop_challenge_history_from_trades(username: str, timeframe: str, hi
             continue
 
 
+
+def prop_session_from_timestamp(ts) -> str:
+    """Trading-session label in Nairobi display time.
+
+    This is intentionally simple and stable:
+      Asia:     00:00–07:59 EAT
+      London:   08:00–15:59 EAT
+      New York: 16:00–23:59 EAT
+    """
+    try:
+        hour = pd.to_datetime(ts, utc=True).tz_convert(NAIROBI_TZ).hour
+    except Exception:
+        return "Unknown"
+    if 0 <= hour < 8:
+        return "Asia"
+    if 8 <= hour < 16:
+        return "London"
+    return "New York"
+
+
+def prop_best_session_profile(df: pd.DataFrame, min_trades: int = PROP_MIN_SESSION_TRADES) -> dict:
+    """Find the user's dynamic best prop session from closed A/A+ trades only."""
+    if df is None or df.empty:
+        return {"best_session": "All sessions", "profit_factor": 0.0, "win_rate": 0.0, "trade_count": 0, "sample_ready": False}
+    work = df.copy()
+    if "prop_event_time" not in work.columns:
+        event_time = pd.to_datetime(work.get("exit_at", pd.Series(pd.NaT, index=work.index)), errors="coerce", utc=True)
+        created_time = pd.to_datetime(work.get("created_at", pd.Series(pd.NaT, index=work.index)), errors="coerce", utc=True)
+        work["prop_event_time"] = event_time.fillna(created_time)
+    work = work.dropna(subset=["prop_event_time"]).copy()
+    work["r_multiple"] = pd.to_numeric(work.get("r_multiple", 0), errors="coerce").fillna(0.0)
+    work["prop_session"] = work["prop_event_time"].apply(prop_session_from_timestamp)
+    rows = []
+    for session, g in work.groupby("prop_session"):
+        if session == "Unknown":
+            continue
+        wins = g[g["r_multiple"] > 0]
+        losses = g[g["r_multiple"] < 0]
+        gross_profit = float(wins["r_multiple"].sum()) if not wins.empty else 0.0
+        gross_loss = abs(float(losses["r_multiple"].sum())) if not losses.empty else 0.0
+        pf = gross_profit / gross_loss if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
+        wr = float((g["r_multiple"] > 0).mean() * 100) if len(g) else 0.0
+        net = float(g["r_multiple"].sum())
+        rows.append({"best_session": session, "profit_factor": pf, "win_rate": wr, "net_r": net, "trade_count": int(len(g)), "sample_ready": len(g) >= min_trades})
+    if not rows:
+        return {"best_session": "All sessions", "profit_factor": 0.0, "win_rate": 0.0, "trade_count": 0, "sample_ready": False}
+    eligible = [r for r in rows if r["sample_ready"]]
+    ranked = sorted(eligible or rows, key=lambda r: (r["profit_factor"], r["win_rate"], r["net_r"], r["trade_count"]), reverse=True)
+    out = ranked[0]
+    out["all_sessions"] = rows
+    return out
+
+
+def apply_prop_best_session_trade_filter(df: pd.DataFrame, profile: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Apply Prop Firm v2: best session only, max 4 trades/day.
+
+    If no session has the minimum sample yet, the profile is marked not ready
+    and we do not restrict by session. We still apply the 4-trades/day cap.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    work = df.copy().sort_values("prop_event_time").reset_index(drop=True)
+    work["prop_session"] = work["prop_event_time"].apply(prop_session_from_timestamp)
+    work["prop_day_all"] = work["prop_event_time"].apply(lambda ts: pd.Timestamp(ts).tz_convert(NAIROBI_TZ).date())
+    best = str(profile.get("best_session") or "All sessions")
+    sample_ready = bool(profile.get("sample_ready"))
+    skipped_parts = []
+    eligible = work.copy()
+    if sample_ready and best not in {"", "All sessions"}:
+        outside = eligible[eligible["prop_session"] != best].copy()
+        if not outside.empty:
+            outside["prop_skip_reason"] = "Skipped — outside best session"
+            skipped_parts.append(outside)
+        eligible = eligible[eligible["prop_session"] == best].copy()
+    eligible["_daily_rank"] = eligible.groupby("prop_day_all").cumcount() + 1
+    taken = eligible[eligible["_daily_rank"] <= PROP_MAX_TRADES_PER_DAY].copy()
+    capped = eligible[eligible["_daily_rank"] > PROP_MAX_TRADES_PER_DAY].copy()
+    if not capped.empty:
+        capped["prop_skip_reason"] = "Skipped — daily trade cap reached"
+        skipped_parts.append(capped)
+    skipped = pd.concat(skipped_parts, ignore_index=True) if skipped_parts else pd.DataFrame()
+    return taken.drop(columns=[c for c in ["_daily_rank", "prop_day_all"] if c in taken.columns]), skipped
+
 def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: str = "", starting: float = 10000.0) -> dict:
     """Replay scoped A+/A closed trades using the exact FTMO 2-step model.
 
@@ -1536,7 +1621,7 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
     }
 
     if prop_closed_all is None or prop_closed_all.empty:
-        return {"history": [], "active": empty_active, "active_curve": pd.DataFrame(), "active_daily": pd.DataFrame(), "all_daily": pd.DataFrame(), "all_trades": pd.DataFrame()}
+        return {"history": [], "active": empty_active, "active_curve": pd.DataFrame(), "active_daily": pd.DataFrame(), "all_daily": pd.DataFrame(), "all_trades": pd.DataFrame(), "skipped_trades": pd.DataFrame(), "best_session": {"best_session":"All sessions","profit_factor":0.0,"win_rate":0.0,"trade_count":0,"sample_ready":False}}
 
     df = prop_closed_all.copy()
     df = numeric_cols(df, ["r_multiple", "entry", "sl", "tp", "rr"])
@@ -1549,9 +1634,15 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
     if pd.notna(act_ts):
         df = df[df["prop_event_time"] >= act_ts].copy().reset_index(drop=True)
     if df.empty:
-        return {"history": [], "active": empty_active, "active_curve": pd.DataFrame(), "active_daily": pd.DataFrame(), "all_daily": pd.DataFrame(), "all_trades": pd.DataFrame()}
+        return {"history": [], "active": empty_active, "active_curve": pd.DataFrame(), "active_daily": pd.DataFrame(), "all_daily": pd.DataFrame(), "all_trades": pd.DataFrame(), "skipped_trades": pd.DataFrame(), "best_session": {"best_session":"All sessions","profit_factor":0.0,"win_rate":0.0,"trade_count":0,"sample_ready":False}}
 
     df["pnl_cash"] = pd.to_numeric(df["r_multiple"], errors="coerce").fillna(0.0) * risk_cash
+
+    best_session_profile = prop_best_session_profile(df, PROP_MIN_SESSION_TRADES)
+    skipped_prop_trades = pd.DataFrame()
+    df, skipped_prop_trades = apply_prop_best_session_trade_filter(df, best_session_profile)
+    if df.empty:
+        return {"history": [], "active": empty_active, "active_curve": pd.DataFrame(), "active_daily": pd.DataFrame(), "all_daily": pd.DataFrame(), "all_trades": pd.DataFrame(), "skipped_trades": skipped_prop_trades, "best_session": best_session_profile}
 
     histories: list[dict] = []
     all_replay_rows: list[dict] = []
@@ -1670,6 +1761,8 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
         row_dict["day_open_balance"] = float(phase_day_open[day])
         row_dict["daily_loss_floor"] = float(phase_day_open[day]) - daily_loss_limit_cash
         row_dict["phase_target"] = targets[phase]
+        row_dict["prop_session"] = prop_session_from_timestamp(ts)
+        row_dict["prop_selection"] = "Taken"
         phase_rows.append(row_dict)
         cycle_rows.append(row_dict)
         all_replay_rows.append(row_dict.copy())
@@ -1769,7 +1862,7 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
         # This keeps Phase 2 above Phase 1 inside the same challenge/day because
         # Phase 2 can only happen after Phase 1 in the replay sequence.
         all_daily = all_daily.sort_values(["_challenge_order", "Day", "_phase_order"], ascending=[False, False, False]).drop(columns=["_challenge_order", "_phase_order"])
-    return {"history": histories, "active": active, "active_curve": active_curve, "active_daily": active_daily, "all_daily": all_daily, "all_trades": all_trades}
+    return {"history": histories, "active": active, "active_curve": active_curve, "active_daily": active_daily, "all_daily": all_daily, "all_trades": all_trades, "skipped_trades": skipped_prop_trades, "best_session": best_session_profile}
 
 def prop_firm_monte_carlo(trades_df: pd.DataFrame, state: dict, runs: int = 2000) -> dict:
     """
@@ -1797,7 +1890,7 @@ def prop_firm_monte_carlo(trades_df: pd.DataFrame, state: dict, runs: int = 2000
         trades_today = 0
         day_start = equity
         for step in range(60):
-            if trades_today >= 3:
+            if trades_today >= PROP_MAX_TRADES_PER_DAY:
                 day_start = equity
                 trades_today = 0
             r = float(rng.choice(r_values))
@@ -5848,6 +5941,17 @@ def render_workflow(username: str, settings: dict) -> None:
         with i3: metric_card("Last closed", last_closed_at or "—", "Most recent resolved A+/A trade")
         with i4: metric_card("Closed / Open", f"{closed_count} / {open_count}", "A+/A trades only")
         with i5: metric_card("Max drawdown", f"${max_drawdown_cash:,.2f}", f"{max_drawdown_pct:.2f}% from peak")
+
+        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
+        best_session_info = prop_sim.get("best_session", {}) if isinstance(prop_sim, dict) else {}
+        bs1, bs2, bs3 = st.columns(3)
+        session_label = str(best_session_info.get("best_session", "All sessions"))
+        sample_note = f"{int(best_session_info.get('trade_count', 0) or 0)} A/A+ trades"
+        if not bool(best_session_info.get("sample_ready", False)):
+            sample_note += f" · minimum {PROP_MIN_SESSION_TRADES} required"
+        with bs1: metric_card("Best trading session", session_label, sample_note)
+        with bs2: metric_card("Session profit factor", f"{float(best_session_info.get('profit_factor', 0.0) or 0.0):.2f}", "A/A+ closed trades only")
+        with bs3: metric_card("Session win rate", f"{float(best_session_info.get('win_rate', 0.0) or 0.0):.2f}%", "Used for prop trade filter")
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         p1, p2, p3 = st.columns(3)
