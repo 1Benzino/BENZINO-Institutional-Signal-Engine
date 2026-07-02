@@ -2365,24 +2365,52 @@ def compute_dashboard_summary(df: pd.DataFrame, settings: dict) -> dict:
 
 
 def render_balance_curve(df: pd.DataFrame, settings: dict, title: str = "Balance curve", split_by_grade: bool = False, include_overall: bool = False) -> None:
-    """Render realised balance curve from closed trades when evidence exists.
+    """Render realised balance curves from the user's visible Supabase rows.
 
-    When split_by_grade=True, the chart shows separate hypothetical equity
-    curves for A+/A, B, and C trades. Each curve starts from the same user
-    account size and only compounds the trades in that grade bucket, making it
-    clear which quality tier is helping or hurting the journal.
+    For grade splits, each line is a separate hypothetical replay from the same
+    starting balance using only that grade bucket. The "All trades" line uses
+    the combined A+/A, B, and C closed trades. Curves are ordered by the actual
+    resolution time, not signal creation time, and display balances may go negative because this is an analytical replay,
+    not a broker liquidation model.
     """
     if df is None or df.empty:
         return
+
     view = add_trade_pnl_columns(df.copy(), settings)
     status = view.get("status", pd.Series(dtype=str)).astype(str).str.upper()
     closed = view[status.str.contains("CLOSED|EXPIRED|TP|SL", na=False)].copy()
     if closed.empty:
         return
-    closed = closed.sort_values("created_at")
+
+    # A balance curve should advance when a trade is resolved, not when the
+    # original signal was generated. Using created_at can create misleading
+    # jumps when old signals close later.
+    if "exit_at" in closed.columns:
+        closed["curve_time"] = pd.to_datetime(closed["exit_at"], errors="coerce", utc=True)
+    else:
+        closed["curve_time"] = pd.NaT
+    closed["curve_time"] = closed["curve_time"].fillna(pd.to_datetime(closed.get("created_at"), errors="coerce", utc=True))
+    closed = closed.dropna(subset=["curve_time"]).sort_values("curve_time")
+
+    account = float(settings.get("account_size", 10000) or 10000)
+    risk_pct = float(settings.get("risk_pct", 1.0) or 1.0)
+
+    def _build_curve(source: pd.DataFrame, group_name: str) -> pd.DataFrame:
+        source = source.sort_values("curve_time").copy()
+        balances = account + pd.to_numeric(source["pnl_cash"], errors="coerce").fillna(0.0).cumsum()
+        source["grade_balance_after"] = balances
+        source["Grade Group"] = group_name
+        # Add an anchor point so every line visibly starts from the selected
+        # account size before the first closed trade in that bucket.
+        first_time = source["curve_time"].min()
+        anchor = pd.DataFrame({
+            "curve_time": [first_time - pd.Timedelta(seconds=1)],
+            "grade_balance_after": [account],
+            "Grade Group": [group_name],
+        })
+        return pd.concat([anchor, source[["curve_time", "grade_balance_after", "Grade Group"]]], ignore_index=True)
 
     if split_by_grade and "grade" in closed.columns:
-        account = float(settings.get("account_size", 10000) or 10000)
         grade = closed["grade"].astype(str).str.upper().str.strip()
         closed["Grade Group"] = np.select(
             [grade.isin(["A+", "A"]), grade.eq("B"), grade.eq("C")],
@@ -2392,29 +2420,40 @@ def render_balance_curve(df: pd.DataFrame, settings: dict, title: str = "Balance
         closed = closed[closed["Grade Group"].isin(["A+/A only", "B only", "C only"])].copy()
         if closed.empty:
             return
+
         pieces = []
-        if include_overall:
-            overall = closed.sort_values("created_at").copy()
-            overall["Grade Group"] = "All trades"
-            overall["grade_balance_after"] = account + pd.to_numeric(overall["pnl_cash"], errors="coerce").fillna(0.0).cumsum()
-            pieces.append(overall)
         grade_group_order = ["All trades", "A+/A only", "B only", "C only"]
+        if include_overall:
+            pieces.append(_build_curve(closed, "All trades"))
         for group_name in ["A+/A only", "B only", "C only"]:
             group_df = closed[closed["Grade Group"].eq(group_name)].copy()
-            if group_df.empty:
-                continue
-            group_df = group_df.sort_values("created_at").copy()
-            group_df["grade_balance_after"] = account + pd.to_numeric(group_df["pnl_cash"], errors="coerce").fillna(0.0).cumsum()
-            pieces.append(group_df)
+            if not group_df.empty:
+                pieces.append(_build_curve(group_df, group_name))
+
         chart_df = pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame()
         if chart_df.empty:
             return
         chart_df["Grade Group"] = pd.Categorical(chart_df["Grade Group"], categories=grade_group_order, ordered=True)
-        chart_df = chart_df.sort_values(["Grade Group", "created_at"])
-        fig = px.line(chart_df, x="created_at", y="grade_balance_after", color="Grade Group", title=title, category_orders={"Grade Group": grade_group_order})
-        fig.update_layout(yaxis_title="Balance after", xaxis_title="created_at", height=380, margin=dict(l=20, r=20, t=20, b=35))
+        chart_df = chart_df.sort_values(["Grade Group", "curve_time"])
+        fig = px.line(
+            chart_df,
+            x="curve_time",
+            y="grade_balance_after",
+            color="Grade Group",
+            title=title,
+            category_orders={"Grade Group": grade_group_order},
+        )
+        fig.update_layout(
+            yaxis_title=f"Balance after ({account:,.0f} start, {risk_pct:.2f}% risk)",
+            xaxis_title="Resolved at",
+            height=380,
+            margin=dict(l=20, r=20, t=20, b=35),
+        )
     else:
-        fig = px.line(closed, x="created_at", y="balance_after", color="timeframe" if "timeframe" in closed.columns else None, title=title)
+        closed = closed.sort_values("curve_time").copy()
+        closed["balance_after"] = account + pd.to_numeric(closed["pnl_cash"], errors="coerce").fillna(0.0).cumsum()
+        fig = px.line(closed, x="curve_time", y="balance_after", color="timeframe" if "timeframe" in closed.columns else None, title=title)
+        fig.update_layout(yaxis_title="Balance after", xaxis_title="Resolved at", height=380, margin=dict(l=20, r=20, t=20, b=35))
 
     st.plotly_chart(fig, use_container_width=True)
 
