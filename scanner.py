@@ -506,6 +506,14 @@ CHALLENGE_MIN_TRADING_DAYS = 4
 
 GRADE_RANK = {"A+": 4, "A": 3, "B": 2, "C": 1, "NO TRADE": 0}
 
+# Shadow research backlog controls. Supabase pooler can time out if thousands of
+# rows are resolved one-by-one in a single scanner run, so backlog resolution is
+# intentionally chunked and committed in batches. Increase carefully only if the
+# database comfortably handles the load.
+SHADOW_EVAL_LIMIT = int(os.environ.get("SHADOW_EVAL_LIMIT", "400"))
+SHADOW_DB_UPDATE_BATCH_SIZE = int(os.environ.get("SHADOW_DB_UPDATE_BATCH_SIZE", "100"))
+SHADOW_BACKFILL_LIMIT = int(os.environ.get("SHADOW_BACKFILL_LIMIT", "800"))
+
 # One-off / safety replay controls.
 # When true, the scanner replays existing resolved Supabase outcomes using the
 # new 1-minute replay engine where Yahoo 1m data is available, falling back to
@@ -513,7 +521,7 @@ GRADE_RANK = {"A+": 4, "A": 3, "B": 2, "C": 1, "NO TRADE": 0}
 # Supabase TP/SL/expiry data without restarting the test.
 REPLAY_EXISTING_OUTCOMES = os.environ.get("REPLAY_EXISTING_OUTCOMES", "true").strip().lower() in {"1", "true", "yes", "y"}
 REPLAY_EXISTING_OUTCOMES_DAYS = int(os.environ.get("REPLAY_EXISTING_OUTCOMES_DAYS", "30"))
-REPLAY_EXISTING_OUTCOMES_LIMIT = int(os.environ.get("REPLAY_EXISTING_OUTCOMES_LIMIT", "5000"))
+REPLAY_EXISTING_OUTCOMES_LIMIT = int(os.environ.get("REPLAY_EXISTING_OUTCOMES_LIMIT", "300"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -711,6 +719,7 @@ def init_tables() -> None:
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_exit_price NUMERIC")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_closed_at TIMESTAMPTZ")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS display_id TEXT")
+                cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS replay_checked_at TIMESTAMPTZ")
                 # Dashboard uses this table when replaying simulated FTMO challenge cycles.
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS prop_challenge_history (
@@ -999,7 +1008,7 @@ def fetch_open_trades(assets: set[str] | None = None, timeframes: set[str] | Non
 
 
 def fetch_unresolved_shadow_trades(assets: set[str] | None = None, timeframes: set[str] | None = None,
-                                   max_age_days: int = 3650) -> list[dict]:
+                                   max_age_days: int = 3650, limit: int | None = None) -> list[dict]:
     """
     NO TRADE signals are never alerted and never touch the prop ledger, but they
     ARE still worth tracking hypothetically: "if a trader had taken this blocked
@@ -1022,7 +1031,8 @@ def fetch_unresolved_shadow_trades(assets: set[str] | None = None, timeframes: s
             if timeframes:
                 sql += " AND timeframe = ANY(%s)"
                 params.append(list(timeframes))
-            sql += " ORDER BY created_at ASC LIMIT 10000"
+            sql += " ORDER BY created_at ASC LIMIT %s"
+            params.append(int(limit or SHADOW_EVAL_LIMIT))
             cur.execute(sql, tuple(params))
             rows = [dict(r) for r in cur.fetchall()]
         conn.close()
@@ -1051,6 +1061,48 @@ def close_shadow_trade(signal_id: str, exit_price: float, outcome: str, r_multip
         conn.close()
     except Exception as e:
         print(f"[DB] close_shadow_trade failed: {e}")
+
+
+
+def close_shadow_trades_batch(updates: list[tuple[str, float, str, float]]) -> int:
+    """Resolve NO TRADE shadow rows in one database transaction.
+
+    `updates` tuples are (signal_id, exit_price, outcome, r_multiple). Batching
+    avoids opening thousands of Supabase connections and prevents the pooler
+    from timing out during historical backlog repair.
+    """
+    if not updates:
+        return 0
+    sql = """
+    UPDATE scanner_signals
+    SET shadow_outcome = %s,
+        shadow_r_multiple = %s,
+        shadow_exit_price = %s,
+        shadow_closed_at = NOW()
+    WHERE signal_id = %s
+      AND status = 'SHADOW'
+      AND shadow_outcome IS NULL;
+    """
+    params = [(outcome, float(r_multiple), float(exit_price), signal_id)
+              for signal_id, exit_price, outcome, r_multiple in updates]
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.executemany(sql, params)
+                count = int(cur.rowcount or 0)
+        conn.close()
+        return count
+    except Exception as e:
+        print(f"[DB] close_shadow_trades_batch failed for {len(updates)} row(s): {e}")
+        saved = 0
+        for signal_id, exit_price, outcome, r_multiple in updates[:10]:
+            try:
+                close_shadow_trade(signal_id, exit_price, outcome, r_multiple)
+                saved += 1
+            except Exception:
+                pass
+        return saved
 
 
 # ── Prop firm ledger — A+/A trades only ───────────────────────────────────────
@@ -2398,7 +2450,8 @@ def backfill_shadow_trade_plans(assets: set[str] | None = None, timeframes: set[
             if timeframes:
                 sql += " AND timeframe = ANY(%s)"
                 params.append(list(timeframes))
-            sql += " ORDER BY created_at ASC LIMIT 10000"
+            sql += " ORDER BY created_at ASC LIMIT %s"
+            params.append(int(SHADOW_BACKFILL_LIMIT))
             cur.execute(sql, tuple(params))
             rows = [dict(r) for r in cur.fetchall()]
         conn.close()
@@ -2456,17 +2509,38 @@ def backfill_shadow_trade_plans(assets: set[str] | None = None, timeframes: set[
 def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] | None = None) -> int:
     """
     Hypothetically resolve NO TRADE (shadow) signals using 1-minute replay where
-    available, writing only to shadow_* columns. Older rows outside Yahoo's
-    1-minute retention window fall back to the signal timeframe candles.
+    available, writing only to shadow_* columns. The historical backlog is
+    chunked per run so Supabase is not hit with thousands of individual updates.
     """
-    backfill_shadow_trade_plans(assets=assets, timeframes=timeframes)
-    shadow_trades = fetch_unresolved_shadow_trades(assets=assets, timeframes=timeframes)
+    backfilled = backfill_shadow_trade_plans(assets=assets, timeframes=timeframes)
+    shadow_trades = fetch_unresolved_shadow_trades(
+        assets=assets,
+        timeframes=timeframes,
+        limit=SHADOW_EVAL_LIMIT,
+    )
     if not shadow_trades:
         print("[Shadow] No unresolved NO TRADE rows to evaluate.")
         return 0
 
-    print(f"[Shadow] Checking {len(shadow_trades)} unresolved NO TRADE row(s) with 1-minute replay where available...")
+    print(
+        f"[Shadow] Checking {len(shadow_trades)} unresolved NO TRADE row(s) "
+        f"with 1-minute replay where available. Batch limit: {SHADOW_EVAL_LIMIT}."
+    )
+    if backfilled:
+        print(f"[Shadow] Backfill was capped at {SHADOW_BACKFILL_LIMIT} row(s) this run.")
+
     resolved = 0
+    pending_updates: list[tuple[str, float, str, float]] = []
+    bars_updates: list[tuple[str, int]] = []
+
+    def _flush_pending() -> int:
+        nonlocal pending_updates
+        if not pending_updates:
+            return 0
+        saved = close_shadow_trades_batch(pending_updates)
+        pending_updates = []
+        return saved
+
     for t in shadow_trades:
         signal_id = t.get("signal_id")
         result = replay_trade_outcome(t, use_minute=True)
@@ -2474,17 +2548,30 @@ def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] 
             continue
         reason = result.get("reason")
         bars_open = int(result.get("bars_open") or 0)
-        method = str(result.get("method") or "unknown")
         if reason == "OPEN":
             if bars_open:
-                bump_bars_open(signal_id, bars_open)
+                bars_updates.append((signal_id, bars_open))
             continue
 
         outcome = {"TP": "SHADOW_TP", "SL": "SHADOW_SL", "EXPIRY": "SHADOW_EXPIRY"}.get(str(reason), "SHADOW_EXPIRY")
-        close_shadow_trade(signal_id, float(result.get("price") or 0.0), outcome, float(result.get("r") or 0.0))
-        resolved += 1
+        pending_updates.append((
+            signal_id,
+            float(result.get("price") or 0.0),
+            outcome,
+            float(result.get("r") or 0.0),
+        ))
+        if len(pending_updates) >= max(1, SHADOW_DB_UPDATE_BATCH_SIZE):
+            resolved += _flush_pending()
 
-    print(f"[Shadow] Resolved {resolved} NO TRADE hypothetical outcome(s) this run.")
+    resolved += _flush_pending()
+
+    for signal_id, bars_open in bars_updates[:100]:
+        bump_bars_open(signal_id, bars_open)
+
+    remaining_note = ""
+    if len(shadow_trades) >= SHADOW_EVAL_LIMIT:
+        remaining_note = " More unresolved rows likely remain and will be processed on later runs."
+    print(f"[Shadow] Resolved {resolved} NO TRADE hypothetical outcome(s) this run.{remaining_note}")
     return resolved
 
 
@@ -2508,6 +2595,7 @@ def fetch_existing_outcomes_for_replay(max_age_days: int = 30, limit: int = 5000
                 UPPER(TRIM(COALESCE(status,''))) IN ('CLOSED_TP','CLOSED_SL','EXPIRED','CLOSED')
              OR shadow_outcome IS NOT NULL
           )
+          AND replay_checked_at IS NULL
         ORDER BY created_at ASC
         LIMIT %s
     """
@@ -2523,85 +2611,92 @@ def fetch_existing_outcomes_for_replay(max_age_days: int = 30, limit: int = 5000
         return []
 
 
-def update_existing_outcome_from_replay(row: dict, result: dict) -> bool:
-    """Rewrite a resolved Supabase outcome using the replay engine result.
-
-    For real trades we update status/exit fields/r_multiple. For shadow research
-    we only update shadow_* fields. A+/A prop_firm_trades rows are also updated
-    so the cash P/L stored there matches the replayed R multiple.
-    """
-    signal_id = row.get("signal_id")
-    if not signal_id or not result:
-        return False
-    reason = str(result.get("reason") or "").upper()
-    if reason == "OPEN" or reason not in {"TP", "SL", "EXPIRY"}:
-        return False
-    exit_price = float(result.get("price") or 0.0)
-    r_mult = float(result.get("r") or 0.0)
-    exit_time = result.get("exit_time") or pd.Timestamp.now(tz="UTC")
+def update_existing_outcomes_batch(updates: list[dict]) -> int:
+    """Apply replayed journal/shadow outcomes in one controlled DB transaction."""
+    if not updates:
+        return 0
     try:
-        exit_ts = pd.to_datetime(exit_time, errors="coerce", utc=True)
-        if pd.isna(exit_ts):
-            exit_ts = pd.Timestamp.now(tz="UTC")
-    except Exception:
-        exit_ts = pd.Timestamp.now(tz="UTC")
+        conn = db_connect()
+        applied = 0
+        with conn:
+            with conn.cursor() as cur:
+                for u in updates:
+                    signal_id = u.get("signal_id")
+                    if not signal_id:
+                        continue
+                    if u.get("is_shadow"):
+                        cur.execute(
+                            """
+                            UPDATE scanner_signals
+                            SET shadow_outcome = %s,
+                                shadow_r_multiple = %s,
+                                shadow_exit_price = %s,
+                                shadow_closed_at = %s,
+                                replay_checked_at = NOW()
+                            WHERE signal_id = %s
+                            """,
+                            (u["outcome"], u["r_multiple"], u["exit_price"], u["exit_at"], signal_id),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE scanner_signals
+                            SET status = %s,
+                                exit_price = %s,
+                                exit_reason = %s,
+                                exit_at = %s,
+                                r_multiple = %s,
+                                replay_checked_at = NOW()
+                            WHERE signal_id = %s
+                            """,
+                            (u["status"], u["exit_price"], u["exit_reason"], u["exit_at"], u["r_multiple"], signal_id),
+                        )
+                        if u.get("prop_grade") in {"A+", "A"}:
+                            pnl_cash = float(ACCOUNT_SIZE) * float(RISK_PER_TRADE) * float(u["r_multiple"])
+                            cur.execute(
+                                """
+                                UPDATE prop_firm_trades
+                                SET r_multiple = %s, pnl_cash = %s, closed_at = %s
+                                WHERE signal_id = %s
+                                """,
+                                (u["r_multiple"], pnl_cash, u["exit_at"], signal_id),
+                            )
+                    applied += int(cur.rowcount >= 0)
+        conn.close()
+        return applied
+    except Exception as exc:
+        print(f"[Replay1mBackfill] Batch update failed for {len(updates)} row(s): {exc}")
+        return 0
 
-    is_shadow = str(row.get("status") or "").upper() == "SHADOW" or row.get("shadow_outcome") is not None
+
+def mark_existing_replay_checked(signal_ids: list[str]) -> int:
+    """Mark rows as checked even when replay cannot improve them, so each run advances."""
+    signal_ids = [str(x) for x in signal_ids if x]
+    if not signal_ids:
+        return 0
     try:
         conn = db_connect()
         with conn:
             with conn.cursor() as cur:
-                if is_shadow:
-                    outcome = {"TP": "SHADOW_TP", "SL": "SHADOW_SL", "EXPIRY": "SHADOW_EXPIRY"}.get(reason, "SHADOW_EXPIRY")
-                    cur.execute(
-                        """
-                        UPDATE scanner_signals
-                        SET shadow_outcome = %s,
-                            shadow_r_multiple = %s,
-                            shadow_exit_price = %s,
-                            shadow_closed_at = %s
-                        WHERE signal_id = %s
-                        """,
-                        (outcome, r_mult, exit_price, exit_ts.isoformat(), signal_id),
-                    )
-                else:
-                    status = {"TP": "CLOSED_TP", "SL": "CLOSED_SL", "EXPIRY": "EXPIRED"}.get(reason, "CLOSED")
-                    cur.execute(
-                        """
-                        UPDATE scanner_signals
-                        SET status = %s,
-                            exit_price = %s,
-                            exit_reason = %s,
-                            exit_at = %s,
-                            r_multiple = %s
-                        WHERE signal_id = %s
-                        """,
-                        (status, exit_price, reason, exit_ts.isoformat(), r_mult, signal_id),
-                    )
-                    if str(row.get("grade") or "").upper() in {"A+", "A"}:
-                        pnl_cash = float(ACCOUNT_SIZE) * float(RISK_PER_TRADE) * r_mult
-                        cur.execute(
-                            """
-                            UPDATE prop_firm_trades
-                            SET r_multiple = %s, pnl_cash = %s, closed_at = %s
-                            WHERE signal_id = %s
-                            """,
-                            (r_mult, pnl_cash, exit_ts.isoformat(), signal_id),
-                        )
+                cur.execute(
+                    "UPDATE scanner_signals SET replay_checked_at = NOW() WHERE signal_id = ANY(%s)",
+                    (signal_ids,),
+                )
+                count = cur.rowcount or 0
         conn.close()
-        return True
+        return int(count)
     except Exception as exc:
-        print(f"[Replay1mBackfill] Update failed for {signal_id}: {exc}")
-        return False
+        print(f"[Replay1mBackfill] Could not mark checked rows: {exc}")
+        return 0
 
 
 def replay_existing_resolved_outcomes(max_age_days: int | None = None, limit: int | None = None) -> int:
-    """Recalculate existing Supabase outcomes with 1-minute replay where possible.
+    """Recalculate existing Supabase outcomes with 1-minute replay in safe batches.
 
-    Yahoo 1-minute data is only available for recent rows, so older rows are
-    recalculated through the same fallback timeframe replay. This is still safe
-    and deterministic, but the log separates true 1-minute improvements from
-    fallback updates.
+    This deliberately processes only a limited number per scanner run. That means
+    old SL/TP/expiry data is improved gradually without overloading Supabase.
+    Rows are marked with replay_checked_at so the next run moves to the next
+    batch instead of hammering the same records repeatedly.
     """
     days = int(max_age_days if max_age_days is not None else REPLAY_EXISTING_OUTCOMES_DAYS)
     lim = int(limit if limit is not None else REPLAY_EXISTING_OUTCOMES_LIMIT)
@@ -2610,24 +2705,69 @@ def replay_existing_resolved_outcomes(max_age_days: int | None = None, limit: in
         print("[Replay1mBackfill] No existing resolved outcomes to replay.")
         return 0
 
-    updated = 0
+    updates: list[dict] = []
+    checked_without_update: list[str] = []
     minute_updates = 0
     fallback_updates = 0
+
     for row in rows:
+        signal_id = row.get("signal_id")
         result = replay_trade_outcome(row, use_minute=True)
         if not result or str(result.get("reason") or "").upper() == "OPEN":
+            if signal_id:
+                checked_without_update.append(str(signal_id))
             continue
-        if update_existing_outcome_from_replay(row, result):
-            updated += 1
-            method = str(result.get("method") or "")
-            if method.startswith("1m"):
-                minute_updates += 1
-            else:
-                fallback_updates += 1
 
+        reason = str(result.get("reason") or "").upper()
+        if reason not in {"TP", "SL", "EXPIRY"}:
+            if signal_id:
+                checked_without_update.append(str(signal_id))
+            continue
+
+        exit_time = pd.to_datetime(result.get("exit_time"), errors="coerce", utc=True)
+        if pd.isna(exit_time):
+            exit_time = pd.Timestamp.now(tz="UTC")
+        exit_at = exit_time.isoformat()
+        exit_price = float(result.get("price") or 0.0)
+        r_mult = float(result.get("r") or 0.0)
+        is_shadow = str(row.get("status") or "").upper() == "SHADOW" or row.get("shadow_outcome") is not None
+
+        method = str(result.get("method") or "")
+        if method.startswith("1m"):
+            minute_updates += 1
+        else:
+            fallback_updates += 1
+
+        if is_shadow:
+            outcome = {"TP": "SHADOW_TP", "SL": "SHADOW_SL", "EXPIRY": "SHADOW_EXPIRY"}.get(reason, "SHADOW_EXPIRY")
+            updates.append({
+                "signal_id": signal_id,
+                "is_shadow": True,
+                "outcome": outcome,
+                "r_multiple": r_mult,
+                "exit_price": exit_price,
+                "exit_at": exit_at,
+            })
+        else:
+            status = {"TP": "CLOSED_TP", "SL": "CLOSED_SL", "EXPIRY": "EXPIRED"}.get(reason, "CLOSED")
+            updates.append({
+                "signal_id": signal_id,
+                "is_shadow": False,
+                "status": status,
+                "exit_reason": reason,
+                "r_multiple": r_mult,
+                "exit_price": exit_price,
+                "exit_at": exit_at,
+                "prop_grade": str(row.get("grade") or "").upper(),
+            })
+
+    updated = update_existing_outcomes_batch(updates)
+    marked = mark_existing_replay_checked(checked_without_update)
+    remaining_note = " More rows may remain and will be processed on later runs." if len(rows) >= lim else ""
     print(
-        f"[Replay1mBackfill] Replayed {updated} existing outcome(s): "
-        f"{minute_updates} using 1-minute data, {fallback_updates} using timeframe fallback."
+        f"[Replay1mBackfill] Checked {len(rows)} existing outcome(s); updated {updated}, "
+        f"marked {marked} unchanged/open. {minute_updates} used 1-minute data, "
+        f"{fallback_updates} used timeframe fallback.{remaining_note}"
     )
     return updated
 
