@@ -3432,7 +3432,7 @@ def apply_theme() -> None:
     .metric-label { color:#8BAAB8; font-size:var(--font-card-title); font-weight:800; text-transform:uppercase; letter-spacing:.5px; }
     .metric-value { color:#E8EDF2; font-size:var(--font-kpi-value); font-weight:950; margin-top:4px; line-height:1.15; overflow-wrap:anywhere; }
     .soft-card { background:#0F2235; border:1px solid #1E3050; border-radius:18px; padding:20px; margin:16px 0; line-height:1.55; }
-    .ai-card { background:linear-gradient(180deg,#10283D 0%,#0F2235 100%); border:1px solid #244363; border-radius:18px; padding:24px 28px; margin:16px 0 24px; line-height:1.72; font-size:clamp(15px, .98vw, 18px); font-weight:750; }
+    .ai-card { background:linear-gradient(180deg,#10283D 0%,#0F2235 100%); border:1px solid #244363; border-radius:18px; padding:24px 28px; margin:16px 0 24px; line-height:1.72; font-size:clamp(17px,1.05vw,21px); font-weight:750; }
     .green { color:#00D4A3; }
     .red { color:#FF5D5D; }
     .muted { color:#8BAAB8; }
@@ -3732,6 +3732,8 @@ def apply_theme() -> None:
     input, textarea, div[data-baseweb="select"] > div { border-radius:12px !important; }
     .danger-button button { background:#8B1E2D !important; border-color:#FF5D5D !important; color:#fff !important; }
     .grey-note { background:#111A2A; border:1px solid #26364A; border-radius:14px; padding:12px 14px; color:#A9BBC9; }
+    .workflow-section-title { color:#E8EDF2 !important; font-size:clamp(26px,2vw,42px) !important; line-height:1.15 !important; font-weight:950 !important; margin:26px 0 20px !important; }
+    .page-commentary { background:#111A2A; border:1px solid #26364A; border-radius:18px; padding:22px 26px; color:#A9BBC9; font-size:clamp(17px,1.15vw,22px); line-height:1.65; margin:18px 0 28px; }
 
     /* Disabled buttons (e.g. "Activate Settings" while alerts are already
        active, or "Deactivate alerts" while inactive): force a clearly greyed
@@ -4277,9 +4279,21 @@ def stat_card(label: str, value: str, note: str = "", icon: str = "●", tone: s
 
 
 def page_header(title: str, subtitle: str) -> None:
-    st.markdown(f"<h1 class='benzino-page-title' style='color:#E8EDF2;margin-bottom:0'>{html.escape(title)}</h1>", unsafe_allow_html=True)
-    st.markdown(f"<div class='muted' style='margin-bottom:14px'>{html.escape(subtitle)}</div>", unsafe_allow_html=True)
+    """Global Benzino page title + commentary block used across the whole app."""
+    title = html.escape(str(title or ""))
+    subtitle = str(subtitle or "")
+    st.markdown(f"<div class='workflow-section-title'>{title}</div>", unsafe_allow_html=True)
+    if subtitle.strip():
+        st.markdown(f"<div class='page-commentary'>{html.escape(subtitle)}</div>", unsafe_allow_html=True)
 
+
+def workflow_commentary_header(title: str, body: str) -> None:
+    """Global Benzino section title + commentary block used across all modules."""
+    title = html.escape(str(title or ""))
+    body = str(body or "")
+    st.markdown(f"<div class='workflow-section-title'>{title}</div>", unsafe_allow_html=True)
+    if body.strip():
+        st.markdown(f"<div class='page-commentary'>{body}</div>", unsafe_allow_html=True)
 
 
 def render_user_topbar(username: str, settings: dict) -> dict:
@@ -4992,10 +5006,9 @@ def asset_group_for_asset(asset: str) -> str:
 
 def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
     """Render total system performance using every scanner row in Supabase."""
-    st.subheader("Total System Performance")
-    st.caption(
-        "This view ignores individual user watchlists and uses all scanner data currently saved in Supabase. "
-        "It refreshes whenever the app reloads and gives you the global Benzino engine performance picture."
+    workflow_commentary_header(
+        "Total System Performance",
+        "This view ignores individual user watchlists and uses all scanner data currently saved in Supabase. It refreshes whenever the app reloads and gives you the global Benzino engine performance picture.",
     )
 
     if system_df is None or system_df.empty:
@@ -5442,6 +5455,10 @@ def render_workflow(username: str, settings: dict) -> None:
     t1, t2, t3, t_cap, t4, t5, t6 = st.tabs(["User Journal", "System Performance", "Prop Firm", "Capital", "No Trade Tracker", "Coach AI", "Explain AI"])
 
     with t1:
+        workflow_commentary_header(
+            "User Journal",
+            "This view shows the logged-in user's watchlist-scoped journal trades for the selected timeframe. Open, closed, and resolved outcomes update from Supabase as the scanner evaluates TP, SL, and expiry.",
+        )
         c1, c2, c3, c4 = st.columns(4)
         resolved = closed_resolved_trades(closed_trades)
         won_trades = int(resolved_outcome_masks(closed_trades)[0].sum()) if not closed_trades.empty else 0
@@ -5581,18 +5598,9 @@ def render_workflow(username: str, settings: dict) -> None:
             prop_start_map = {}
         prop_started_at_raw = str(settings.get("tracking_started_at", "") or "")
 
-        st.markdown("<h2 style='color:#E8EDF2;margin:22px 0 10px;'>Prop Firm Challenge</h2>", unsafe_allow_html=True)
-        st.markdown(
-            f"""
-            <div class='muted' style='font-size:19px;line-height:1.85;margin-bottom:24px;'>
-                This view recalculates the FTMO-style challenge from your current watchlist and selected timeframe
-                <b>({html.escape(str(challenge_tf))})</b>. It uses only <b>A+/A closed trades</b>, a fixed
-                <b>&#36;10,000</b> account, <b>1% risk per trade</b>, a <b>&#36;1,000 Phase 1 target</b>,
-                a <b>&#36;500 Phase 2 target</b>, a <b>5% max daily loss</b>, and a <b>10% max total loss</b>.
-                Completed cycles are rebuilt from Supabase on every load.
-            </div>
-            """,
-            unsafe_allow_html=True,
+        workflow_commentary_header(
+            "Prop Firm Challenge",
+            f"This view recalculates the FTMO-style challenge from your current watchlist and selected timeframe <b>({html.escape(str(challenge_tf))})</b>. It uses only <b>A+/A closed trades</b>, a fixed <b>&#36;10,000</b> account, <b>1% risk per trade</b>, a <b>&#36;1,000 Phase 1 target</b>, a <b>&#36;500 Phase 2 target</b>, a <b>5% max daily loss</b>, and a <b>10% max total loss</b>. Completed cycles are rebuilt from Supabase on every load.",
         )
 
         prop_source = trades[
@@ -6425,8 +6433,10 @@ def render_workflow(username: str, settings: dict) -> None:
             st.info("No completed prop-firm challenges have been archived yet. Passed or failed attempts will appear here automatically.")
 
     with t_cap:
-        st.markdown("<h3 style='margin:18px 0 10px;color:#E8EDF2'>Capital.com</h3>", unsafe_allow_html=True)
-        st.markdown("<div class='grey-note' style='font-size:clamp(17px,1.15vw,22px);line-height:1.65;margin-bottom:20px;'>Activation stays under Settings. This page shows Capital auto-trade execution, simulated-vs-actual comparison, and imported broker rows for the logged-in user's visible data.</div>", unsafe_allow_html=True)
+        workflow_commentary_header(
+            "Capital.com",
+            "Activation stays under Settings. This page shows Capital auto-trade execution, simulated-vs-actual comparison, and imported broker rows for the logged-in user's visible data.",
+        )
 
         cap_comp = load_capital_trade_comparisons(limit=APP_TABLE_MAX_ROWS)
         cap_raw = load_capital_executed_trades(limit=APP_TABLE_MAX_ROWS)
@@ -6659,8 +6669,10 @@ def render_workflow(username: str, settings: dict) -> None:
         )
 
     with t5:
-        st.subheader("Coach AI")
-        st.markdown("<div class='grey-note' style='font-size:clamp(16px,1vw,20px);line-height:1.6;margin-bottom:16px;'>Coach AI reviews your journal patterns and turns trade history into practical behaviour, risk, and execution guidance.</div>", unsafe_allow_html=True)
+        workflow_commentary_header(
+            "Coach AI",
+            "Coach AI reviews your journal patterns and turns trade history into practical behaviour, risk, and execution guidance. The guidance is split between prop-firm discipline and broader user-journal improvement.",
+        )
         prop_state = load_prop_firm_state()
         prop_status = str(prop_state.get("status") or "ACTIVE").upper()
 
@@ -6765,8 +6777,10 @@ def render_workflow(username: str, settings: dict) -> None:
         render_ai_card("User Journal Coaching", "\n\n".join(journal_parts))
 
     with t6:
-        st.subheader("Explain AI")
-        st.caption("Closed outcomes are the main lesson source. Select a trade from the table to open its full Explain AI lesson. Lessons are saved in the explain_ai_lessons table.")
+        workflow_commentary_header(
+            "Explain AI",
+            "Closed outcomes are the main lesson source. Select a trade from the table to open its full Explain AI lesson. Lessons are saved in the explain_ai_lessons table.",
+        )
 
         if closed_trades.empty:
             st.info("No closed trades yet. Explain AI will populate once TP, SL, or expiry outcomes are recorded.")
