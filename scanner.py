@@ -555,6 +555,17 @@ CAPITAL_AUTO_TRADE_MIN_SIZE = float(os.environ.get("CAPITAL_AUTO_TRADE_MIN_SIZE"
 CAPITAL_AUTO_TRADE_MAX_SIZE = float(os.environ.get("CAPITAL_AUTO_TRADE_MAX_SIZE", "0"))  # 0 means no cap
 CAPITAL_AUTO_TRADE_USE_STOPS = os.environ.get("CAPITAL_AUTO_TRADE_USE_STOPS", "true").strip().lower() in {"1", "true", "yes", "y"}
 
+# Schema migrations are intentionally OFF during normal scanner runs.
+# Running ALTER TABLE / CREATE INDEX every 15 minutes can deadlock with another
+# local/GitHub scanner. Apply the SQL migration once in Supabase, then keep this
+# false. Set SCANNER_RUN_SCHEMA_MIGRATIONS=true only for a one-off controlled run.
+SCANNER_RUN_SCHEMA_MIGRATIONS = os.environ.get("SCANNER_RUN_SCHEMA_MIGRATIONS", "false").strip().lower() in {"1", "true", "yes", "y"}
+
+# Capital history endpoints are optional. Open positions are enough for demo
+# auto-trade matching. The history endpoints reject some lastPeriod values on
+# some Capital accounts, so they are disabled unless explicitly enabled.
+CAPITAL_FETCH_ACTIVITY_HISTORY = os.environ.get("CAPITAL_FETCH_ACTIVITY_HISTORY", "false").strip().lower() in {"1", "true", "yes", "y"}
+
 # Audit guard: historical replay must never rewrite the original trade plan.
 # Existing rows keep their original entry/sl/tp/rr. Replay is allowed to update
 # only outcome fields such as status, exit_price, exit_reason, exit_at,
@@ -625,6 +636,10 @@ def db_connect():
 
 
 def init_tables() -> None:
+    if not SCANNER_RUN_SCHEMA_MIGRATIONS:
+        print("[DB] Schema migrations skipped for normal scanner run. Supabase tables are assumed ready.")
+        return
+
     ddl = """
     CREATE TABLE IF NOT EXISTS scanner_signals (
         signal_id      TEXT PRIMARY KEY,
@@ -1385,6 +1400,10 @@ CAPITAL_PASSWORD = os.environ.get("CAPITAL_PASSWORD", "").strip()
 CAPITAL_DEMO = os.environ.get("CAPITAL_DEMO", "true").strip().lower() in {"1", "true", "yes", "y"}
 CAPITAL_ENABLED = os.environ.get("CAPITAL_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y"}
 CAPITAL_PRIMARY_ALL_ASSETS = os.environ.get("CAPITAL_PRIMARY_ALL_ASSETS", "true").strip().lower() in {"1", "true", "yes", "y"}
+# Strict mode: after the Capital.com migration, BENZINO should not silently use Yahoo
+# for signal generation or TP/SL replay. If Capital.com cannot provide the data,
+# the row is skipped for that run instead of being evaluated against the wrong feed.
+CAPITAL_STRICT_ALL_ASSETS = os.environ.get("CAPITAL_STRICT_ALL_ASSETS", "true").strip().lower() in {"1", "true", "yes", "y"}
 CAPITAL_PRICE_FIELD = os.environ.get("CAPITAL_PRICE_FIELD", "mid").strip().lower()  # mid, bid, ask
 CAPITAL_API_URL_RAW = os.environ.get("CAPITAL_API_URL", "").strip().rstrip("/")
 if CAPITAL_API_URL_RAW:
@@ -1421,6 +1440,16 @@ def capital_symbol_from_ticker(ticker: str) -> str:
 
 
 def yahoo_fallback_for_symbol(symbol: str, ticker: str = "") -> str:
+    """Return Yahoo fallback only when strict Capital mode is disabled.
+
+    The user validates charts on TradingView using the Capital.com feed, so a
+    Yahoo fallback can create false TP/SL outcomes. In strict mode every
+    MASTER_WATCHLIST asset must use Capital.com for both signal generation and
+    replay; if Capital data is unavailable, the scanner skips that asset/row
+    until Capital is available again.
+    """
+    if CAPITAL_STRICT_ALL_ASSETS:
+        return ""
     symbol = str(symbol or "").strip().upper()
     if symbol in YAHOO_FALLBACK_TICKERS:
         return YAHOO_FALLBACK_TICKERS[symbol]
@@ -1545,12 +1574,72 @@ def _capital_market_score(symbol: str, market: dict) -> int:
     return score
 
 
+def capital_load_saved_epic(symbol: str) -> str | None:
+    """Read a previously resolved Capital.com epic from Supabase.
+
+    This avoids calling /markets for every asset on every scanner run. The
+    table is intentionally managed as a normal data table, not through scanner
+    schema migrations, to avoid lock/deadlock issues during scheduled runs.
+    """
+    symbol = str(symbol or "").strip().upper()
+    if not symbol:
+        return None
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT epic FROM capital_epic_map WHERE asset = %s LIMIT 1",
+                (symbol,),
+            )
+            row = cur.fetchone()
+        conn.close()
+        if row:
+            epic = str(row.get("epic") or "").strip()
+            return epic or None
+    except Exception as exc:
+        # Non-fatal: if the table is absent/unavailable, fall back to live resolve.
+        print(f"[Capital] Saved epic lookup skipped for {symbol}: {exc}")
+    return None
+
+
+def capital_save_epic(symbol: str, epic: str) -> None:
+    """Persist an asset -> Capital epic mapping for future scanner runs."""
+    symbol = str(symbol or "").strip().upper()
+    epic = str(epic or "").strip()
+    if not symbol or not epic:
+        return
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO capital_epic_map(asset, epic, source, updated_at)
+                    VALUES (%s, %s, 'CAPITAL', NOW())
+                    ON CONFLICT (asset) DO UPDATE
+                    SET epic = EXCLUDED.epic,
+                        source = EXCLUDED.source,
+                        updated_at = NOW()
+                    """,
+                    (symbol, epic),
+                )
+        conn.close()
+    except Exception as exc:
+        # Non-fatal: mapping can still be used in-memory for this run.
+        print(f"[Capital] Could not save epic map for {symbol}->{epic}: {exc}")
+
+
 def capital_find_epic(symbol: str) -> str | None:
     symbol = str(symbol or "").strip().upper()
     if not symbol or not capital_configured():
         return None
     if symbol in _CAPITAL_EPIC_CACHE:
         return _CAPITAL_EPIC_CACHE[symbol]
+
+    saved_epic = capital_load_saved_epic(symbol)
+    if saved_epic:
+        _CAPITAL_EPIC_CACHE[symbol] = saved_epic
+        return saved_epic
 
     candidates = CAPITAL_EPIC_HINTS.get(symbol, [symbol])
     # Forex pairs generally resolve directly or through a simple search term.
@@ -1572,13 +1661,21 @@ def capital_find_epic(symbol: str) -> str | None:
         if epic:
             _CAPITAL_EPIC_CACHE[symbol] = epic
             _CAPITAL_MARKET_CACHE[symbol] = best or {}
-            if epic.upper() != symbol:
-                print(f"[Capital] {symbol} mapped to epic {epic}.")
+            capital_save_epic(symbol, epic)
+            print(f"[Capital] {symbol} mapped to epic {epic} and saved.")
             return epic
 
     # Last chance: sometimes the symbol itself is already the epic.
     _CAPITAL_EPIC_CACHE[symbol] = symbol
+    capital_save_epic(symbol, symbol)
+    print(f"[Capital] {symbol} using direct epic {symbol} and saved.")
     return symbol
+
+
+# Backward-compatible alias used by the auto-trade layer.
+# The strict Capital feed resolver is capital_find_epic().
+def capital_resolve_epic(symbol: str) -> str | None:
+    return capital_find_epic(symbol)
 
 
 def _capital_price_value(block: dict | None) -> float | None:
@@ -1661,9 +1758,9 @@ def should_use_capital_for_ticker(ticker: str) -> bool:
 def download(ticker: str, interval: str, period: str, retries: int = 3, pause_seconds: float = 2.0) -> pd.DataFrame | None:
     """Download OHLCV data.
 
-    Capital.com is preferred for CAPITAL:<asset> tickers so BENZINO matches the
-    user's TradingView Capital.com charts. Yahoo remains a fallback for symbols
-    Capital.com cannot resolve or when API credentials are missing.
+    Capital.com is the primary source for CAPITAL:<asset> tickers so BENZINO
+    matches the user's TradingView Capital.com charts. In strict mode, Yahoo is
+    not used as a fallback because it can produce wrong TP/SL outcomes.
     """
     ticker = str(ticker or "").strip()
     # Capital.com path.
@@ -1681,10 +1778,11 @@ def download(ticker: str, interval: str, period: str, retries: int = 3, pause_se
             print(f"[Capital] {symbol}: unavailable for {tf}; falling back to Yahoo {fallback}.")
             ticker = fallback
         else:
-            print(f"[Capital] {symbol}: unavailable and no Yahoo fallback configured.")
+            print(f"[Capital] {symbol}: unavailable for {tf}; strict Capital mode active — skipping Yahoo fallback.")
             return None
 
-    # Yahoo fallback path.
+    # Yahoo fallback path. Used only when strict Capital mode is disabled or for
+    # truly non-Capital tickers supplied outside MASTER_WATCHLIST.
     last_error = None
     for attempt in range(1, int(retries) + 1):
         try:
@@ -1759,8 +1857,9 @@ _MINUTE_REPLAY_CACHE: dict[str, pd.DataFrame | None] = {}
 def get_minute_replay_df(ticker: str) -> pd.DataFrame | None:
     """Download/cache recent 1-minute candles for execution replay.
 
-    Capital.com is preferred for CAPITAL:<asset> tickers; Yahoo remains fallback
-    for old rows or instruments not available through Capital.com.
+    Capital.com is preferred for CAPITAL:<asset> tickers. In strict mode, Yahoo
+    is not used as fallback, so old rows are replayed only against the Capital
+    feed that matches TradingView.
     """
     ticker = str(ticker or "").strip()
     if not ticker:
@@ -1784,12 +1883,14 @@ def get_minute_replay_df(ticker: str) -> pd.DataFrame | None:
             print(f"[Replay1m] {symbol}: Capital.com minute data unavailable; falling back to Yahoo {fallback}.")
             ticker_yahoo = fallback
         else:
+            print(f"[Replay1m] {symbol}: Capital.com minute data unavailable; strict Capital mode active — no Yahoo fallback.")
             _MINUTE_REPLAY_CACHE[ticker] = None
             return None
     else:
         ticker_yahoo = ticker
 
-    # Yahoo fallback path.
+    # Yahoo fallback path. Used only when strict Capital mode is disabled or for
+    # non-Capital tickers.
     try:
         df = yf.download(ticker_yahoo, interval="1m", period="7d", auto_adjust=True, progress=False, threads=False)
         if df is None or df.empty:
@@ -3336,22 +3437,33 @@ def capital_fetch_open_positions() -> list[dict]:
 
 
 def capital_fetch_activity_history() -> list[dict]:
-    # Capital.com exposes trading history through the activity history endpoint.
-    # The exact response keys vary slightly across account region/version, so the
-    # parser below accepts several common top-level keys.
-    params = {
-        "lastPeriod": int(CAPITAL_ACTIVITY_LOOKBACK_SECONDS),
-        "detailed": "true",
-    }
+    """Optional Capital.com history fetch.
+
+    For the current auto-trade demo test, open positions are enough because
+    BENZINO stores every API-created order in capital_auto_orders with signal_id.
+    Some Capital.com accounts reject numeric lastPeriod values with
+    error.invalid.lastPeriod, so history sync stays disabled unless explicitly
+    enabled. This prevents noisy failures during every scanner run.
+    """
+    if not CAPITAL_FETCH_ACTIVITY_HISTORY:
+        return []
+
     rows: list[dict] = []
-    for path in ("/history/activity", "/history/transactions"):
-        data = capital_request("GET", path, params=params, retries=2)
-        if not isinstance(data, dict):
-            continue
-        candidate = data.get("activities") or data.get("transactions") or data.get("items") or data.get("history") or []
-        if isinstance(candidate, list) and candidate:
-            rows.extend(candidate)
-            break
+    # Try conservative string periods first, then a short numeric fallback.
+    candidate_params = [
+        {"lastPeriod": "DAY", "detailed": "true"},
+        {"lastPeriod": "WEEK", "detailed": "true"},
+        {"lastPeriod": "LAST_DAY", "detailed": "true"},
+    ]
+    for params in candidate_params:
+        for path in ("/history/activity", "/history/transactions"):
+            data = capital_request("GET", path, params=params, retries=1)
+            if not isinstance(data, dict):
+                continue
+            candidate = data.get("activities") or data.get("transactions") or data.get("items") or data.get("history") or []
+            if isinstance(candidate, list) and candidate:
+                rows.extend(candidate)
+                return rows
     return rows
 
 
@@ -3768,7 +3880,7 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
     if capital_auto_order_exists(sig.signal_id):
         return False
 
-    epic = capital_resolve_epic(sig.asset)
+    epic = capital_find_epic(sig.asset)
     if not epic:
         record_capital_auto_order(sig, status="FAILED", error="No Capital.com epic resolved")
         print(f"[CapitalAuto] {sig.asset}: no Capital.com epic resolved; order skipped.")
@@ -3948,8 +4060,12 @@ def run_scan() -> None:
     force_open_graded_setups()
 
     # 1. Resolve outcomes for everything already open BEFORE scanning for new setups.
-    evaluate_open_trades(assets=set(scan_assets.keys()), timeframes=set(active_tfs))
-    evaluate_shadow_trades(assets=set(scan_assets.keys()), timeframes=None)
+    # Important: outcome evaluation must NOT be limited to active_tfs. A 4h/1d
+    # trade can hit TP/SL while the scheduled run is only generating 15m signals.
+    # Therefore every run checks every open timeframe using Capital.com replay.
+    all_replay_tfs = set(TIMEFRAME_CONFIGS.keys())
+    evaluate_open_trades(assets=set(scan_assets.keys()), timeframes=all_replay_tfs)
+    evaluate_shadow_trades(assets=set(scan_assets.keys()), timeframes=all_replay_tfs)
     if REPLAY_EXISTING_OUTCOMES:
         replay_existing_resolved_outcomes()
     sync_capital_actual_executions()
