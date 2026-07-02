@@ -3432,7 +3432,7 @@ def apply_theme() -> None:
     .metric-label { color:#8BAAB8; font-size:var(--font-card-title); font-weight:800; text-transform:uppercase; letter-spacing:.5px; }
     .metric-value { color:#E8EDF2; font-size:var(--font-kpi-value); font-weight:950; margin-top:4px; line-height:1.15; overflow-wrap:anywhere; }
     .soft-card { background:#0F2235; border:1px solid #1E3050; border-radius:18px; padding:20px; margin:16px 0; line-height:1.55; }
-    .ai-card { background:linear-gradient(180deg,#10283D 0%,#0F2235 100%); border:1px solid #244363; border-radius:18px; padding:22px; margin:16px 0 24px; line-height:1.65; font-size:var(--font-table-body); }
+    .ai-card { background:linear-gradient(180deg,#10283D 0%,#0F2235 100%); border:1px solid #244363; border-radius:18px; padding:24px 28px; margin:16px 0 24px; line-height:1.72; font-size:clamp(15px, .98vw, 18px); font-weight:750; }
     .green { color:#00D4A3; }
     .red { color:#FF5D5D; }
     .muted { color:#8BAAB8; }
@@ -4040,6 +4040,11 @@ def apply_theme() -> None:
         overflow-wrap:anywhere;
         letter-spacing:-.5px;
     }
+    .benzino-stat-value.compact {
+        font-size:clamp(18px, 1.15vw, 23px) !important;
+        line-height:1.15 !important;
+        letter-spacing:-.2px !important;
+    }
     .benzino-stat-note {
         font-size:clamp(10px, .68vw, 12px);
         font-weight:800;
@@ -4238,12 +4243,14 @@ def apply_theme() -> None:
 
 def metric_card(label: str, value: str, note: str = "") -> None:
     """Standard Benzino KPI card used across all pages."""
+    value_text = str(value)
+    value_class = "benzino-stat-value compact" if len(value_text) > 14 else "benzino-stat-value"
     st.markdown(
         f"""
         <div class='benzino-stat-card benzino-stat-card-no-icon'>
           <div>
             <div class='benzino-stat-label'>{html.escape(label)}</div>
-            <div class='benzino-stat-value'>{html.escape(str(value))}</div>
+            <div class='{value_class}'>{html.escape(value_text)}</div>
             {f"<div class='benzino-stat-note flat'>{html.escape(note)}</div>" if note else ""}
           </div>
         </div>
@@ -6418,27 +6425,33 @@ def render_workflow(username: str, settings: dict) -> None:
             st.info("No completed prop-firm challenges have been archived yet. Passed or failed attempts will appear here automatically.")
 
     with t_cap:
-        st.subheader("Capital.com")
-        st.caption("Activation stays under Settings. This page shows Capital auto-trade execution, simulated-vs-actual comparison, and imported broker rows for the logged-in user's visible data.")
-        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-        st.subheader("Simulated vs actual")
-        st.caption("This compares BENZINO's simulated signal outcome against trades BENZINO opened on your Capital.com demo account. Historical signal plans stay locked; the focus here is whether the auto-executed trade matched the simulated result, not manual entry or exit drift.")
-        render_capital_match_quality_legend()
+        st.markdown("<h3 style='margin:18px 0 10px;color:#E8EDF2'>Capital.com</h3>", unsafe_allow_html=True)
+        st.markdown("<div class='grey-note' style='font-size:clamp(17px,1.15vw,22px);line-height:1.65;margin-bottom:20px;'>Activation stays under Settings. This page shows Capital auto-trade execution, simulated-vs-actual comparison, and imported broker rows for the logged-in user's visible data.</div>", unsafe_allow_html=True)
+
         cap_comp = load_capital_trade_comparisons(limit=APP_TABLE_MAX_ROWS)
         cap_raw = load_capital_executed_trades(limit=APP_TABLE_MAX_ROWS)
         if cap_comp.empty and cap_raw.empty:
-            st.info("No Capital.com auto-trade executions have been imported yet. Once CAPITAL_AUTO_TRADE_ENABLED is turned on and the scanner opens demo trades, this section will show simulated vs actual results.")
+            st.info("No Capital.com auto-trade executions have been imported yet. Once a user enables Capital demo auto-trading, this section will show simulated vs actual results.")
         else:
             auto_count = int(pd.Series(cap_comp.get("auto_trade", pd.Series(dtype=bool))).fillna(False).astype(bool).sum()) if not cap_comp.empty else 0
             matched_count = len(cap_comp)
             total_actual_pnl = float(pd.to_numeric(cap_comp.get("actual_pnl", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not cap_comp.empty else 0.0
-            avg_sim_r = float(pd.to_numeric(cap_comp.get("simulated_r", pd.Series(dtype=float)), errors="coerce").dropna().mean()) if not cap_comp.empty else 0.0
-            avg_actual_r = float(pd.to_numeric(cap_comp.get("actual_r", pd.Series(dtype=float)), errors="coerce").dropna().mean()) if not cap_comp.empty else 0.0
+            sim_series = pd.to_numeric(cap_comp.get("simulated_r", pd.Series(dtype=float)), errors="coerce").dropna() if not cap_comp.empty else pd.Series(dtype=float)
+            actual_series = pd.to_numeric(cap_comp.get("actual_r", pd.Series(dtype=float)), errors="coerce").dropna() if not cap_comp.empty else pd.Series(dtype=float)
+            avg_sim_r = float(sim_series.mean()) if len(sim_series) else None
+            avg_actual_r = float(actual_series.mean()) if len(actual_series) else None
+            avg_r_text = f"Sim {avg_sim_r:+.2f}R / Actual {avg_actual_r:+.2f}R" if avg_sim_r is not None and avg_actual_r is not None else (f"Sim {avg_sim_r:+.2f}R / Actual n/a" if avg_sim_r is not None else "n/a")
+
             ec1, ec2, ec3, ec4 = st.columns(4)
             with ec1: metric_card("Auto executions", f"{auto_count:,}", "Opened by BENZINO on Capital.com")
             with ec2: metric_card("Matched signals", f"{matched_count:,}", "Linked by signal ID")
-            with ec3: metric_card("Avg R", f"Sim {avg_sim_r:+.2f}R / Actual {avg_actual_r:+.2f}R", "Simulation vs execution")
+            with ec3: metric_card("Avg R", avg_r_text, "Simulation vs execution")
             with ec4: metric_card("Actual P/L", f"${total_actual_pnl:+,.2f}", "Capital.com reported P/L")
+
+            st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
+            st.markdown("<h3 style='margin:18px 0 8px;color:#E8EDF2'>Simulated vs actual</h3>", unsafe_allow_html=True)
+            st.markdown("<div class='grey-note' style='font-size:clamp(16px,1vw,20px);line-height:1.6;margin-bottom:8px;'>This compares BENZINO's simulated signal outcome against trades BENZINO opened on your Capital.com demo account. Historical signal plans stay locked; the focus here is whether the auto-executed trade matched the simulated result.</div>", unsafe_allow_html=True)
+            render_capital_match_quality_legend()
 
             if not cap_comp.empty:
                 comp = cap_comp.copy()
@@ -6478,17 +6491,17 @@ def render_workflow(username: str, settings: dict) -> None:
                 render_benzino_aggrid(
                     comp_display,
                     key="capital_execution_comparison",
-                    height=360,
+                    title="Capital comparison rows",
+                    height=420,
                     page_size=25,
                     pinned=["Opened", "Asset", "Direction", "Match"],
                     badge_cols={"Direction":"signal", "Match":"status", "Sim Outcome":"status", "Actual Status":"status", "Auto Trade":"status"},
                     numeric_cols_right=["Sim Entry", "Actual Entry", "Sim Exit", "Actual Exit", "Sim R", "Actual R", "Actual P/L", "Size"],
-                    enable_search=False,
-                    show_footer=False,
+                    enable_search=True,
+                    show_footer=True,
                 )
             elif not cap_raw.empty:
                 st.warning("Capital.com executions were imported, but none are linked to BENZINO auto-traded signals yet.")
-
 
 
     with t4:
@@ -6647,37 +6660,70 @@ def render_workflow(username: str, settings: dict) -> None:
 
     with t5:
         st.subheader("Coach AI")
-        st.caption("Coach AI reviews your journal patterns and turns trade history into practical behaviour, risk, and execution guidance.")
+        st.markdown("<div class='grey-note' style='font-size:clamp(16px,1vw,20px);line-height:1.6;margin-bottom:16px;'>Coach AI reviews your journal patterns and turns trade history into practical behaviour, risk, and execution guidance.</div>", unsafe_allow_html=True)
         prop_state = load_prop_firm_state()
         prop_status = str(prop_state.get("status") or "ACTIVE").upper()
 
         resolved = closed_resolved_trades(closed_trades) if not closed_trades.empty else pd.DataFrame()
-        coach_parts = []
+        prop_parts = []
+        journal_parts = []
+
         if prop_status == "FAILED":
-            coach_parts.append(
-                "The official prop challenge has failed, which changes the coaching priority immediately. The right response is not to look for the next A+ entry to recover the account; it is to pause, review the ledger, and understand whether the failure came from trade quality, overexposure, daily-loss pressure, or taking too many correlated opportunities. Continuing to risk capital after a failed challenge would defeat the purpose of having the grading system in the first place."
+            prop_parts.append(
+                "The official prop challenge has failed, so the coaching priority is preservation rather than recovery. The right action is to pause new prop-risk decisions, review whether the breach came from trade quality, daily-loss pressure, correlation, or too many trades in the wrong session, then only restart under the new A+/A best-session rules."
             )
         elif prop_status == "PASSED":
-            coach_parts.append(
-                "The official prop challenge has reached its pass condition. Coach AI would treat this as a capital-preservation moment rather than an invitation to keep pressing. The system has done its job on this ledger, so the better decision is to lock in the result and let the next challenge start with a clean risk profile."
+            prop_parts.append(
+                "The official prop challenge has reached its pass condition. Coach AI would treat this as a lock-in moment: protect the result, let the cycle archive cleanly, and restart from a fresh challenge rather than continuing to press risk after the edge has already done its job."
             )
         else:
             try:
                 roi_now = (float(prop_state.get("current_equity") or 0) / float(prop_state.get("starting_balance") or 1) - 1) * 100
             except Exception:
                 roi_now = 0.0
-            coach_parts.append(
-                f"The official prop challenge is still active and currently sits at {roi_now:+.2f}% toward the target. That means the system is still in decision-making mode, not recovery mode or celebration mode. The main coaching priority is to protect the ledger from unnecessary drawdown while allowing only the strongest graded opportunities to continue proving themselves."
+            prop_parts.append(
+                f"The prop challenge is active and currently sits at {roi_now:+.2f}% from the starting balance. That means the system should behave like a funded-account simulator: preserve drawdown first, then allow only the strongest A+/A opportunities in the user's best-performing session."
             )
 
+        aa_closed = resolved[resolved.get("grade", pd.Series(dtype=str)).astype(str).isin(["A+", "A"])] if not resolved.empty and "grade" in resolved.columns else pd.DataFrame()
+        if not aa_closed.empty and "session" in aa_closed.columns:
+            session_perf = aa_closed.groupby("session").apply(
+                lambda g: pd.Series({
+                    "trades": len(closed_resolved_trades(g)),
+                    "win_rate": win_rate_group(g),
+                    "avg_r": pd.to_numeric(g.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean(),
+                    "net_r": pd.to_numeric(g.get("r_multiple", pd.Series(dtype=float)), errors="coerce").sum(),
+                }), include_groups=False
+            ).reset_index()
+            supported = session_perf[session_perf["trades"] >= 5].sort_values(["avg_r", "win_rate", "net_r"], ascending=False)
+            if not supported.empty:
+                srow = supported.iloc[0]
+                prop_parts.append(
+                    f"The best supported A+/A session in the current sample is {srow['session']}, with {int(srow['trades'])} closed trade(s), a {srow['win_rate']:.2f}% win rate, and {srow['net_r']:+.2f}R net performance. Prop auto-trading should focus there and stop at a maximum of four demo trades per day."
+                )
+            else:
+                prop_parts.append(
+                    "There is not enough A+/A session evidence yet to make the session filter fully reliable. Until the sample grows, the system should remain conservative and avoid treating a small winning streak as proof of edge."
+                )
+        else:
+            prop_parts.append(
+                "There are not enough closed A+/A prop-quality trades yet to identify a reliable best session. The prop engine should continue collecting data while keeping B/C trades as journal-learning data only."
+            )
+
+        a_open = len(open_trades[open_trades["grade"].isin(["A+", "A"])]) if not open_trades.empty and "grade" in open_trades.columns else 0
+        bc_open = len(open_trades[open_trades["grade"].isin(["B", "C"])]) if not open_trades.empty and "grade" in open_trades.columns else 0
+        prop_parts.append(
+            f"Current open exposure contains {a_open} A+/A trade(s) and {bc_open} B/C trade(s). For prop-firm logic, the practical instruction is simple: reserve challenge risk for A+/A only, cap the day at four trades, and let weaker grades remain simulation research."
+        )
+
         if len(closed_trades) < 10 or resolved.empty:
-            coach_parts.append(
-                f"Coach AI currently has {len(closed_trades)} closed journal trade(s) to study. That is enough to describe individual trades, but not enough to make strong claims about the best asset, best session, or worst recurring mistake. The correct behaviour at this stage is patience: keep collecting outcomes, avoid changing the rules too early, and pay close attention to whether open exposure is growing faster than evidence quality."
+            journal_parts.append(
+                f"The user journal currently has {len(closed_trades)} closed trade(s). That is enough for trade-by-trade review, but not enough to make hard conclusions about the best asset, best session, or recurring mistake. The correct behaviour is patience: collect more outcomes before changing the strategy rules."
             )
         else:
             asset_perf = resolved.groupby("asset").apply(
                 lambda g: pd.Series({
-                    "win_rate": win_rate_group(g) / 100,
+                    "win_rate": win_rate_group(g),
                     "trades": len(closed_resolved_trades(g)),
                     "avg_r": pd.to_numeric(g.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean(),
                 }), include_groups=False
@@ -6686,16 +6732,16 @@ def render_workflow(username: str, settings: dict) -> None:
             if not supported_assets.empty:
                 best = supported_assets.sort_values(["win_rate", "avg_r"], ascending=False).iloc[0]
                 worst = supported_assets.sort_values(["win_rate", "avg_r"], ascending=True).iloc[0]
-                coach_parts.append(
-                    f"The strongest supported asset in the current sample is {best['asset']}. It has {int(best['trades'])} closed trades, a {best['win_rate']*100:.2f}% win rate, and an average result of {best['avg_r']:+.2f}R. Coach AI would not treat this as a lucky label on a chart; it suggests the engine's confirmation model is currently reading that market structure better than others. When similar grades compete for attention, this asset deserves priority until the sample changes."
+                journal_parts.append(
+                    f"The strongest supported asset in the journal is {best['asset']}: {int(best['trades'])} closed trade(s), {best['win_rate']:.2f}% win rate, and {best['avg_r']:+.2f}R average result. This is where the engine currently appears to read structure best, so similar future setups deserve closer attention."
                 )
-                coach_parts.append(
-                    f"The weakest supported area is {worst['asset']}, with {int(worst['trades'])} closed trades, a {worst['win_rate']*100:.2f}% win rate, and an average result of {worst['avg_r']:+.2f}R. The recommendation is not to ban the asset, but to demand stronger evidence before trusting it: cleaner multi-timeframe alignment, less stretched momentum, and better risk placement. Until performance improves, this area should be treated as research fuel rather than a prop-firm priority."
+                journal_parts.append(
+                    f"The weakest supported area is {worst['asset']}: {int(worst['trades'])} closed trade(s), {worst['win_rate']:.2f}% win rate, and {worst['avg_r']:+.2f}R average result. This does not mean the asset should be banned; it means the journal should demand cleaner confirmation before trusting it."
                 )
             if "session" in resolved.columns:
                 session_perf = resolved.groupby("session").apply(
                     lambda g: pd.Series({
-                        "win_rate": win_rate_group(g) / 100,
+                        "win_rate": win_rate_group(g),
                         "trades": len(closed_resolved_trades(g)),
                         "avg_r": pd.to_numeric(g.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean(),
                     }), include_groups=False
@@ -6703,20 +6749,20 @@ def render_workflow(username: str, settings: dict) -> None:
                 session_perf = session_perf[session_perf["trades"] >= 5].sort_values(["win_rate", "avg_r"], ascending=False)
                 if not session_perf.empty:
                     srow = session_perf.iloc[0]
-                    coach_parts.append(
-                        f"Session behaviour also matters. The best supported session is {srow['session']}, with {int(srow['trades'])} closed trades and a {srow['win_rate']*100:.2f}% win rate. That suggests the system is finding cleaner follow-through during that window. When two trades have similar grades, Coach AI would prefer the one appearing in the stronger session, because execution environment can be the difference between a good idea and a good fill."
+                    journal_parts.append(
+                        f"The best journal session is {srow['session']}, with {int(srow['trades'])} closed trade(s), {srow['win_rate']:.2f}% win rate, and {srow['avg_r']:+.2f}R average result. When two setups look similar, the one appearing in the stronger session deserves priority."
                     )
 
         if len(open_trades) >= 3:
-            coach_parts.append(
-                f"Current exposure is elevated because {len(open_trades)} trades are still open. The coaching message here is simple: let some risk resolve before adding more. This matters even more in prop-firm mode, where one good setup can be ruined by stacking too many positions into the same market shock."
+            journal_parts.append(
+                f"There are {len(open_trades)} open journal trades. That is elevated exposure, so the user should let some risk resolve before adding more unless the new setup is materially stronger than the existing book."
             )
-        a_count = len(open_trades[open_trades["grade"].isin(["A+", "A"])]) if not open_trades.empty and "grade" in open_trades.columns else 0
-        b_count = len(open_trades[open_trades["grade"].isin(["B", "C"])]) if not open_trades.empty and "grade" in open_trades.columns else 0
-        coach_parts.append(
-            f"The current open-quality mix is {a_count} A+/A trade(s) and {b_count} B/C trade(s). The practical instruction is to keep prop-firm capital reserved for A+/A setups and let B/C trades remain journal-learning data. The goal is not to take every signal; it is to learn which signals deserve capital when the cost of being wrong is highest."
+        journal_parts.append(
+            "The journal's job is broader than the prop account: it should continue recording A+/A/B/C outcomes so Coach AI can learn which grades, assets, sessions, and timeframes deserve capital later."
         )
-        render_ai_card("Trade Management Guidance", "\n\n".join(coach_parts))
+
+        render_ai_card("Prop Firm Coaching", "\n\n".join(prop_parts))
+        render_ai_card("User Journal Coaching", "\n\n".join(journal_parts))
 
     with t6:
         st.subheader("Explain AI")
@@ -7255,13 +7301,7 @@ def render_settings(username: str, settings: dict) -> None:
                     st.success("Capital settings saved.")
                     st.rerun()
 
-            execs = load_capital_executed_trades(limit=APP_TABLE_MAX_ROWS)
-            comps = load_capital_trade_comparisons(limit=APP_TABLE_MAX_ROWS)
-            if not comps.empty:
-                own = apply_market_price_formatting(comps.copy())
-                render_benzino_aggrid(own, key="capital_settings_comparison_table", title="My Capital comparison rows", height=360, page_size=10, pinned=["asset", "direction"], numeric_cols_right=["simulated_r", "actual_pnl", "actual_pnl_ftmo_equiv", "ftmo_normalization_factor"], enable_search=True)
-            else:
-                st.info("No Capital comparison rows yet.")
+            st.markdown("<div class='grey-note' style='margin-top:14px;'>Execution details, simulated-vs-actual comparison rows, and match-quality explanations now live under Workflow → Capital.</div>", unsafe_allow_html=True)
         except Exception as exc:
             st.error(f"Capital settings error: {exc}")
 
