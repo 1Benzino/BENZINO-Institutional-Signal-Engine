@@ -60,7 +60,7 @@ except Exception:  # pragma: no cover
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "v7.3-user-journal-expiry-breakdown"
+APP_VERSION = "v7.4-polish-no-trade-prop-expiry"
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "assets"
 LOGO_PATH = ASSETS_DIR / "benzino_logo.png"
@@ -353,6 +353,47 @@ def init_tables() -> None:
         pnl_cash NUMERIC,
         closed_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS capital_executed_trades (
+        id TEXT PRIMARY KEY,
+        deal_id TEXT,
+        deal_reference TEXT,
+        source_type TEXT,
+        environment TEXT,
+        epic TEXT,
+        asset TEXT,
+        instrument_name TEXT,
+        direction TEXT,
+        status TEXT,
+        opened_at TIMESTAMPTZ,
+        closed_at TIMESTAMPTZ,
+        entry_price NUMERIC,
+        exit_price NUMERIC,
+        size NUMERIC,
+        pnl NUMERIC,
+        currency TEXT,
+        raw_json JSONB,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS capital_trade_comparisons (
+        id TEXT PRIMARY KEY,
+        capital_trade_id TEXT REFERENCES capital_executed_trades(id),
+        signal_id TEXT REFERENCES scanner_signals(signal_id),
+        asset TEXT,
+        direction TEXT,
+        simulated_entry NUMERIC,
+        actual_entry NUMERIC,
+        entry_diff NUMERIC,
+        simulated_exit NUMERIC,
+        actual_exit NUMERIC,
+        exit_diff NUMERIC,
+        simulated_r NUMERIC,
+        actual_pnl NUMERIC,
+        simulated_outcome TEXT,
+        actual_status TEXT,
+        match_quality TEXT,
+        opened_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
     CREATE TABLE IF NOT EXISTS prop_challenge_history (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         scan_owner TEXT,
@@ -415,6 +456,12 @@ def init_tables() -> None:
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_outcome TEXT")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS trade_notes TEXT")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS display_id TEXT")
+                cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS replay_checked_at TIMESTAMPTZ")
+                cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS raw_json JSONB")
+                cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS environment TEXT")
+                cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS match_quality TEXT")
+                cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS actual_r NUMERIC")
+                cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS auto_trade BOOLEAN DEFAULT FALSE")
                 cur.execute("ALTER TABLE prop_challenge_history ADD COLUMN IF NOT EXISTS failure_reason TEXT")
                 # Migration/fix: Telegram delivery must never control journal status.
                 # A+/A/B/C BUY/SELL setups are active journal trades; NO TRADE/HOLD stays SHADOW.
@@ -1254,6 +1301,50 @@ def load_prop_firm_trades(limit: int = 500) -> pd.DataFrame:
     if df.empty:
         return df
     return numeric_cols(df, ["r_multiple", "pnl_cash", "entry", "sl", "tp"])
+
+
+def load_capital_trade_comparisons(limit: int = 500) -> pd.DataFrame:
+    """Actual Capital.com executions matched against simulated BENZINO signals."""
+    df = read_df(
+        """
+        SELECT
+            c.opened_at, c.asset, c.direction, c.match_quality,
+            c.simulated_entry, c.actual_entry,
+            c.simulated_exit, c.actual_exit,
+            c.simulated_r, c.actual_r, c.actual_pnl, c.simulated_outcome, c.actual_status,
+            c.signal_id, c.capital_trade_id, COALESCE(c.auto_trade, FALSE) AS auto_trade,
+            ce.instrument_name, ce.environment, ce.status AS execution_status,
+            ce.size, ce.currency, ce.updated_at
+        FROM capital_trade_comparisons c
+        LEFT JOIN capital_executed_trades ce ON ce.id = c.capital_trade_id
+        ORDER BY c.opened_at DESC NULLS LAST, c.updated_at DESC
+        LIMIT %s
+        """,
+        (limit,),
+    )
+    if df.empty:
+        return df
+    return numeric_cols(df, [
+        "simulated_entry", "actual_entry", "simulated_exit",
+        "actual_exit", "simulated_r", "actual_r", "actual_pnl", "size"
+    ])
+
+
+def load_capital_executed_trades(limit: int = 500) -> pd.DataFrame:
+    """Raw Capital.com execution rows imported by the scanner."""
+    df = read_df(
+        """
+        SELECT opened_at, closed_at, asset, direction, status, source_type, environment,
+               epic, instrument_name, entry_price, exit_price, size, pnl, currency, updated_at
+        FROM capital_executed_trades
+        ORDER BY COALESCE(opened_at, updated_at) DESC NULLS LAST
+        LIMIT %s
+        """,
+        (limit,),
+    )
+    if df.empty:
+        return df
+    return numeric_cols(df, ["entry_price", "exit_price", "size", "pnl"])
 
 
 
@@ -5226,6 +5317,73 @@ def render_workflow(username: str, settings: dict) -> None:
         )
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
+        st.subheader("Capital.com simulated vs actual")
+        st.caption("This compares BENZINO's simulated signal outcome against trades BENZINO opened on your Capital.com demo account. Historical signal plans stay locked; the focus here is whether the auto-executed trade matched the simulated result, not manual entry or exit drift.")
+        cap_comp = load_capital_trade_comparisons(limit=500)
+        cap_raw = load_capital_executed_trades(limit=500)
+        if cap_comp.empty and cap_raw.empty:
+            st.info("No Capital.com auto-trade executions have been imported yet. Once CAPITAL_AUTO_TRADE_ENABLED is turned on and the scanner opens demo trades, this section will show simulated vs actual results.")
+        else:
+            auto_count = int(pd.Series(cap_comp.get("auto_trade", pd.Series(dtype=bool))).fillna(False).astype(bool).sum()) if not cap_comp.empty else 0
+            matched_count = len(cap_comp)
+            total_actual_pnl = float(pd.to_numeric(cap_comp.get("actual_pnl", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not cap_comp.empty else 0.0
+            avg_sim_r = float(pd.to_numeric(cap_comp.get("simulated_r", pd.Series(dtype=float)), errors="coerce").dropna().mean()) if not cap_comp.empty else 0.0
+            avg_actual_r = float(pd.to_numeric(cap_comp.get("actual_r", pd.Series(dtype=float)), errors="coerce").dropna().mean()) if not cap_comp.empty else 0.0
+            ec1, ec2, ec3, ec4 = st.columns(4)
+            with ec1: metric_card("Auto executions", f"{auto_count:,}", "Opened by BENZINO on Capital.com")
+            with ec2: metric_card("Matched signals", f"{matched_count:,}", "Linked by signal ID")
+            with ec3: metric_card("Avg R", f"Sim {avg_sim_r:+.2f}R / Actual {avg_actual_r:+.2f}R", "Simulation vs execution")
+            with ec4: metric_card("Actual P/L", f"${total_actual_pnl:+,.2f}", "Capital.com reported P/L")
+
+            if not cap_comp.empty:
+                comp = cap_comp.copy()
+                comp["Opened"] = pd.to_datetime(comp.get("opened_at"), errors="coerce", utc=True).dt.tz_convert(NAIROBI_TZ).dt.strftime("%Y-%m-%d %H:%M")
+                comp_display = comp.rename(columns={
+                    "asset": "Asset",
+                    "direction": "Direction",
+                    "match_quality": "Match",
+                    "simulated_entry": "Sim Entry",
+                    "actual_entry": "Actual Entry",
+                    "simulated_exit": "Sim Exit",
+                    "actual_exit": "Actual Exit",
+                    "simulated_r": "Sim R",
+                    "actual_r": "Actual R",
+                    "actual_pnl": "Actual P/L",
+                    "simulated_outcome": "Sim Outcome",
+                    "actual_status": "Actual Status",
+                    "instrument_name": "Instrument",
+                    "environment": "Environment",
+                    "size": "Size",
+                    "currency": "Currency",
+                    "auto_trade": "Auto Trade",
+                })
+                order = ["Opened", "Asset", "Direction", "Match", "Auto Trade", "Sim Entry", "Actual Entry", "Sim Exit", "Actual Exit", "Sim R", "Actual R", "Actual P/L", "Sim Outcome", "Actual Status", "Instrument", "Environment", "Size", "Currency", "signal_id"]
+                comp_display = comp_display[[c for c in order if c in comp_display.columns] + [c for c in comp_display.columns if c not in order]]
+
+                cf1, cf2 = st.columns([0.32, 0.68], vertical_alignment="center")
+                with cf1:
+                    asset_opts = ["All"] + sorted([x for x in comp_display.get("Asset", pd.Series(dtype=str)).dropna().astype(str).unique() if x])
+                    cap_asset_filter = st.selectbox("Execution asset", asset_opts, key="capital_exec_asset_filter")
+                with cf2:
+                    st.markdown("<div class='grey-note' style='margin-top:4px;'>Auto-traded rows are matched by the originating BENZINO signal ID, so entry/exit drift stats are intentionally removed.</div>", unsafe_allow_html=True)
+                if cap_asset_filter != "All" and "Asset" in comp_display.columns:
+                    comp_display = comp_display[comp_display["Asset"].astype(str).eq(cap_asset_filter)]
+
+                render_benzino_aggrid(
+                    comp_display,
+                    key="capital_execution_comparison",
+                    height=360,
+                    page_size=25,
+                    pinned=["Opened", "Asset", "Direction", "Match"],
+                    badge_cols={"Direction":"signal", "Match":"status", "Sim Outcome":"status", "Actual Status":"status", "Auto Trade":"status"},
+                    numeric_cols_right=["Sim Entry", "Actual Entry", "Sim Exit", "Actual Exit", "Sim R", "Actual R", "Actual P/L", "Size"],
+                    enable_search=False,
+                    show_footer=False,
+                )
+            elif not cap_raw.empty:
+                st.warning("Capital.com executions were imported, but none are linked to BENZINO auto-traded signals yet.")
+
+        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         st.subheader("Expiry breakdown")
         expiry_rules = {
             "15m": {"bars": 56, "approx": "~14 hours"},
@@ -5255,7 +5413,7 @@ def render_workflow(username: str, settings: dict) -> None:
         render_benzino_aggrid(
             expiry_df,
             key="journal_expiry_breakdown",
-            height=190,
+            height=320,
             page_size=4,
             pinned=["Timeframe"],
             badge_cols={"Currently Selected": "status"},
@@ -5300,11 +5458,18 @@ def render_workflow(username: str, settings: dict) -> None:
             prop_start_map = {}
         prop_started_at_raw = str(settings.get("tracking_started_at", "") or "")
 
-        st.caption(
-            f"This tab recalculates the FTMO-style challenge from your current watchlist and selected timeframe "
-            f"({challenge_tf}). It uses only A+/A closed trades, fixed $10,000 account size, 1% risk per trade, "
-            f"Phase 1 target +$1,000, Phase 2 target +$500, 5% max daily loss and 10% max total loss. "
-            "Phase 2 starts from a fresh $10,000 verification account after Phase 1 passes; completed cycles are rebuilt from Supabase on every load."
+        st.markdown(
+            f"""
+            <div class='grey-note' style='margin-top:10px;margin-bottom:18px;'>
+                This tab recalculates the FTMO-style challenge from your current watchlist and selected timeframe
+                <b>({html.escape(str(challenge_tf))})</b>. It uses only <b>A+/A closed trades</b>, a fixed
+                <b>&#36;10,000</b> account, <b>1% risk per trade</b>, a <b>&#36;1,000 Phase 1 target</b>,
+                a <b>&#36;500 Phase 2 target</b>, a <b>5% max daily loss</b>, and a <b>10% max total loss</b>.
+                Phase 2 starts from a fresh <b>&#36;10,000</b> verification account after Phase 1 passes.
+                Completed cycles are rebuilt from Supabase on every load.
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
         prop_source = trades[
@@ -6109,16 +6274,20 @@ def render_workflow(username: str, settings: dict) -> None:
                 hovertemplate="%{x|%Y-%m-%d %H:%M}<br>Balance: $%{y:,.2f}<extra></extra>",
             ))
             fig.update_layout(
-                height=360,
-                margin=dict(t=20, b=40, l=20, r=20),
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
+                height=420,
+                margin=dict(t=20, b=45, l=20, r=20),
+                paper_bgcolor="#0E1117",
+                plot_bgcolor="#0E1117",
+                font=dict(color="#E8EDF2"),
                 xaxis_title="Resolved at",
                 yaxis_title="Hypothetical balance",
                 legend_title_text="",
+                hovermode="x unified",
             )
-            fig.update_yaxes(tickprefix="$", tickformat=",.0f")
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            fig.update_xaxes(gridcolor="rgba(255,255,255,0.12)", zerolinecolor="rgba(255,255,255,0.12)")
+            fig.update_yaxes(tickprefix="$", tickformat=",.0f", gridcolor="rgba(255,255,255,0.12)", zerolinecolor="rgba(255,255,255,0.12)")
+            with st.container(border=True):
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             st.markdown(
                 "<div class='grey-note'>This curve is research-only. It uses resolved SHADOW rows from Supabase, "
                 "the selected timeframe/watchlist scope, and your selected account/risk settings. It is excluded from "
@@ -6129,11 +6298,72 @@ def render_workflow(username: str, settings: dict) -> None:
             st.info("No resolved No Trade shadow outcomes yet. The updated scanner will now backfill and resolve the historical SHADOW / NO TRADE rows from Supabase, including legacy HOLD rows that previously had Entry = SL = TP.")
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-        no_trade_cols = ["created_at_eat", "asset", "timeframe", "signal", "grade", "status", "entry", "sl", "tp", "rr", "confidence", "edge_score", "shadow_outcome", "shadow_r_multiple", "shadow_exit_price", "reason", "session"]
+        no_trade_cols = [
+            "created_at", "created_at_eat", "asset", "timeframe", "signal", "grade", "status",
+            "entry", "sl", "tp", "rr", "confidence", "edge_score", "shadow_outcome",
+            "shadow_r_multiple", "shadow_exit_price", "reason", "session"
+        ]
         no_trade_table = no_trades[[c for c in no_trade_cols if c in no_trades.columns]].copy() if not no_trades.empty else pd.DataFrame(columns=[c for c in no_trade_cols if c in no_trades.columns])
         if not no_trade_table.empty and "created_at" in no_trades.columns:
             no_trade_table = no_trade_table.loc[no_trades.sort_values("created_at", ascending=False).index.intersection(no_trade_table.index)]
-        render_benzino_aggrid(prepare_signal_table(no_trade_table), key="no_trade_tracker", title="Research Queue", height=560, page_size=100, pinned=["Asset", "Signal", "Grade", "Age"], badge_cols={"Signal":"signal", "Grade":"grade", "Status":"status", "Hypothetical Outcome":"outcome"}, numeric_cols_right=["Entry", "SL", "TP", "Confidence", "Decayed Confidence", "RR", "Edge Score", "Hypothetical R", "Hypothetical Exit", "R Multiple"])
+
+        no_trade_display = prepare_signal_table(no_trade_table, limit=10000)
+        if not no_trade_display.empty:
+            # The database status for No Trade rows is intentionally always SHADOW,
+            # so the table uses a more useful research status instead: whether the
+            # hypothetical trade has been resolved by TP/SL/expiry yet.
+            hyp_reason = no_trade_display.get("Hypothetical Outcome", pd.Series("", index=no_trade_display.index)).astype(str).str.upper().str.strip()
+            hyp_r = pd.to_numeric(no_trade_display.get("Hypothetical R", pd.Series(np.nan, index=no_trade_display.index)), errors="coerce")
+
+            no_trade_display["Status"] = np.where(hyp_reason.ne("") & hyp_reason.ne("NAN"), "RESOLVED", "OPEN")
+            no_trade_display["Outcome"] = np.select(
+                [
+                    hyp_r > 0,
+                    hyp_r < 0,
+                    hyp_r.eq(0) & hyp_reason.ne("") & hyp_reason.ne("NAN"),
+                    hyp_reason.str.contains("TP", na=False),
+                    hyp_reason.str.contains("SL", na=False),
+                ],
+                ["WIN", "LOSS", "BREAKEVEN", "WIN", "LOSS"],
+                default="OPEN",
+            )
+
+            # Place Status and Outcome immediately after Grade, matching the User Journal layout.
+            no_trade_order = [
+                "Asset", "Signal", "Grade", "Status", "Outcome", "Age", "Entry", "SL", "TP",
+                "RR", "Confidence", "Decayed Confidence", "Edge Score", "Hypothetical Outcome",
+                "Hypothetical R", "Hypothetical Exit", "Session", "Reason", "Ticker", "Timeframe",
+                "Created At", "Signal ID", "Scan Owner"
+            ]
+            no_trade_display = no_trade_display[[c for c in no_trade_order if c in no_trade_display.columns] + [c for c in no_trade_display.columns if c not in no_trade_order]]
+
+            st.markdown("<div class='benzino-panel-title'>Research Queue</div>", unsafe_allow_html=True)
+            f1, f2, f3 = st.columns([0.22, 0.22, 0.56], vertical_alignment="center")
+            with f1:
+                status_options = ["All"] + sorted([v for v in no_trade_display["Status"].dropna().astype(str).unique() if v])
+                selected_research_status = st.selectbox("Research status", status_options, key="no_trade_research_status_filter")
+            with f2:
+                outcome_options = ["All"] + sorted([v for v in no_trade_display["Outcome"].dropna().astype(str).unique() if v])
+                selected_research_outcome = st.selectbox("Outcome", outcome_options, key="no_trade_research_outcome_filter")
+            with f3:
+                st.markdown("<div class='grey-note' style='margin-top:4px;'>Filter No Trade ideas by whether the hypothetical setup is still open or resolved, and by whether the resolved idea won or lost.</div>", unsafe_allow_html=True)
+
+            if selected_research_status != "All":
+                no_trade_display = no_trade_display[no_trade_display["Status"].astype(str).eq(selected_research_status)].copy()
+            if selected_research_outcome != "All":
+                no_trade_display = no_trade_display[no_trade_display["Outcome"].astype(str).eq(selected_research_outcome)].copy()
+
+        render_benzino_aggrid(
+            no_trade_display,
+            key="no_trade_tracker",
+            title=None,
+            height=560,
+            page_size=100,
+            pinned=["Asset", "Signal", "Grade", "Status", "Outcome"],
+            badge_cols={"Signal":"signal", "Grade":"grade", "Status":"status", "Outcome":"outcome", "Hypothetical Outcome":"status"},
+            numeric_cols_right=["Entry", "SL", "TP", "Confidence", "Decayed Confidence", "RR", "Edge Score", "Hypothetical R", "Hypothetical Exit", "R Multiple"],
+            show_status_filter=False,
+        )
 
     with t5:
         st.subheader("Coach AI")

@@ -124,10 +124,28 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 MASTER_WATCHLIST = {
-    # Commodities — using spot/CFD-equivalent tickers so prices match TradingView XAUUSD/XAGUSD.
-    # GC=F (Gold Futures) and SI=F (Silver Futures) trade $20-50 above spot due to contango;
-    # switching to the =X forex-pair form gives prices consistent with broker spot charts.
-    "XAUUSD": "XAUUSD=X", "XAGUSD": "XAGUSD=X", "OIL": "CL=F", "BRENT": "BZ=F",
+    # Primary data source is now Capital.com because the user's TradingView charts
+    # use the Capital.com feed. Tickers are kept as CAPITAL:<asset_key>; the
+    # downloader resolves each asset key to the correct Capital.com epic at run
+    # time and falls back to Yahoo only when Capital.com is unavailable.
+    "XAUUSD": "CAPITAL:XAUUSD", "XAGUSD": "CAPITAL:XAGUSD", "OIL": "CAPITAL:OIL", "BRENT": "CAPITAL:BRENT",
+    "NATGAS": "CAPITAL:NATGAS", "COPPER": "CAPITAL:COPPER",
+    "EURUSD": "CAPITAL:EURUSD", "GBPUSD": "CAPITAL:GBPUSD", "USDJPY": "CAPITAL:USDJPY",
+    "USDCHF": "CAPITAL:USDCHF", "USDCAD": "CAPITAL:USDCAD", "AUDUSD": "CAPITAL:AUDUSD", "NZDUSD": "CAPITAL:NZDUSD",
+    "GBPJPY": "CAPITAL:GBPJPY", "EURJPY": "CAPITAL:EURJPY", "AUDJPY": "CAPITAL:AUDJPY",
+    "NZDJPY": "CAPITAL:NZDJPY", "CADJPY": "CAPITAL:CADJPY", "CHFJPY": "CAPITAL:CHFJPY",
+    "EURGBP": "CAPITAL:EURGBP", "EURAUD": "CAPITAL:EURAUD", "EURNZD": "CAPITAL:EURNZD",
+    "EURCAD": "CAPITAL:EURCAD", "EURCHF": "CAPITAL:EURCHF", "GBPAUD": "CAPITAL:GBPAUD",
+    "GBPNZD": "CAPITAL:GBPNZD", "GBPCAD": "CAPITAL:GBPCAD", "GBPCHF": "CAPITAL:GBPCHF",
+    "AUDCAD": "CAPITAL:AUDCAD", "AUDNZD": "CAPITAL:AUDNZD", "AUDCHF": "CAPITAL:AUDCHF",
+    "NZDCAD": "CAPITAL:NZDCAD", "NZDCHF": "CAPITAL:NZDCHF",
+    "BTCUSD": "CAPITAL:BTCUSD", "ETHUSD": "CAPITAL:ETHUSD",
+    "SP500": "CAPITAL:SP500", "NAS100": "CAPITAL:NAS100", "DOW30": "CAPITAL:DOW30",
+    "NVDA": "CAPITAL:NVDA", "MU": "CAPITAL:MU",
+}
+
+YAHOO_FALLBACK_TICKERS = {
+    "XAUUSD": "GC=F", "XAGUSD": "SI=F", "OIL": "CL=F", "BRENT": "BZ=F",
     "NATGAS": "NG=F", "COPPER": "HG=F",
     "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "JPY=X",
     "USDCHF": "CHF=X", "USDCAD": "CAD=X", "AUDUSD": "AUDUSD=X", "NZDUSD": "NZDUSD=X",
@@ -149,7 +167,7 @@ def load_user_watchlist(username: str) -> dict[str, str]:
     Load one user's enabled watchlist from Supabase.
 
     Returns:
-        {"XAUUSD": "XAUUSD=X", "BTCUSD": "BTC-USD"}
+        {"XAUUSD": "GC=F", "BTCUSD": "BTC-USD"}
 
     If the user has no saved watchlist yet, this returns an empty dict.
     The scanner still scans MASTER_WATCHLIST; this helper is for user-specific
@@ -195,7 +213,7 @@ def get_all_user_watchlists() -> dict[str, dict[str, str]]:
 
     Returns:
         {
-            "ben": {"XAUUSD": "XAUUSD=X", "BTCUSD": "BTC-USD"},
+            "ben": {"XAUUSD": "GC=F", "BTCUSD": "BTC-USD"},
             "brother": {"EURUSD": "EURUSD=X"}
         }
 
@@ -523,6 +541,27 @@ REPLAY_EXISTING_OUTCOMES = os.environ.get("REPLAY_EXISTING_OUTCOMES", "true").st
 REPLAY_EXISTING_OUTCOMES_DAYS = int(os.environ.get("REPLAY_EXISTING_OUTCOMES_DAYS", "30"))
 REPLAY_EXISTING_OUTCOMES_LIMIT = int(os.environ.get("REPLAY_EXISTING_OUTCOMES_LIMIT", "300"))
 
+# Capital.com actual execution + auto-trading controls. Auto-trading is opt-in.
+# Keep this disabled for live accounts unless you have explicitly tested on demo.
+CAPITAL_SYNC_EXECUTIONS = os.environ.get("CAPITAL_SYNC_EXECUTIONS", "true").strip().lower() in {"1", "true", "yes", "y"}
+CAPITAL_ACTIVITY_LOOKBACK_SECONDS = int(os.environ.get("CAPITAL_ACTIVITY_LOOKBACK_SECONDS", str(7 * 24 * 60 * 60)))
+CAPITAL_MATCH_WINDOW_HOURS = int(os.environ.get("CAPITAL_MATCH_WINDOW_HOURS", "2"))
+CAPITAL_AUTO_TRADE_ENABLED = os.environ.get("CAPITAL_AUTO_TRADE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "y"}
+CAPITAL_AUTO_TRADE_REQUIRE_DEMO = os.environ.get("CAPITAL_AUTO_TRADE_REQUIRE_DEMO", "true").strip().lower() in {"1", "true", "yes", "y"}
+CAPITAL_AUTO_TRADE_GRADES = {g.strip().upper() for g in os.environ.get("CAPITAL_AUTO_TRADE_GRADES", "A+,A,B,C").split(",") if g.strip()}
+CAPITAL_AUTO_TRADE_TIMEFRAMES = {t.strip().lower() for t in os.environ.get("CAPITAL_AUTO_TRADE_TIMEFRAMES", "15m,1h,4h,1d").split(",") if t.strip()}
+CAPITAL_AUTO_TRADE_OWNER = os.environ.get("CAPITAL_AUTO_TRADE_OWNER", "").strip()
+CAPITAL_AUTO_TRADE_MIN_SIZE = float(os.environ.get("CAPITAL_AUTO_TRADE_MIN_SIZE", "0.01"))
+CAPITAL_AUTO_TRADE_MAX_SIZE = float(os.environ.get("CAPITAL_AUTO_TRADE_MAX_SIZE", "0"))  # 0 means no cap
+CAPITAL_AUTO_TRADE_USE_STOPS = os.environ.get("CAPITAL_AUTO_TRADE_USE_STOPS", "true").strip().lower() in {"1", "true", "yes", "y"}
+
+# Audit guard: historical replay must never rewrite the original trade plan.
+# Existing rows keep their original entry/sl/tp/rr. Replay is allowed to update
+# only outcome fields such as status, exit_price, exit_reason, exit_at,
+# r_multiple, bars_open, replay_checked_at, and shadow_* research columns.
+LOCK_HISTORICAL_SIGNAL_PLANS = os.environ.get("LOCK_HISTORICAL_SIGNAL_PLANS", "true").strip().lower() in {"1", "true", "yes", "y"}
+FORBIDDEN_HISTORICAL_PLAN_KEYS = {"entry", "sl", "tp", "rr"}
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  RESULT DATACLASS
@@ -689,6 +728,79 @@ def init_tables() -> None:
     CREATE UNIQUE INDEX IF NOT EXISTS idx_prop_firm_trades_signal_id
         ON prop_firm_trades (signal_id);
 
+    CREATE TABLE IF NOT EXISTS capital_executed_trades (
+        id TEXT PRIMARY KEY,
+        deal_id TEXT,
+        deal_reference TEXT,
+        source_type TEXT,
+        environment TEXT,
+        epic TEXT,
+        asset TEXT,
+        instrument_name TEXT,
+        direction TEXT,
+        status TEXT,
+        opened_at TIMESTAMPTZ,
+        closed_at TIMESTAMPTZ,
+        entry_price NUMERIC,
+        exit_price NUMERIC,
+        size NUMERIC,
+        pnl NUMERIC,
+        currency TEXT,
+        raw_json JSONB,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_capital_exec_asset_time
+        ON capital_executed_trades (asset, opened_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_capital_exec_status
+        ON capital_executed_trades (status);
+
+    CREATE TABLE IF NOT EXISTS capital_auto_orders (
+        signal_id TEXT PRIMARY KEY REFERENCES scanner_signals(signal_id),
+        deal_reference TEXT,
+        deal_id TEXT,
+        scan_owner TEXT,
+        environment TEXT,
+        asset TEXT,
+        timeframe TEXT,
+        direction TEXT,
+        grade TEXT,
+        epic TEXT,
+        size NUMERIC,
+        entry NUMERIC,
+        sl NUMERIC,
+        tp NUMERIC,
+        status TEXT,
+        error TEXT,
+        raw_json JSONB,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_capital_auto_asset_time
+        ON capital_auto_orders (asset, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS capital_trade_comparisons (
+        id TEXT PRIMARY KEY,
+        capital_trade_id TEXT REFERENCES capital_executed_trades(id),
+        signal_id TEXT REFERENCES scanner_signals(signal_id),
+        asset TEXT,
+        direction TEXT,
+        simulated_entry NUMERIC,
+        actual_entry NUMERIC,
+        entry_diff NUMERIC,
+        simulated_exit NUMERIC,
+        actual_exit NUMERIC,
+        exit_diff NUMERIC,
+        simulated_r NUMERIC,
+        actual_pnl NUMERIC,
+        simulated_outcome TEXT,
+        actual_status TEXT,
+        match_quality TEXT,
+        opened_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_capital_comparison_asset
+        ON capital_trade_comparisons (asset, opened_at DESC);
+
     CREATE TABLE IF NOT EXISTS benzino_signal_counter (
         id      INTEGER PRIMARY KEY DEFAULT 1,
         counter BIGINT NOT NULL DEFAULT 0,
@@ -720,6 +832,13 @@ def init_tables() -> None:
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS shadow_closed_at TIMESTAMPTZ")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS display_id TEXT")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS replay_checked_at TIMESTAMPTZ")
+                cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS raw_json JSONB")
+                cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS environment TEXT")
+                cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS match_quality TEXT")
+                cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS actual_r NUMERIC")
+                cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS auto_trade BOOLEAN DEFAULT FALSE")
+                cur.execute("ALTER TABLE capital_auto_orders ADD COLUMN IF NOT EXISTS deal_id TEXT")
+                cur.execute("ALTER TABLE capital_auto_orders ADD COLUMN IF NOT EXISTS raw_json JSONB")
                 # Dashboard uses this table when replaying simulated FTMO challenge cycles.
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS prop_challenge_history (
@@ -1167,6 +1286,7 @@ def update_prop_firm(signal_id: str, asset: str, grade: str, r_multiple: float) 
         return
 
     force_open_graded_setups()
+    sync_capital_actual_executions()
     state = load_prop_firm_state()
     if state.get("status") != "ACTIVE":
         print(f"[PropFirm] Challenge already {state.get('status')} — ignoring new trade.")
@@ -1254,26 +1374,340 @@ def log_runtime(run_id: str, started_at: datetime, finished_at: datetime, total_
     except Exception as e:
         print(f"[Runtime] Failed to log scanner runtime: {e}")
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CAPITAL.COM DATA SOURCE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+CAPITAL_API_KEY = os.environ.get("CAPITAL_API_KEY", "").strip()
+CAPITAL_IDENTIFIER = os.environ.get("CAPITAL_IDENTIFIER", "").strip()
+CAPITAL_PASSWORD = os.environ.get("CAPITAL_PASSWORD", "").strip()
+CAPITAL_DEMO = os.environ.get("CAPITAL_DEMO", "true").strip().lower() in {"1", "true", "yes", "y"}
+CAPITAL_ENABLED = os.environ.get("CAPITAL_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y"}
+CAPITAL_PRIMARY_ALL_ASSETS = os.environ.get("CAPITAL_PRIMARY_ALL_ASSETS", "true").strip().lower() in {"1", "true", "yes", "y"}
+CAPITAL_PRICE_FIELD = os.environ.get("CAPITAL_PRICE_FIELD", "mid").strip().lower()  # mid, bid, ask
+CAPITAL_API_URL_RAW = os.environ.get("CAPITAL_API_URL", "").strip().rstrip("/")
+if CAPITAL_API_URL_RAW:
+    CAPITAL_BASE_URL = CAPITAL_API_URL_RAW if CAPITAL_API_URL_RAW.endswith("/api/v1") else f"{CAPITAL_API_URL_RAW}/api/v1"
+else:
+    CAPITAL_BASE_URL = (
+        "https://demo-api-capital.backend-capital.com/api/v1"
+        if CAPITAL_DEMO else
+        "https://api-capital.backend-capital.com/api/v1"
+    )
+CAPITAL_RESOLUTION_MAP = {
+    "1m": "MINUTE",
+    "15m": "MINUTE_15",
+    "1h": "HOUR",
+    "4h": "HOUR_4",
+    "1d": "DAY",
+}
+_CAPITAL_SESSION: dict = {"cst": "", "security_token": "", "ts": 0.0}
+_CAPITAL_EPIC_CACHE: dict[str, str | None] = {}
+_CAPITAL_MARKET_CACHE: dict[str, dict] = {}
+
+
+def capital_configured() -> bool:
+    return bool(CAPITAL_ENABLED and CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD)
+
+
+def is_capital_ticker(ticker: str) -> bool:
+    return str(ticker or "").strip().upper().startswith("CAPITAL:")
+
+
+def capital_symbol_from_ticker(ticker: str) -> str:
+    ticker = str(ticker or "").strip()
+    return ticker.split(":", 1)[1].strip().upper() if ":" in ticker else ticker.strip().upper()
+
+
+def yahoo_fallback_for_symbol(symbol: str, ticker: str = "") -> str:
+    symbol = str(symbol or "").strip().upper()
+    if symbol in YAHOO_FALLBACK_TICKERS:
+        return YAHOO_FALLBACK_TICKERS[symbol]
+    ticker = str(ticker or "").strip()
+    if is_capital_ticker(ticker):
+        return ""
+    return ticker
+
+
+def preferred_data_ticker(asset: str, current_ticker: str = "") -> str:
+    """Return the intended scanner data ticker for an asset.
+
+    New rows use CAPITAL:<asset>. Old Supabase rows may still contain Yahoo
+    tickers; replay can still upgrade them to Capital.com by using the asset key.
+    """
+    asset = str(asset or "").strip().upper()
+    if capital_configured() and CAPITAL_PRIMARY_ALL_ASSETS and asset in MASTER_WATCHLIST:
+        return MASTER_WATCHLIST[asset]
+    return current_ticker or MASTER_WATCHLIST.get(asset, "")
+
+
+def capital_headers(authenticated: bool = True) -> dict:
+    headers = {
+        "X-CAP-API-KEY": CAPITAL_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if authenticated:
+        if not _CAPITAL_SESSION.get("cst") or time.time() - float(_CAPITAL_SESSION.get("ts") or 0) > 540:
+            capital_start_session()
+        headers["CST"] = str(_CAPITAL_SESSION.get("cst") or "")
+        headers["X-SECURITY-TOKEN"] = str(_CAPITAL_SESSION.get("security_token") or "")
+    return headers
+
+
+def capital_start_session() -> bool:
+    if not (CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD):
+        return False
+    try:
+        url = f"{CAPITAL_BASE_URL}/session"
+        payload = {
+            "identifier": CAPITAL_IDENTIFIER,
+            "password": CAPITAL_PASSWORD,
+            "encryptedPassword": False,
+        }
+        resp = requests.post(url, headers=capital_headers(authenticated=False), json=payload, timeout=20)
+        if resp.status_code >= 400:
+            print(f"[Capital] Session failed: HTTP {resp.status_code} {resp.text[:180]}")
+            return False
+        _CAPITAL_SESSION["cst"] = resp.headers.get("CST", "")
+        _CAPITAL_SESSION["security_token"] = resp.headers.get("X-SECURITY-TOKEN", "")
+        _CAPITAL_SESSION["ts"] = time.time()
+        ok = bool(_CAPITAL_SESSION["cst"] and _CAPITAL_SESSION["security_token"])
+        if ok:
+            print(f"[Capital] Session active ({'demo' if CAPITAL_DEMO else 'live'}).")
+        else:
+            print("[Capital] Session response did not include CST / X-SECURITY-TOKEN.")
+        return ok
+    except Exception as exc:
+        print(f"[Capital] Session failed: {exc}")
+        return False
+
+
+def capital_request(method: str, path: str, *, params: dict | None = None, json_body: dict | None = None, retries: int = 2) -> dict | None:
+    if not capital_configured():
+        return None
+    for attempt in range(1, retries + 1):
+        try:
+            url = f"{CAPITAL_BASE_URL}{path}"
+            resp = requests.request(method.upper(), url, headers=capital_headers(authenticated=True), params=params or {}, json=json_body, timeout=30)
+            if resp.status_code in (401, 403):
+                _CAPITAL_SESSION["cst"] = ""
+                _CAPITAL_SESSION["security_token"] = ""
+                resp = requests.request(method.upper(), url, headers=capital_headers(authenticated=True), params=params or {}, json=json_body, timeout=30)
+            if resp.status_code == 429:
+                time.sleep(1.0 + attempt)
+                continue
+            if resp.status_code >= 400:
+                if attempt == retries:
+                    print(f"[Capital] {method} {path} failed: HTTP {resp.status_code} {resp.text[:160]}")
+                time.sleep(0.5)
+                continue
+            return resp.json()
+        except Exception as exc:
+            if attempt == retries:
+                print(f"[Capital] {method} {path} failed: {exc}")
+            time.sleep(0.5)
+    return None
+
+
+CAPITAL_EPIC_HINTS = {
+    # Common Capital.com epics seen in public examples / platform naming.
+    "XAUUSD": ["GOLD", "XAUUSD"],
+    "XAGUSD": ["SILVER", "XAGUSD"],
+    "OIL": ["OIL_CRUDE", "CRUDE", "USOIL", "OIL"],
+    "BRENT": ["OIL_BRENT", "BRENT"],
+    "NATGAS": ["NATURALGAS", "NATGAS", "NATURAL_GAS"],
+    "COPPER": ["COPPER"],
+    "SP500": ["US500", "SPX500", "SP500", "US500_CASH"],
+    "NAS100": ["US100", "NAS100", "NASDAQ100"],
+    "DOW30": ["US30", "DOW30", "WALLSTREET"],
+    "BTCUSD": ["BTCUSD", "BITCOIN"],
+    "ETHUSD": ["ETHUSD", "ETHEREUM"],
+}
+
+
+def _capital_market_score(symbol: str, market: dict) -> int:
+    symbol = str(symbol or "").upper()
+    epic = str(market.get("epic") or "").upper()
+    name = str(market.get("instrumentName") or market.get("name") or market.get("symbol") or "").upper()
+    score = 0
+    if epic == symbol:
+        score += 100
+    if symbol in epic:
+        score += 50
+    if symbol in name.replace("/", "").replace(" ", ""):
+        score += 45
+    if "CFD" in str(market.get("instrumentType") or market.get("type") or "").upper():
+        score += 5
+    if market.get("streamingPricesAvailable") is True:
+        score += 3
+    return score
+
+
+def capital_find_epic(symbol: str) -> str | None:
+    symbol = str(symbol or "").strip().upper()
+    if not symbol or not capital_configured():
+        return None
+    if symbol in _CAPITAL_EPIC_CACHE:
+        return _CAPITAL_EPIC_CACHE[symbol]
+
+    candidates = CAPITAL_EPIC_HINTS.get(symbol, [symbol])
+    # Forex pairs generally resolve directly or through a simple search term.
+    if symbol.endswith("USD") or symbol.endswith("JPY") or symbol.endswith("CHF") or symbol.endswith("CAD") or symbol.endswith("AUD") or symbol.endswith("NZD") or symbol.endswith("GBP") or symbol.endswith("EUR"):
+        candidates = [symbol] + [c for c in candidates if c != symbol]
+
+    for candidate in candidates:
+        data = capital_request("GET", "/markets", params={"searchTerm": candidate}, retries=2)
+        markets = []
+        if isinstance(data, dict):
+            markets = data.get("markets") or data.get("items") or data.get("market") or []
+        if isinstance(markets, dict):
+            markets = [markets]
+        if not markets:
+            continue
+        ranked = sorted(markets, key=lambda m: _capital_market_score(symbol, m), reverse=True)
+        best = ranked[0] if ranked else None
+        epic = str((best or {}).get("epic") or "").strip()
+        if epic:
+            _CAPITAL_EPIC_CACHE[symbol] = epic
+            _CAPITAL_MARKET_CACHE[symbol] = best or {}
+            if epic.upper() != symbol:
+                print(f"[Capital] {symbol} mapped to epic {epic}.")
+            return epic
+
+    # Last chance: sometimes the symbol itself is already the epic.
+    _CAPITAL_EPIC_CACHE[symbol] = symbol
+    return symbol
+
+
+def _capital_price_value(block: dict | None) -> float | None:
+    if not isinstance(block, dict):
+        return None
+    bid = block.get("bid")
+    ask = block.get("ask")
+    try:
+        if CAPITAL_PRICE_FIELD == "bid" and bid is not None:
+            return float(bid)
+        if CAPITAL_PRICE_FIELD == "ask" and ask is not None:
+            return float(ask)
+        if bid is not None and ask is not None:
+            return (float(bid) + float(ask)) / 2.0
+        if bid is not None:
+            return float(bid)
+        if ask is not None:
+            return float(ask)
+    except Exception:
+        return None
+    return None
+
+
+def capital_prices_to_df(data: dict) -> pd.DataFrame | None:
+    prices = data.get("prices") if isinstance(data, dict) else None
+    if not isinstance(prices, list) or not prices:
+        return None
+    rows = []
+    for p in prices:
+        try:
+            ts = p.get("snapshotTimeUTC") or p.get("snapshotTime")
+            row = {
+                "Date": pd.to_datetime(ts, utc=True, errors="coerce"),
+                "Open": _capital_price_value(p.get("openPrice")),
+                "High": _capital_price_value(p.get("highPrice")),
+                "Low": _capital_price_value(p.get("lowPrice")),
+                "Close": _capital_price_value(p.get("closePrice")),
+                "Volume": float(p.get("lastTradedVolume") or 0),
+            }
+            if pd.isna(row["Date"]) or any(row[k] is None for k in ["Open", "High", "Low", "Close"]):
+                continue
+            rows.append(row)
+        except Exception:
+            continue
+    if not rows:
+        return None
+    df = pd.DataFrame(rows).sort_values("Date").drop_duplicates("Date")
+    df["Date"] = pd.to_datetime(df["Date"], utc=True, errors="coerce").dt.tz_localize(None)
+    return df.reset_index(drop=True)
+
+
+def capital_download(symbol: str, timeframe: str, max_rows: int = 1000) -> pd.DataFrame | None:
+    """Download OHLCV from Capital.com for a BENZINO asset key."""
+    if not capital_configured():
+        return None
+    symbol = str(symbol or "").strip().upper()
+    timeframe = str(timeframe or "15m").strip().lower()
+    resolution = CAPITAL_RESOLUTION_MAP.get(timeframe, "MINUTE_15")
+    epic = capital_find_epic(symbol)
+    if not epic:
+        return None
+    params = {"resolution": resolution, "max": int(min(max_rows, 1000))}
+    data = capital_request("GET", f"/prices/{epic}", params=params, retries=2)
+    df = capital_prices_to_df(data or {})
+    if df is not None and len(df) >= 50:
+        return df
+    if df is not None and timeframe == "1m" and len(df) >= 5:
+        return df
+    return None
+
+
+def should_use_capital_for_ticker(ticker: str) -> bool:
+    return capital_configured() and is_capital_ticker(ticker)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  DATA DOWNLOAD
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def download(ticker: str, interval: str, period: str) -> pd.DataFrame | None:
-    try:
-        df = yf.download(ticker, interval=interval, period=period, auto_adjust=True, progress=False)
-        if df is None or df.empty:
+def download(ticker: str, interval: str, period: str, retries: int = 3, pause_seconds: float = 2.0) -> pd.DataFrame | None:
+    """Download OHLCV data.
+
+    Capital.com is preferred for CAPITAL:<asset> tickers so BENZINO matches the
+    user's TradingView Capital.com charts. Yahoo remains a fallback for symbols
+    Capital.com cannot resolve or when API credentials are missing.
+    """
+    ticker = str(ticker or "").strip()
+    # Capital.com path.
+    if should_use_capital_for_ticker(ticker):
+        symbol = capital_symbol_from_ticker(ticker)
+        interval_to_tf = {"1m": "1m", "15m": "15m", "30m": "30m", "60m": "1h", "1h": "1h", "1d": "1d"}
+        tf = interval_to_tf.get(str(interval).lower(), "15m")
+        # For 4h we call get_timeframe_df directly with timeframe="4h"; download()
+        # only sees the base interval. Synthetic resampling remains supported.
+        df = capital_download(symbol, tf, max_rows=1000)
+        if df is not None and not df.empty:
+            return df
+        fallback = yahoo_fallback_for_symbol(symbol, ticker)
+        if fallback:
+            print(f"[Capital] {symbol}: unavailable for {tf}; falling back to Yahoo {fallback}.")
+            ticker = fallback
+        else:
+            print(f"[Capital] {symbol}: unavailable and no Yahoo fallback configured.")
             return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = df.reset_index()
-        df.columns = [str(c) for c in df.columns]
-        date_col = df.columns[0]
-        df[date_col] = pd.to_datetime(df[date_col], utc=True).dt.tz_localize(None)
-        df = df.rename(columns={date_col: "Date"})
-        return df if len(df) >= 50 else None
-    except Exception as e:
-        print(f"[data] {ticker} ({interval}): {e}")
-        return None
+
+    # Yahoo fallback path.
+    last_error = None
+    for attempt in range(1, int(retries) + 1):
+        try:
+            df = yf.download(ticker, interval=interval, period=period, auto_adjust=True, progress=False, threads=False)
+            if df is None or df.empty:
+                last_error = "empty response"
+            else:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                df = df.reset_index()
+                df.columns = [str(c) for c in df.columns]
+                date_col = df.columns[0]
+                df[date_col] = pd.to_datetime(df[date_col], utc=True, errors="coerce").dt.tz_localize(None)
+                df = df.dropna(subset=[date_col]).rename(columns={date_col: "Date"})
+                if len(df) >= 50:
+                    return df
+                last_error = f"too few rows ({len(df)})"
+        except Exception as e:
+            last_error = e
+        if attempt < int(retries):
+            time.sleep(float(pause_seconds))
+    print(f"[data] {ticker} ({interval}) skipped after {retries} attempt(s): {last_error}")
+    return None
 
 
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame | None:
@@ -1325,11 +1759,8 @@ _MINUTE_REPLAY_CACHE: dict[str, pd.DataFrame | None] = {}
 def get_minute_replay_df(ticker: str) -> pd.DataFrame | None:
     """Download/cache recent 1-minute candles for execution replay.
 
-    Yahoo normally exposes 1-minute data only for recent history. When this data
-    is available, TP/SL ordering is evaluated minute-by-minute instead of using
-    the wider signal timeframe candle. If 1-minute data is unavailable for an
-    older row or a symbol, the scanner falls back to the original timeframe
-    candles rather than leaving trades unresolved.
+    Capital.com is preferred for CAPITAL:<asset> tickers; Yahoo remains fallback
+    for old rows or instruments not available through Capital.com.
     """
     ticker = str(ticker or "").strip()
     if not ticker:
@@ -1337,8 +1768,30 @@ def get_minute_replay_df(ticker: str) -> pd.DataFrame | None:
     if ticker in _MINUTE_REPLAY_CACHE:
         cached = _MINUTE_REPLAY_CACHE[ticker]
         return cached.copy() if cached is not None else None
+
+    # Capital.com 1-minute path.
+    if should_use_capital_for_ticker(ticker):
+        symbol = capital_symbol_from_ticker(ticker)
+        df = capital_download(symbol, "1m", max_rows=1000)
+        if df is not None and not df.empty:
+            df = df.copy()
+            df["Date"] = pd.to_datetime(df["Date"], utc=True, errors="coerce")
+            df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+            _MINUTE_REPLAY_CACHE[ticker] = df.copy()
+            return df.copy()
+        fallback = yahoo_fallback_for_symbol(symbol, ticker)
+        if fallback:
+            print(f"[Replay1m] {symbol}: Capital.com minute data unavailable; falling back to Yahoo {fallback}.")
+            ticker_yahoo = fallback
+        else:
+            _MINUTE_REPLAY_CACHE[ticker] = None
+            return None
+    else:
+        ticker_yahoo = ticker
+
+    # Yahoo fallback path.
     try:
-        df = yf.download(ticker, interval="1m", period="7d", auto_adjust=True, progress=False)
+        df = yf.download(ticker_yahoo, interval="1m", period="7d", auto_adjust=True, progress=False, threads=False)
         if df is None or df.empty:
             _MINUTE_REPLAY_CACHE[ticker] = None
             return None
@@ -1357,7 +1810,7 @@ def get_minute_replay_df(ticker: str) -> pd.DataFrame | None:
         _MINUTE_REPLAY_CACHE[ticker] = df.copy()
         return df.copy()
     except Exception as exc:
-        print(f"[Replay1m] {ticker}: 1-minute download failed: {exc}")
+        print(f"[Replay1m] {ticker_yahoo}: 1-minute download failed: {exc}")
         _MINUTE_REPLAY_CACHE[ticker] = None
         return None
 
@@ -1405,7 +1858,7 @@ def replay_trade_outcome(row: dict, *, use_minute: bool = True) -> dict | None:
     retention window, the function falls back to the signal timeframe candles.
     """
     try:
-        ticker = str(row.get("ticker") or "").strip()
+        ticker = preferred_data_ticker(str(row.get("asset") or ""), str(row.get("ticker") or "").strip())
         timeframe = str(row.get("timeframe") or "15m").strip().lower()
         signal = str(row.get("signal") or "").strip().upper()
         entry = float(row.get("entry"))
@@ -2611,8 +3064,35 @@ def fetch_existing_outcomes_for_replay(max_age_days: int = 30, limit: int = 5000
         return []
 
 
+def enforce_historical_plan_lock(updates: list[dict]) -> list[dict]:
+    """Remove/guard any accidental plan-field mutations during replay.
+
+    This keeps Supabase audit-clean: replay can correct outcomes, but it cannot
+    rewrite the original signal plan. New signals get Capital.com-based
+    entry/sl/tp at creation time; old signals keep whatever plan they originally
+    had.
+    """
+    if not LOCK_HISTORICAL_SIGNAL_PLANS:
+        return updates
+    clean: list[dict] = []
+    for update in updates or []:
+        if not isinstance(update, dict):
+            continue
+        blocked = FORBIDDEN_HISTORICAL_PLAN_KEYS.intersection(update.keys())
+        if blocked:
+            print(f"[Replay1mBackfill] Historical plan lock removed forbidden keys {sorted(blocked)} for {update.get('signal_id')}")
+            update = {k: v for k, v in update.items() if k not in FORBIDDEN_HISTORICAL_PLAN_KEYS}
+        clean.append(update)
+    return clean
+
+
 def update_existing_outcomes_batch(updates: list[dict]) -> int:
-    """Apply replayed journal/shadow outcomes in one controlled DB transaction."""
+    """Apply replayed journal/shadow outcomes in one controlled DB transaction.
+
+    Important: this function intentionally does NOT update entry, sl, tp, or rr
+    for historical rows. It only corrects realised outcome fields after replay.
+    """
+    updates = enforce_historical_plan_lock(updates)
     if not updates:
         return 0
     try:
@@ -2772,6 +3252,674 @@ def replay_existing_resolved_outcomes(max_age_days: int | None = None, limit: in
     return updated
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CAPITAL.COM ACTUAL EXECUTION SYNC / SIMULATION COMPARISON
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _first_value(obj: dict, keys: list[str], default=None):
+    if not isinstance(obj, dict):
+        return default
+    for key in keys:
+        if key in obj and obj.get(key) not in (None, ""):
+            return obj.get(key)
+    return default
+
+
+def _nested_first_value(obj: dict, paths: list[list[str]], default=None):
+    for path in paths:
+        current = obj
+        ok = True
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                ok = False
+                break
+            current = current.get(key)
+        if ok and current not in (None, ""):
+            return current
+    return default
+
+
+def _parse_capital_time(value):
+    try:
+        ts = pd.to_datetime(value, errors="coerce", utc=True)
+        return None if pd.isna(ts) else ts.to_pydatetime()
+    except Exception:
+        return None
+
+
+def _parse_float_or_none(value):
+    try:
+        if value is None or value == "":
+            return None
+        x = float(value)
+        return x if math.isfinite(x) else None
+    except Exception:
+        return None
+
+
+def capital_asset_from_epic(epic: str, name: str = "") -> str:
+    epic_u = str(epic or "").upper()
+    name_u = str(name or "").upper()
+    for asset, cached_epic in list(_CAPITAL_EPIC_CACHE.items()):
+        if str(cached_epic or "").upper() == epic_u:
+            return asset
+    checks = {
+        "XAUUSD": ["XAU", "GOLD"],
+        "XAGUSD": ["XAG", "SILVER"],
+        "OIL": ["OIL_CRUDE", "USOIL", "CRUDE"],
+        "BRENT": ["OIL_BRENT", "BRENT"],
+        "NATGAS": ["NATURAL", "NATGAS", "GAS"],
+        "COPPER": ["COPPER"],
+        "SP500": ["US500", "SPX", "S&P"],
+        "NAS100": ["US100", "NASDAQ", "NAS100"],
+        "DOW30": ["US30", "DOW", "WALL"],
+        "BTCUSD": ["BTC", "BITCOIN"],
+        "ETHUSD": ["ETH", "ETHEREUM"],
+    }
+    for asset, needles in checks.items():
+        if any(n in epic_u or n in name_u for n in needles):
+            return asset
+    compact = (epic_u + " " + name_u).replace("/", "").replace(" ", "")
+    for asset in MASTER_WATCHLIST:
+        if asset in compact:
+            return asset
+    return epic_u or "UNKNOWN"
+
+
+def capital_fetch_open_positions() -> list[dict]:
+    data = capital_request("GET", "/positions", retries=2)
+    if not isinstance(data, dict):
+        return []
+    rows = data.get("positions") or data.get("items") or []
+    return rows if isinstance(rows, list) else []
+
+
+def capital_fetch_activity_history() -> list[dict]:
+    # Capital.com exposes trading history through the activity history endpoint.
+    # The exact response keys vary slightly across account region/version, so the
+    # parser below accepts several common top-level keys.
+    params = {
+        "lastPeriod": int(CAPITAL_ACTIVITY_LOOKBACK_SECONDS),
+        "detailed": "true",
+    }
+    rows: list[dict] = []
+    for path in ("/history/activity", "/history/transactions"):
+        data = capital_request("GET", path, params=params, retries=2)
+        if not isinstance(data, dict):
+            continue
+        candidate = data.get("activities") or data.get("transactions") or data.get("items") or data.get("history") or []
+        if isinstance(candidate, list) and candidate:
+            rows.extend(candidate)
+            break
+    return rows
+
+
+def normalise_capital_position(row: dict) -> dict | None:
+    position = row.get("position") if isinstance(row.get("position"), dict) else row
+    market = row.get("market") if isinstance(row.get("market"), dict) else {}
+    deal_id = str(_first_value(position, ["dealId", "dealID", "id", "positionId"], "") or "")
+    deal_ref = str(_first_value(position, ["dealReference", "dealRef", "reference"], "") or "")
+    epic = str(_first_value(market, ["epic"], "") or _first_value(position, ["epic", "marketId"], "") or "")
+    name = str(_first_value(market, ["instrumentName", "name"], "") or _first_value(position, ["instrumentName", "marketName", "name"], "") or "")
+    direction = str(_first_value(position, ["direction", "side"], "") or "").upper()
+    opened_at = _parse_capital_time(_first_value(position, ["createdDateUTC", "createdDate", "openDate", "openedAt", "date"], None))
+    entry = _parse_float_or_none(_first_value(position, ["level", "openLevel", "entryPrice", "price"], None))
+    size = _parse_float_or_none(_first_value(position, ["size", "dealSize", "quantity"], None))
+    pnl = _parse_float_or_none(_first_value(position, ["profit", "pnl", "upl", "realizedProfit"], None))
+    if not (deal_id or deal_ref or epic):
+        return None
+    raw_id = deal_id or deal_ref or f"{epic}:{opened_at or datetime.now(timezone.utc).isoformat()}"
+    return {
+        "id": f"CAPITAL_OPEN:{raw_id}",
+        "deal_id": deal_id,
+        "deal_reference": deal_ref,
+        "source_type": "OPEN_POSITION",
+        "environment": "demo" if CAPITAL_DEMO else "live",
+        "epic": epic,
+        "asset": capital_asset_from_epic(epic, name),
+        "instrument_name": name,
+        "direction": "BUY" if direction in {"BUY", "LONG"} else "SELL" if direction in {"SELL", "SHORT"} else direction,
+        "status": "OPEN",
+        "opened_at": opened_at,
+        "closed_at": None,
+        "entry_price": entry,
+        "exit_price": None,
+        "size": size,
+        "pnl": pnl,
+        "currency": str(_first_value(position, ["currency", "profitCurrency"], "") or ""),
+        "raw_json": row,
+    }
+
+
+def normalise_capital_activity(row: dict) -> dict | None:
+    market = row.get("market") if isinstance(row.get("market"), dict) else {}
+    details = row.get("details") if isinstance(row.get("details"), dict) else {}
+    deal_id = str(_first_value(row, ["dealId", "dealID", "id", "positionId"], "") or _first_value(details, ["dealId", "positionId"], "") or "")
+    deal_ref = str(_first_value(row, ["dealReference", "dealRef", "reference"], "") or _first_value(details, ["dealReference", "dealRef"], "") or "")
+    epic = str(_first_value(row, ["epic", "marketId"], "") or _first_value(market, ["epic"], "") or _first_value(details, ["epic", "marketId"], "") or "")
+    name = str(_first_value(row, ["instrumentName", "marketName", "name"], "") or _first_value(market, ["instrumentName", "name"], "") or _first_value(details, ["instrumentName", "marketName"], "") or "")
+    activity_type = str(_first_value(row, ["type", "activityType"], "") or "").upper()
+    raw_status = str(_first_value(row, ["status", "dealStatus"], "") or _first_value(details, ["status"], "") or "").upper()
+    direction = str(_first_value(row, ["direction", "side"], "") or _first_value(details, ["direction", "side"], "") or "").upper()
+    opened_at = _parse_capital_time(_first_value(row, ["createdDateUTC", "createdDate", "date", "openDate", "openedAt"], None))
+    closed_at = _parse_capital_time(_first_value(row, ["closeDate", "closedAt", "date"], None)) if ("CLOSE" in activity_type or "CLOSE" in raw_status) else None
+    entry = _parse_float_or_none(_first_value(row, ["level", "openLevel", "entryPrice", "price"], None) or _first_value(details, ["level", "openLevel", "entryPrice", "price"], None))
+    exit_price = _parse_float_or_none(_first_value(row, ["closeLevel", "exitPrice"], None) or _first_value(details, ["closeLevel", "exitPrice"], None))
+    size = _parse_float_or_none(_first_value(row, ["size", "dealSize", "quantity"], None) or _first_value(details, ["size", "dealSize", "quantity"], None))
+    pnl = _parse_float_or_none(_first_value(row, ["profit", "pnl", "realizedProfit", "amount"], None) or _first_value(details, ["profit", "pnl", "realizedProfit", "amount"], None))
+    if not (deal_id or deal_ref or epic):
+        return None
+    if "REJECT" in raw_status:
+        return None
+    status = "CLOSED" if (closed_at or "CLOSE" in activity_type or "CLOSE" in raw_status) else "ACTIVITY"
+    raw_id = deal_id or deal_ref or f"{epic}:{opened_at or datetime.now(timezone.utc).isoformat()}:{activity_type}"
+    return {
+        "id": f"CAPITAL_ACTIVITY:{raw_id}:{status}",
+        "deal_id": deal_id,
+        "deal_reference": deal_ref,
+        "source_type": activity_type or "ACTIVITY",
+        "environment": "demo" if CAPITAL_DEMO else "live",
+        "epic": epic,
+        "asset": capital_asset_from_epic(epic, name),
+        "instrument_name": name,
+        "direction": "BUY" if direction in {"BUY", "LONG"} else "SELL" if direction in {"SELL", "SHORT"} else direction,
+        "status": status,
+        "opened_at": opened_at,
+        "closed_at": closed_at,
+        "entry_price": entry,
+        "exit_price": exit_price,
+        "size": size,
+        "pnl": pnl,
+        "currency": str(_first_value(row, ["currency", "profitCurrency"], "") or _first_value(details, ["currency", "profitCurrency"], "") or ""),
+        "raw_json": row,
+    }
+
+
+def upsert_capital_executed_trades(rows: list[dict]) -> int:
+    rows = [r for r in rows if isinstance(r, dict) and r.get("id")]
+    if not rows:
+        return 0
+    sql = """
+    INSERT INTO capital_executed_trades (
+        id, deal_id, deal_reference, source_type, environment, epic, asset,
+        instrument_name, direction, status, opened_at, closed_at, entry_price,
+        exit_price, size, pnl, currency, raw_json, updated_at
+    ) VALUES (
+        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW()
+    )
+    ON CONFLICT (id) DO UPDATE SET
+        deal_id = EXCLUDED.deal_id,
+        deal_reference = EXCLUDED.deal_reference,
+        source_type = EXCLUDED.source_type,
+        environment = EXCLUDED.environment,
+        epic = EXCLUDED.epic,
+        asset = EXCLUDED.asset,
+        instrument_name = EXCLUDED.instrument_name,
+        direction = EXCLUDED.direction,
+        status = EXCLUDED.status,
+        opened_at = EXCLUDED.opened_at,
+        closed_at = EXCLUDED.closed_at,
+        entry_price = EXCLUDED.entry_price,
+        exit_price = EXCLUDED.exit_price,
+        size = EXCLUDED.size,
+        pnl = EXCLUDED.pnl,
+        currency = EXCLUDED.currency,
+        raw_json = EXCLUDED.raw_json,
+        updated_at = NOW()
+    """
+    params = []
+    for r in rows:
+        params.append((
+            r.get("id"), r.get("deal_id"), r.get("deal_reference"), r.get("source_type"),
+            r.get("environment"), r.get("epic"), r.get("asset"), r.get("instrument_name"),
+            r.get("direction"), r.get("status"), r.get("opened_at"), r.get("closed_at"),
+            r.get("entry_price"), r.get("exit_price"), r.get("size"), r.get("pnl"),
+            r.get("currency"), json.dumps(sanitize_for_json(r.get("raw_json") or {}), allow_nan=False),
+        ))
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.executemany(sql, params)
+        conn.close()
+        return len(rows)
+    except Exception as exc:
+        print(f"[CapitalSync] Upsert failed for {len(rows)} row(s): {exc}")
+        return 0
+
+
+def rebuild_capital_trade_comparisons(limit: int = 500) -> int:
+    """Match actual Capital.com executions to nearest BENZINO simulated signal.
+
+    Matching is intentionally conservative: same asset, same BUY/SELL direction,
+    and nearest signal created before/around the actual open time. The user can
+    then inspect entry/exit drift in the app.
+    """
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM capital_trade_comparisons WHERE COALESCE(auto_trade, FALSE) = FALSE")
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM capital_executed_trades
+                    WHERE opened_at IS NOT NULL
+                      AND UPPER(TRIM(COALESCE(direction,''))) IN ('BUY','SELL')
+                    ORDER BY opened_at DESC
+                    LIMIT %s
+                    """,
+                    (int(limit),),
+                )
+                actual_rows = [dict(r) for r in cur.fetchall()]
+                inserted = 0
+                for actual in actual_rows:
+                    cur.execute(
+                        """
+                        SELECT signal_id, asset, signal, entry, exit_price, r_multiple,
+                               status, exit_reason, created_at, candle_close
+                        FROM scanner_signals
+                        WHERE asset = %s
+                          AND UPPER(TRIM(COALESCE(signal,''))) = %s
+                          AND UPPER(TRIM(COALESCE(grade,''))) IN ('A+','A','B','C')
+                          AND created_at BETWEEN %s::timestamptz - (%s::int * INTERVAL '1 hour')
+                                             AND %s::timestamptz + (%s::int * INTERVAL '1 hour')
+                        ORDER BY ABS(EXTRACT(EPOCH FROM (created_at - %s::timestamptz))) ASC
+                        LIMIT 1
+                        """,
+                        (
+                            actual.get("asset"), actual.get("direction"), actual.get("opened_at"), CAPITAL_MATCH_WINDOW_HOURS,
+                            actual.get("opened_at"), CAPITAL_MATCH_WINDOW_HOURS, actual.get("opened_at"),
+                        ),
+                    )
+                    sim = cur.fetchone()
+                    if not sim:
+                        continue
+                    sim = dict(sim)
+                    actual_entry = _parse_float_or_none(actual.get("entry_price"))
+                    simulated_entry = _parse_float_or_none(sim.get("entry"))
+                    actual_exit = _parse_float_or_none(actual.get("exit_price"))
+                    simulated_exit = _parse_float_or_none(sim.get("exit_price"))
+                    entry_diff = (actual_entry - simulated_entry) if actual_entry is not None and simulated_entry is not None else None
+                    exit_diff = (actual_exit - simulated_exit) if actual_exit is not None and simulated_exit is not None else None
+                    if entry_diff is None:
+                        quality = "MATCHED_NO_ENTRY"
+                    else:
+                        basis = max(abs(simulated_entry or 0), 1.0)
+                        drift_pct = abs(entry_diff) / basis * 100
+                        quality = "TIGHT" if drift_pct <= 0.05 else "OK" if drift_pct <= 0.25 else "WIDE"
+                    comp_id = f"{actual.get('id')}::{sim.get('signal_id')}"
+                    cur.execute(
+                        """
+                        INSERT INTO capital_trade_comparisons (
+                            id, capital_trade_id, signal_id, asset, direction,
+                            simulated_entry, actual_entry, entry_diff,
+                            simulated_exit, actual_exit, exit_diff,
+                            simulated_r, actual_pnl, simulated_outcome, actual_status,
+                            match_quality, opened_at, updated_at
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                        ON CONFLICT (id) DO NOTHING
+                        """,
+                        (
+                            comp_id, actual.get("id"), sim.get("signal_id"), actual.get("asset"), actual.get("direction"),
+                            simulated_entry, actual_entry, entry_diff, simulated_exit, actual_exit, exit_diff,
+                            _parse_float_or_none(sim.get("r_multiple")), _parse_float_or_none(actual.get("pnl")),
+                            sim.get("status") or sim.get("exit_reason"), actual.get("status"), quality, actual.get("opened_at"),
+                        ),
+                    )
+                    inserted += 1
+        conn.close()
+        if inserted:
+            print(f"[CapitalCompare] Matched {inserted} actual execution(s) to simulated BENZINO signal(s).")
+        return inserted
+    except Exception as exc:
+        print(f"[CapitalCompare] Rebuild failed: {exc}")
+        return 0
+
+
+def capital_auto_order_exists(signal_id: str) -> bool:
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM capital_auto_orders WHERE signal_id = %s LIMIT 1", (signal_id,))
+            row = cur.fetchone()
+        conn.close()
+        return row is not None
+    except Exception as exc:
+        print(f"[CapitalAuto] order existence check failed: {exc}")
+        return True
+
+
+
+def _safe_float_setting(settings: dict, keys: list[str], default: float) -> float:
+    for key in keys:
+        try:
+            value = settings.get(key, None)
+            if value not in (None, ""):
+                return float(value)
+        except Exception:
+            continue
+    return float(default)
+
+
+def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
+    """Resolve the user settings that should size this auto-trade.
+
+    The scanner generates one master signal row, but execution should use the
+    user's own dashboard settings. Selection logic:
+      1. If CAPITAL_AUTO_TRADE_OWNER is set, use that username.
+      2. Otherwise, use the first user whose watchlist contains the asset and
+         whose preferred timeframe matches the signal timeframe.
+      3. If no user settings are found, fall back to ACCOUNT_SIZE/RISK_PER_TRADE.
+    """
+    asset = str(getattr(sig, "asset", "") or "").strip().upper()
+    timeframe = _normalize_timeframe(getattr(sig, "timeframe", "") or DEFAULT_USER_TIMEFRAME)
+    owner_filter = str(CAPITAL_AUTO_TRADE_OWNER or "").strip().lower()
+    fallback = {
+        "username": owner_filter or SCAN_OWNER,
+        "account_size": float(ACCOUNT_SIZE),
+        "risk_pct": float(RISK_PER_TRADE) * 100.0,
+        "leverage": float(LEVERAGE),
+        "source": "scanner_fallback",
+    }
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            if owner_filter:
+                cur.execute(
+                    """
+                    SELECT us.username, us.settings_json
+                    FROM user_settings us
+                    WHERE LOWER(us.username) = %s
+                    LIMIT 1
+                    """,
+                    (owner_filter,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT us.username, us.settings_json
+                    FROM user_settings us
+                    JOIN user_watchlists uw
+                      ON uw.scan_owner = us.username
+                     AND uw.enabled = TRUE
+                     AND UPPER(uw.asset) = %s
+                    ORDER BY us.updated_at DESC NULLS LAST, us.username ASC
+                    """,
+                    (asset,),
+                )
+            rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    except Exception as exc:
+        print(f"[CapitalAuto] Could not load user sizing settings; using fallback: {exc}")
+        return fallback
+
+    for row in rows:
+        try:
+            settings = json.loads(row.get("settings_json") or "{}")
+            if not isinstance(settings, dict):
+                settings = {}
+        except Exception:
+            settings = {}
+        allowed_tfs = _extract_timeframes_from_settings(settings)
+        if timeframe not in allowed_tfs:
+            continue
+        account_size = _safe_float_setting(settings, ["account_size", "account_balance", "starting_balance"], ACCOUNT_SIZE)
+        # In app.py risk_pct is stored as a percent, e.g. 1.0 means 1%.
+        risk_pct = _safe_float_setting(settings, ["risk_pct", "risk_per_trade_pct"], float(RISK_PER_TRADE) * 100.0)
+        leverage = _safe_float_setting(settings, ["leverage"], LEVERAGE)
+        return {
+            "username": str(row.get("username") or fallback["username"]),
+            "account_size": max(0.0, float(account_size)),
+            "risk_pct": max(0.0, float(risk_pct)),
+            "leverage": max(1.0, float(leverage)),
+            "source": "user_settings",
+        }
+    return fallback
+
+
+def calculate_capital_position_size(sig: ScanResult, sizing: dict) -> float:
+    """Calculate Capital.com order size from the user's risk settings.
+
+    Position size is derived from the same risk model used by the simulator:
+      risk_cash = user account size × user risk %
+      size      = risk_cash / absolute entry-to-stop distance
+
+    Capital.com instruments have their own min/max increments, so optional env
+    caps are applied defensively. If a broker rejects the size, the order is
+    logged as rejected and the simulator remains untouched.
+    """
+    try:
+        entry = float(sig.entry)
+        sl = float(sig.sl)
+        stop_distance = abs(entry - sl)
+        if stop_distance <= 0:
+            return 0.0
+        account_size = float(sizing.get("account_size") or ACCOUNT_SIZE)
+        risk_pct = float(sizing.get("risk_pct") or (RISK_PER_TRADE * 100.0))
+        risk_cash = account_size * (risk_pct / 100.0)
+        size = risk_cash / stop_distance
+        size = max(float(CAPITAL_AUTO_TRADE_MIN_SIZE), float(size))
+        if CAPITAL_AUTO_TRADE_MAX_SIZE and CAPITAL_AUTO_TRADE_MAX_SIZE > 0:
+            size = min(float(CAPITAL_AUTO_TRADE_MAX_SIZE), size)
+        return round(float(size), 4)
+    except Exception:
+        return 0.0
+
+
+def record_capital_auto_order(sig: ScanResult, *, status: str, deal_reference: str = "", deal_id: str = "", epic: str = "", size: float = 0.0, error: str = "", raw: dict | None = None) -> None:
+    sql = """
+    INSERT INTO capital_auto_orders(
+        signal_id, deal_reference, deal_id, scan_owner, environment, asset, timeframe,
+        direction, grade, epic, size, entry, sl, tp, status, error, raw_json, updated_at
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+    ON CONFLICT (signal_id) DO UPDATE SET
+        deal_reference = COALESCE(NULLIF(EXCLUDED.deal_reference,''), capital_auto_orders.deal_reference),
+        deal_id = COALESCE(NULLIF(EXCLUDED.deal_id,''), capital_auto_orders.deal_id),
+        status = EXCLUDED.status,
+        error = EXCLUDED.error,
+        raw_json = EXCLUDED.raw_json,
+        updated_at = NOW()
+    """
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (
+                    sig.signal_id, deal_reference, deal_id, SCAN_OWNER, "demo" if CAPITAL_DEMO else "live",
+                    sig.asset, sig.timeframe, sig.signal, sig.grade, epic, float(size or 0),
+                    float(sig.entry), float(sig.sl), float(sig.tp), status, error,
+                    json.dumps(sanitize_for_json(raw or {}), allow_nan=False),
+                ))
+        conn.close()
+    except Exception as exc:
+        print(f"[CapitalAuto] failed to record order for {sig.asset}: {exc}")
+
+
+def capital_confirm_deal(deal_reference: str) -> dict | None:
+    deal_reference = str(deal_reference or "").strip()
+    if not deal_reference:
+        return None
+    return capital_request("GET", f"/confirms/{deal_reference}", retries=3)
+
+
+def place_capital_auto_trade(sig: ScanResult) -> bool:
+    """Place a Capital.com demo trade for one newly accepted BENZINO signal.
+
+    This is intentionally opt-in via CAPITAL_AUTO_TRADE_ENABLED. Matching becomes
+    perfect because the originating BENZINO signal_id is stored in
+    capital_auto_orders at order time. We do not use entry/exit drift metrics for
+    these trades; the research question becomes simulated R vs actual P/L/R.
+    """
+    grade = str(sig.grade or "").strip().upper()
+    direction = str(sig.signal or "").strip().upper()
+    timeframe = str(sig.timeframe or "").strip().lower()
+    if not CAPITAL_AUTO_TRADE_ENABLED:
+        return False
+    if CAPITAL_AUTO_TRADE_REQUIRE_DEMO and not CAPITAL_DEMO:
+        print(f"[CapitalAuto] Refusing to auto-trade {sig.asset}: CAPITAL_DEMO is false.")
+        return False
+    if not capital_configured():
+        print(f"[CapitalAuto] Capital credentials missing — cannot auto-trade {sig.asset}.")
+        return False
+    if grade not in CAPITAL_AUTO_TRADE_GRADES or direction not in {"BUY", "SELL"} or timeframe not in CAPITAL_AUTO_TRADE_TIMEFRAMES:
+        return False
+    if capital_auto_order_exists(sig.signal_id):
+        return False
+
+    epic = capital_resolve_epic(sig.asset)
+    if not epic:
+        record_capital_auto_order(sig, status="FAILED", error="No Capital.com epic resolved")
+        print(f"[CapitalAuto] {sig.asset}: no Capital.com epic resolved; order skipped.")
+        return False
+
+    sizing = load_auto_trade_user_settings_for_signal(sig)
+    trade_size = calculate_capital_position_size(sig, sizing)
+    if trade_size <= 0:
+        record_capital_auto_order(sig, status="FAILED", epic=epic, size=0, error="Dynamic size calculation returned 0", raw={"sizing": sizing})
+        print(f"[CapitalAuto] {sig.asset} {timeframe}: size calculation failed; order skipped.")
+        return False
+
+    payload = {
+        "epic": epic,
+        "direction": direction,
+        "size": float(trade_size),
+        "guaranteedStop": False,
+    }
+    if CAPITAL_AUTO_TRADE_USE_STOPS:
+        payload["stopLevel"] = float(sig.sl)
+        payload["profitLevel"] = float(sig.tp)
+
+    response = capital_request("POST", "/positions", json_body=payload, retries=2)
+    if not isinstance(response, dict):
+        record_capital_auto_order(sig, status="FAILED", epic=epic, size=trade_size, error="POST /positions failed", raw={"payload": payload, "sizing": sizing})
+        print(f"[CapitalAuto] {sig.asset} {direction}: order failed.")
+        return False
+
+    deal_reference = str(response.get("dealReference") or response.get("reference") or "")
+    confirm = capital_confirm_deal(deal_reference) if deal_reference else None
+    confirm_status = str(_first_value(confirm or {}, ["dealStatus", "status"], "") or "").upper()
+    deal_id = str(_first_value(confirm or {}, ["dealId", "dealID"], "") or "")
+    ok = bool(deal_reference) and (not confirm_status or confirm_status in {"ACCEPTED", "OPEN", "SUCCESS", "CONFIRMED"})
+    status = "OPENED" if ok else "REJECTED"
+    error = "" if ok else f"Capital confirmation status: {confirm_status or 'unknown'}"
+    record_capital_auto_order(sig, status=status, deal_reference=deal_reference, deal_id=deal_id, epic=epic, size=trade_size, error=error, raw={"payload": payload, "sizing": sizing, "response": response, "confirm": confirm or {}})
+    user_label = str(sizing.get("username") or SCAN_OWNER)
+    if ok:
+        print(f"[CapitalAuto] {sig.asset} {timeframe} {direction} {grade}: demo trade opened for {user_label} · size {trade_size} · ref {deal_reference}.")
+    else:
+        print(f"[CapitalAuto] {sig.asset} {timeframe} {direction} {grade}: order not accepted · {error}.")
+    return ok
+
+
+def rebuild_capital_auto_comparisons(limit: int = 500) -> int:
+    """Build comparison rows for auto-traded signals using stored signal_id links."""
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT ao.*, ss.exit_price AS simulated_exit, ss.r_multiple AS simulated_r,
+                           ss.status AS simulated_outcome, ss.exit_reason, ss.created_at AS signal_created_at
+                    FROM capital_auto_orders ao
+                    LEFT JOIN scanner_signals ss ON ss.signal_id = ao.signal_id
+                    WHERE ao.status IN ('OPENED','CLOSED','ACCEPTED')
+                    ORDER BY ao.created_at DESC
+                    LIMIT %s
+                    """,
+                    (int(limit),),
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+                inserted = 0
+                for row in rows:
+                    # Try to locate the latest imported actual row by deal id/reference.
+                    actual = None
+                    if row.get("deal_id") or row.get("deal_reference"):
+                        cur.execute(
+                            """
+                            SELECT * FROM capital_executed_trades
+                            WHERE (deal_id = %s AND %s <> '') OR (deal_reference = %s AND %s <> '')
+                            ORDER BY updated_at DESC
+                            LIMIT 1
+                            """,
+                            (row.get("deal_id") or "", row.get("deal_id") or "", row.get("deal_reference") or "", row.get("deal_reference") or ""),
+                        )
+                        actual = cur.fetchone()
+                    actual = dict(actual) if actual else {}
+                    comp_id = f"AUTO::{row.get('signal_id')}"
+                    actual_r = None
+                    try:
+                        entry = float(row.get("entry") or 0)
+                        sl = float(row.get("sl") or 0)
+                        pnl_exit = _parse_float_or_none(actual.get("exit_price"))
+                        if pnl_exit is not None and abs(entry - sl) > 0:
+                            actual_r = r_multiple_for_exit(str(row.get("direction")), entry, sl, pnl_exit, "ACTUAL")
+                    except Exception:
+                        actual_r = None
+                    cur.execute(
+                        """
+                        INSERT INTO capital_trade_comparisons(
+                            id, capital_trade_id, signal_id, asset, direction,
+                            simulated_entry, actual_entry, simulated_exit, actual_exit,
+                            simulated_r, actual_r, actual_pnl, simulated_outcome, actual_status,
+                            match_quality, opened_at, auto_trade, updated_at
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,NOW())
+                        ON CONFLICT (id) DO UPDATE SET
+                            capital_trade_id = EXCLUDED.capital_trade_id,
+                            actual_entry = EXCLUDED.actual_entry,
+                            actual_exit = EXCLUDED.actual_exit,
+                            simulated_r = EXCLUDED.simulated_r,
+                            actual_r = EXCLUDED.actual_r,
+                            actual_pnl = EXCLUDED.actual_pnl,
+                            simulated_outcome = EXCLUDED.simulated_outcome,
+                            actual_status = EXCLUDED.actual_status,
+                            match_quality = EXCLUDED.match_quality,
+                            updated_at = NOW()
+                        """,
+                        (
+                            comp_id, actual.get("id"), row.get("signal_id"), row.get("asset"), row.get("direction"),
+                            _parse_float_or_none(row.get("entry")), _parse_float_or_none(actual.get("entry_price")) or _parse_float_or_none(row.get("entry")),
+                            _parse_float_or_none(row.get("simulated_exit")), _parse_float_or_none(actual.get("exit_price")),
+                            _parse_float_or_none(row.get("simulated_r")), actual_r, _parse_float_or_none(actual.get("pnl")),
+                            row.get("simulated_outcome") or row.get("exit_reason"), actual.get("status") or row.get("status"),
+                            "AUTO_MATCHED", actual.get("opened_at") or row.get("created_at"),
+                        ),
+                    )
+                    inserted += 1
+        conn.close()
+        if inserted:
+            print(f"[CapitalCompare] Updated {inserted} auto-trade comparison row(s).")
+        return inserted
+    except Exception as exc:
+        print(f"[CapitalCompare] Auto comparison rebuild failed: {exc}")
+        return 0
+
+
+def sync_capital_actual_executions() -> int:
+    """Read Capital.com open positions/history into Supabase for comparison."""
+    if not CAPITAL_SYNC_EXECUTIONS:
+        return 0
+    if not capital_configured():
+        print("[CapitalSync] Capital.com credentials not configured — skipping actual execution sync.")
+        return 0
+    rows: list[dict] = []
+    for pos in capital_fetch_open_positions():
+        normalised = normalise_capital_position(pos)
+        if normalised:
+            rows.append(normalised)
+    for activity in capital_fetch_activity_history():
+        normalised = normalise_capital_activity(activity)
+        if normalised:
+            rows.append(normalised)
+    saved = upsert_capital_executed_trades(rows)
+    compared = rebuild_capital_trade_comparisons()
+    auto_compared = rebuild_capital_auto_comparisons()
+    print(f"[CapitalSync] Saved {saved} actual execution row(s); manual comparisons rebuilt: {compared}; auto comparisons updated: {auto_compared}.")
+    return saved
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MAIN SCAN LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2795,6 +3943,8 @@ def run_scan() -> None:
 
     _TF_CACHE.clear()
     init_tables()
+    if LOCK_HISTORICAL_SIGNAL_PLANS:
+        print("[Replay1mBackfill] Historical signal plans locked: entry/sl/tp are preserved; only outcomes are updated.")
     force_open_graded_setups()
 
     # 1. Resolve outcomes for everything already open BEFORE scanning for new setups.
@@ -2802,6 +3952,7 @@ def run_scan() -> None:
     evaluate_shadow_trades(assets=set(scan_assets.keys()), timeframes=None)
     if REPLAY_EXISTING_OUTCOMES:
         replay_existing_resolved_outcomes()
+    sync_capital_actual_executions()
 
     journaled, alerted, shadowed = 0, 0, 0
     assets_scanned = 0
@@ -2838,6 +3989,7 @@ def run_scan() -> None:
             journaled += 1
             if saved:
                 print(f"  [{asset} {tf}] Stored as OPEN journal trade. Telegram is optional only.")
+                place_capital_auto_trade(result)
 
             if not telegram_configured():
                 print(f"  [{asset} {tf}] Telegram not configured — optional alert skipped.")
@@ -2874,6 +4026,7 @@ def run_scan() -> None:
             asset_seconds.append(time.perf_counter() - asset_start)
 
     force_open_graded_setups()
+    sync_capital_actual_executions()
     state = load_prop_firm_state()
     finished = datetime.now(timezone.utc)
     elapsed = (finished - started).total_seconds()
