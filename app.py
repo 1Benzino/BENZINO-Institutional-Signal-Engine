@@ -3471,7 +3471,8 @@ def apply_theme() -> None:
     .metric-label { color:#8BAAB8; font-size:var(--font-card-title); font-weight:800; text-transform:uppercase; letter-spacing:.5px; }
     .metric-value { color:#E8EDF2; font-size:var(--font-kpi-value); font-weight:950; margin-top:4px; line-height:1.15; overflow-wrap:anywhere; }
     .soft-card { background:#0F2235; border:1px solid #1E3050; border-radius:18px; padding:20px; margin:16px 0; line-height:1.55; }
-    .ai-card { background:linear-gradient(180deg,#10283D 0%,#0F2235 100%); border:1px solid #244363; border-radius:18px; padding:24px 28px; margin:16px 0 24px; line-height:1.72; font-size:clamp(17px,1.05vw,21px); font-weight:750; }
+    .ai-card { background:linear-gradient(180deg,#10283D 0%,#0F2235 100%); border:1px solid #244363; border-radius:18px; padding:24px 28px; margin:16px 0 24px; line-height:1.72; font-size:clamp(17px,1.05vw,21px); font-weight:500; color:#E8EDF2; }
+    .ai-card b, .ai-card strong { font-weight:800; }
     .green { color:#00D4A3; }
     .red { color:#FF5D5D; }
     .muted { color:#8BAAB8; }
@@ -4331,6 +4332,13 @@ def workflow_commentary_header(title: str, body: str) -> None:
     title = html.escape(str(title or ""))
     body = str(body or "")
     st.markdown(f"<div class='workflow-section-title'>{title}</div>", unsafe_allow_html=True)
+    if body.strip():
+        st.markdown(f"<div class='page-commentary'>{body}</div>", unsafe_allow_html=True)
+
+
+def workflow_commentary(body: str) -> None:
+    """Workflow tab commentary without repeating the selected tab title."""
+    body = str(body or "")
     if body.strip():
         st.markdown(f"<div class='page-commentary'>{body}</div>", unsafe_allow_html=True)
 
@@ -5486,13 +5494,10 @@ def render_workflow(username: str, settings: dict) -> None:
     open_trades = trades[trades["status"].astype(str).str.upper().eq("OPEN")]
     closed_trades = trades[trades["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])]
 
-    t1, t2, t3, t_cap, t4, t5, t6 = st.tabs(["User Journal", "System Performance", "Prop Firm", "Capital", "No Trade Tracker", "Coach AI", "Explain AI"])
+    t1, t2, t3, t_cap, t4, t5, t6 = st.tabs(["User Journal", "System Performance", "Prop Firm", "Capital.com", "No Trade Tracker", "Coach AI", "Explain AI"])
 
     with t1:
-        workflow_commentary_header(
-            "User Journal",
-            "This view shows the logged-in user's watchlist-scoped journal trades for the selected timeframe. Open, closed, and resolved outcomes update from Supabase as the scanner evaluates TP, SL, and expiry.",
-        )
+        workflow_commentary("This view shows the logged-in user's watchlist-scoped journal trades for the selected timeframe. Open, closed, and resolved outcomes update from Supabase as the scanner evaluates TP, SL, and expiry.")
         c1, c2, c3, c4 = st.columns(4)
         resolved = closed_resolved_trades(closed_trades)
         won_trades = int(resolved_outcome_masks(closed_trades)[0].sum()) if not closed_trades.empty else 0
@@ -5632,10 +5637,7 @@ def render_workflow(username: str, settings: dict) -> None:
             prop_start_map = {}
         prop_started_at_raw = str(settings.get("tracking_started_at", "") or "")
 
-        workflow_commentary_header(
-            "Prop Firm Challenge",
-            f"This view recalculates the FTMO-style challenge from your current watchlist and selected timeframe <b>({html.escape(str(challenge_tf))})</b>. It uses only <b>A+/A closed trades</b>, a fixed <b>&#36;10,000</b> account, <b>1% risk per trade</b>, a <b>&#36;1,000 Phase 1 target</b>, a <b>&#36;500 Phase 2 target</b>, a <b>5% max daily loss</b>, and a <b>10% max total loss</b>. Completed cycles are rebuilt from Supabase on every load.",
-        )
+        workflow_commentary(f"This view recalculates the FTMO-style challenge from your current watchlist and selected timeframe <b>({html.escape(str(challenge_tf))})</b>. It uses only <b>A+/A closed trades</b>, a fixed <b>&#36;10,000</b> account, <b>1% risk per trade</b>, a <b>&#36;1,000 Phase 1 target</b>, a <b>&#36;500 Phase 2 target</b>, a <b>5% max daily loss</b>, and a <b>10% max total loss</b>. Completed cycles are rebuilt from Supabase on every load.")
 
         prop_source = trades[
             trades.get("grade", pd.Series(dtype=str)).astype(str).isin(["A+", "A"])
@@ -6467,10 +6469,7 @@ def render_workflow(username: str, settings: dict) -> None:
             st.info("No completed prop-firm challenges have been archived yet. Passed or failed attempts will appear here automatically.")
 
     with t_cap:
-        workflow_commentary_header(
-            "Capital.com",
-            "Activation stays under Settings. This page shows Capital auto-trade execution, simulated-vs-actual comparison, and imported broker rows for the logged-in user's visible data.",
-        )
+        workflow_commentary("Activation stays under Settings. This page shows Capital auto-trade execution, simulated-vs-actual comparison, and imported broker rows for the logged-in user's visible data.")
 
         cap_comp = load_capital_trade_comparisons(limit=APP_TABLE_MAX_ROWS)
         cap_raw = load_capital_executed_trades(limit=APP_TABLE_MAX_ROWS)
@@ -6549,7 +6548,7 @@ def render_workflow(username: str, settings: dict) -> None:
 
 
     with t4:
-        st.caption("All signals the scanner blocked from being journaled as real trades. Includes two types: (1) directional ideas (BUY/SELL) where the grade was too weak or R:R too thin — these are hypothetically tracked against TP/SL/expiry to see if they'd have worked. (2) HOLD rows where the systems genuinely split with no directional consensus — these have no hypothetical outcome since there's no entry thesis, but they're recorded so you can see how often the scanner truly sees no edge.")
+        workflow_commentary("All signals the scanner blocked from being journaled as real trades. Includes two types: (1) directional ideas (BUY/SELL) where the grade was too weak or R:R too thin — these are hypothetically tracked against TP/SL/expiry to see if they'd have worked. (2) HOLD rows where the systems genuinely split with no directional consensus — these have no hypothetical outcome since there's no entry thesis, but they're recorded so you can see how often the scanner truly sees no edge.")
         no_trades_directional = no_trades[no_trades["signal"].astype(str).str.upper().isin(["BUY", "SELL"])].copy() if not no_trades.empty else pd.DataFrame()
         no_trades_hold = no_trades[no_trades["signal"].astype(str).str.upper().eq("HOLD")].copy() if not no_trades.empty else pd.DataFrame()
         # Count every resolved shadow row, including legacy HOLD rows that the
@@ -6703,10 +6702,7 @@ def render_workflow(username: str, settings: dict) -> None:
         )
 
     with t5:
-        workflow_commentary_header(
-            "Coach AI",
-            "Coach AI reviews your journal patterns and turns trade history into practical behaviour, risk, and execution guidance. The guidance is split between prop-firm discipline and broader user-journal improvement.",
-        )
+        workflow_commentary("Coach AI reviews your journal patterns and turns trade history into practical behaviour, risk, and execution guidance. The guidance is split between prop-firm discipline and broader user-journal improvement.")
         prop_state = load_prop_firm_state()
         prop_status = str(prop_state.get("status") or "ACTIVE").upper()
 
@@ -6811,10 +6807,7 @@ def render_workflow(username: str, settings: dict) -> None:
         render_ai_card("User Journal Coaching", "\n\n".join(journal_parts))
 
     with t6:
-        workflow_commentary_header(
-            "Explain AI",
-            "Closed outcomes are the main lesson source. Select a trade from the table to open its full Explain AI lesson. Lessons are saved in the explain_ai_lessons table.",
-        )
+        workflow_commentary("Closed outcomes are the main lesson source. Select a trade from the table to open its full Explain AI lesson. Lessons are saved in the explain_ai_lessons table.")
 
         if closed_trades.empty:
             st.info("No closed trades yet. Explain AI will populate once TP, SL, or expiry outcomes are recorded.")
