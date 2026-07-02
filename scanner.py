@@ -57,6 +57,61 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 
+
+def load_local_env_file() -> None:
+    """Load local .env values before scanner configuration is read.
+
+    GitHub Actions already provides environment variables from secrets, so this
+    only fills missing values when running `python3 scanner.py` locally. It first
+    tries python-dotenv, then falls back to a small built-in .env parser so the
+    scanner still works even if python-dotenv is not installed.
+    """
+    env_paths = []
+    try:
+        env_paths.append(os.path.join(os.getcwd(), ".env"))
+    except Exception:
+        pass
+    try:
+        env_paths.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+    except Exception:
+        pass
+
+    # De-duplicate while preserving order.
+    seen = set()
+    env_paths = [p for p in env_paths if p and not (p in seen or seen.add(p))]
+
+    loaded_any = False
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        for env_path in env_paths:
+            if os.path.exists(env_path):
+                load_dotenv(env_path, override=False)
+                loaded_any = True
+    except Exception:
+        for env_path in env_paths:
+            if not os.path.exists(env_path):
+                continue
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for raw_line in f:
+                        line = raw_line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        key, value = line.split("=", 1)
+                        key = key.strip()
+                        value = value.strip().strip('"').strip("'")
+                        if key and key not in os.environ:
+                            os.environ[key] = value
+                loaded_any = True
+            except Exception:
+                continue
+
+    if loaded_any:
+        print("[ENV] Loaded local .env values for scanner run.")
+
+
+load_local_env_file()
+
 try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
@@ -305,8 +360,8 @@ WATCHLIST = MASTER_WATCHLIST
 # so 4h is built by resampling 60m data. The scanner creates a separate signal row for
 # each asset + timeframe + signal + candle_close.
 TIMEFRAME_CONFIGS = {
-    "15m": {"interval": "15m", "period": "60d",  "expiry_bars": 48},
-    "1h":  {"interval": "60m", "period": "730d", "expiry_bars": 72},
+    "15m": {"interval": "15m", "period": "60d",  "expiry_bars": 56},
+    "1h":  {"interval": "60m", "period": "730d", "expiry_bars": 56},
     "4h":  {"interval": "60m", "period": "730d", "resample": "4h", "expiry_bars": 42},
     "1d":  {"interval": "1d",  "period": "5y",   "expiry_bars": 20},
 }
@@ -441,7 +496,7 @@ MIN_ALERT_CONFIDENCE_DIST = float(os.environ.get("MIN_ALERT_CONFIDENCE_DIST", "1
 
 ATR_SL_MULT = 1.5
 ATR_TP_MULT = 3.0
-EXPIRY_BARS = 48          # auto-expire an open trade after 48 entry-timeframe bars (~12h on 15m)
+EXPIRY_BARS = 56          # fallback auto-expiry if a timeframe has no explicit expiry_bars
 
 # FTMO-style challenge rules — mirrors app.py's Challenge Mode panel
 CHALLENGE_PROFIT_TARGET    = 0.10
@@ -450,6 +505,15 @@ CHALLENGE_MAX_TOTAL_LOSS   = 0.10
 CHALLENGE_MIN_TRADING_DAYS = 4
 
 GRADE_RANK = {"A+": 4, "A": 3, "B": 2, "C": 1, "NO TRADE": 0}
+
+# One-off / safety replay controls.
+# When true, the scanner replays existing resolved Supabase outcomes using the
+# new 1-minute replay engine where Yahoo 1m data is available, falling back to
+# the stored signal timeframe when it is not. This lets you improve current
+# Supabase TP/SL/expiry data without restarting the test.
+REPLAY_EXISTING_OUTCOMES = os.environ.get("REPLAY_EXISTING_OUTCOMES", "true").strip().lower() in {"1", "true", "yes", "y"}
+REPLAY_EXISTING_OUTCOMES_DAYS = int(os.environ.get("REPLAY_EXISTING_OUTCOMES_DAYS", "30"))
+REPLAY_EXISTING_OUTCOMES_LIMIT = int(os.environ.get("REPLAY_EXISTING_OUTCOMES_LIMIT", "5000"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1195,6 +1259,171 @@ def get_timeframe_df(ticker: str, timeframe: str) -> pd.DataFrame | None:
     _TF_CACHE[key] = base.copy() if base is not None else None
     return base.copy() if base is not None else None
 
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  1-MINUTE TRADE REPLAY ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_TIMEFRAME_MINUTES = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+_MINUTE_REPLAY_CACHE: dict[str, pd.DataFrame | None] = {}
+
+
+def get_minute_replay_df(ticker: str) -> pd.DataFrame | None:
+    """Download/cache recent 1-minute candles for execution replay.
+
+    Yahoo normally exposes 1-minute data only for recent history. When this data
+    is available, TP/SL ordering is evaluated minute-by-minute instead of using
+    the wider signal timeframe candle. If 1-minute data is unavailable for an
+    older row or a symbol, the scanner falls back to the original timeframe
+    candles rather than leaving trades unresolved.
+    """
+    ticker = str(ticker or "").strip()
+    if not ticker:
+        return None
+    if ticker in _MINUTE_REPLAY_CACHE:
+        cached = _MINUTE_REPLAY_CACHE[ticker]
+        return cached.copy() if cached is not None else None
+    try:
+        df = yf.download(ticker, interval="1m", period="7d", auto_adjust=True, progress=False)
+        if df is None or df.empty:
+            _MINUTE_REPLAY_CACHE[ticker] = None
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.reset_index()
+        df.columns = [str(c) for c in df.columns]
+        date_col = df.columns[0]
+        df[date_col] = pd.to_datetime(df[date_col], utc=True, errors="coerce")
+        df = df.dropna(subset=[date_col]).rename(columns={date_col: "Date"})
+        needed = {"Date", "Open", "High", "Low", "Close"}
+        if not needed.issubset(set(df.columns)):
+            _MINUTE_REPLAY_CACHE[ticker] = None
+            return None
+        df = df.sort_values("Date").reset_index(drop=True)
+        _MINUTE_REPLAY_CACHE[ticker] = df.copy()
+        return df.copy()
+    except Exception as exc:
+        print(f"[Replay1m] {ticker}: 1-minute download failed: {exc}")
+        _MINUTE_REPLAY_CACHE[ticker] = None
+        return None
+
+
+def _row_time(row: dict, key: str):
+    try:
+        ts = pd.to_datetime(row.get(key), errors="coerce", utc=True)
+        return None if pd.isna(ts) else ts
+    except Exception:
+        return None
+
+
+def trade_entry_time(row: dict):
+    """Use candle_close as the trade start when available; otherwise created_at."""
+    return _row_time(row, "candle_close") or _row_time(row, "created_at") or pd.Timestamp.now(tz="UTC")
+
+
+def replay_hit_from_bar(signal: str, high: float, low: float, sl: float, tp: float) -> tuple[bool, bool]:
+    signal = str(signal or "").upper()
+    if signal == "BUY":
+        return bool(low <= sl), bool(high >= tp)
+    return bool(high >= sl), bool(low <= tp)
+
+
+def r_multiple_for_exit(signal: str, entry: float, sl: float, exit_price: float, outcome: str) -> float:
+    risk = abs(float(entry) - float(sl))
+    if risk <= 0:
+        return 0.0
+    if str(outcome).upper().endswith("SL") or str(outcome).upper() == "SL":
+        return -1.0
+    if str(signal).upper() == "BUY":
+        return (float(exit_price) - float(entry)) / risk
+    return (float(entry) - float(exit_price)) / risk
+
+
+def replay_trade_outcome(row: dict, *, use_minute: bool = True) -> dict | None:
+    """Return the first TP/SL/expiry result for one trade row.
+
+    Result format:
+        {"reason": "TP"|"SL"|"EXPIRY", "price": float, "r": float,
+         "bars_open": int, "method": "1m"|"timeframe"}
+
+    1-minute replay is preferred because it greatly reduces ambiguous TP+SL
+    ordering inside a 15m/1h/4h candle. For rows older than Yahoo's 1-minute
+    retention window, the function falls back to the signal timeframe candles.
+    """
+    try:
+        ticker = str(row.get("ticker") or "").strip()
+        timeframe = str(row.get("timeframe") or "15m").strip().lower()
+        signal = str(row.get("signal") or "").strip().upper()
+        entry = float(row.get("entry"))
+        sl = float(row.get("sl"))
+        tp = float(row.get("tp"))
+        if signal not in ("BUY", "SELL") or entry <= 0 or abs(entry - sl) <= 0 or sl == tp:
+            return None
+    except Exception:
+        return None
+
+    entry_ts = trade_entry_time(row)
+    tf_minutes = int(_TIMEFRAME_MINUTES.get(timeframe, 15))
+    expiry_bars = int(TIMEFRAME_CONFIGS.get(timeframe, {}).get("expiry_bars", EXPIRY_BARS))
+    expiry_ts = entry_ts + pd.Timedelta(minutes=tf_minutes * expiry_bars)
+
+    # Preferred path: replay each 1-minute candle after entry until expiry.
+    if use_minute:
+        mdf = get_minute_replay_df(ticker)
+        if mdf is not None and not mdf.empty:
+            mdf = mdf.copy()
+            mdf["Date"] = pd.to_datetime(mdf["Date"], utc=True, errors="coerce")
+            mdf = mdf.dropna(subset=["Date"]).sort_values("Date")
+            replay = mdf[(mdf["Date"] > entry_ts) & (mdf["Date"] <= expiry_ts)]
+            for _, bar in replay.iterrows():
+                high, low = float(bar["High"]), float(bar["Low"])
+                hit_sl, hit_tp = replay_hit_from_bar(signal, high, low, sl, tp)
+                if hit_sl and hit_tp:
+                    return {"reason": "SL", "price": sl, "r": -1.0, "bars_open": max(1, int(math.ceil((bar["Date"] - entry_ts).total_seconds() / 60 / tf_minutes))), "method": "1m_ambiguous", "exit_time": bar["Date"]}
+                if hit_sl:
+                    return {"reason": "SL", "price": sl, "r": -1.0, "bars_open": max(1, int(math.ceil((bar["Date"] - entry_ts).total_seconds() / 60 / tf_minutes))), "method": "1m", "exit_time": bar["Date"]}
+                if hit_tp:
+                    r_mult = abs(tp - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0.0
+                    return {"reason": "TP", "price": tp, "r": r_mult, "bars_open": max(1, int(math.ceil((bar["Date"] - entry_ts).total_seconds() / 60 / tf_minutes))), "method": "1m", "exit_time": bar["Date"]}
+
+            latest_minute_time = mdf["Date"].max()
+            if pd.notna(latest_minute_time) and latest_minute_time >= expiry_ts:
+                expiry_bars_df = mdf[(mdf["Date"] > entry_ts) & (mdf["Date"] <= expiry_ts)]
+                last_price = float(expiry_bars_df["Close"].iloc[-1]) if not expiry_bars_df.empty else float(mdf["Close"].iloc[-1])
+                r_mult = r_multiple_for_exit(signal, entry, sl, last_price, "EXPIRY")
+                return {"reason": "EXPIRY", "price": last_price, "r": r_mult, "bars_open": expiry_bars, "method": "1m", "exit_time": expiry_ts}
+
+    # Fallback path for older rows or symbols without usable 1m data.
+    df = get_timeframe_df(ticker, timeframe)
+    if df is None or df.empty:
+        return None
+    df = df.copy()
+    df["Date"] = pd.to_datetime(df["Date"], utc=True, errors="coerce")
+    df = df.dropna(subset=["Date"]).sort_values("Date")
+    new_bars = df[df["Date"] > entry_ts]
+    if new_bars.empty:
+        return None
+
+    bars_open = 0
+    for _, bar in new_bars.iterrows():
+        bars_open += 1
+        high, low = float(bar["High"]), float(bar["Low"])
+        hit_sl, hit_tp = replay_hit_from_bar(signal, high, low, sl, tp)
+        if hit_sl and hit_tp:
+            return {"reason": "SL", "price": sl, "r": -1.0, "bars_open": bars_open, "method": "timeframe_ambiguous", "exit_time": bar["Date"]}
+        if hit_sl:
+            return {"reason": "SL", "price": sl, "r": -1.0, "bars_open": bars_open, "method": "timeframe", "exit_time": bar["Date"]}
+        if hit_tp:
+            r_mult = abs(tp - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0.0
+            return {"reason": "TP", "price": tp, "r": r_mult, "bars_open": bars_open, "method": "timeframe", "exit_time": bar["Date"]}
+        if bars_open >= expiry_bars:
+            last_price = float(bar["Close"])
+            r_mult = r_multiple_for_exit(signal, entry, sl, last_price, "EXPIRY")
+            return {"reason": "EXPIRY", "price": last_price, "r": r_mult, "bars_open": bars_open, "method": "timeframe", "exit_time": bar["Date"]}
+
+    return {"reason": "OPEN", "price": float(new_bars["Close"].iloc[-1]), "r": 0.0, "bars_open": bars_open, "method": "timeframe", "exit_time": new_bars["Date"].iloc[-1]}
 
 def trend_direction_from_df(df: pd.DataFrame | None) -> tuple[str, float]:
     """Return BULLISH/BEARISH/NEUTRAL plus a 0-1 trend strength estimate."""
@@ -2111,73 +2340,32 @@ def evaluate_open_trades(assets: set[str] | None = None, timeframes: set[str] | 
         print("[Evaluate] No open trades.")
         return
 
-    print(f"[Evaluate] Checking {len(open_trades)} open trade(s)...")
+    print(f"[Evaluate] Checking {len(open_trades)} open trade(s) with 1-minute replay where available...")
     for t in open_trades:
-        asset, ticker, timeframe = t["asset"], t["ticker"], t["timeframe"]
-        signal, entry, sl, tp = str(t["signal"]).upper(), float(t["entry"]), float(t["sl"]), float(t["tp"])
-        signal_id = t["signal_id"]
-        grade = t["grade"]
-
-        df = get_timeframe_df(ticker, timeframe)
-        if df is None:
+        asset = t.get("asset")
+        signal_id = t.get("signal_id")
+        grade = t.get("grade")
+        result = replay_trade_outcome(t, use_minute=True)
+        if not result:
             continue
 
-        created = pd.to_datetime(t["created_at"], utc=True)
-        df["Date"] = pd.to_datetime(df["Date"], utc=True)
-        new_bars = df[df["Date"] > created]
-        if new_bars.empty:
+        reason = result.get("reason")
+        bars_open = int(result.get("bars_open") or 0)
+        method = result.get("method", "unknown")
+        if reason == "OPEN":
+            if bars_open:
+                bump_bars_open(signal_id, bars_open)
             continue
 
-        bars_open = int(t.get("bars_open") or 0)
-        closed = False
+        exit_price = float(result.get("price") or 0.0)
+        r_mult = float(result.get("r") or 0.0)
+        close_trade(signal_id, exit_price, reason, r_mult)
+        update_prop_firm(signal_id, asset, grade, r_mult)
 
-        for _, bar in new_bars.iterrows():
-            bars_open += 1
-            high, low = float(bar["High"]), float(bar["Low"])
-
-            if signal == "BUY":
-                hit_sl, hit_tp = low <= sl, high >= tp
-            else:
-                hit_sl, hit_tp = high >= sl, low <= tp
-
-            if hit_sl and hit_tp:
-                # Conservative: ambiguous same-candle hit treated as SL
-                r_mult = -1.0
-                close_trade(signal_id, sl, "SL", r_mult)
-                update_prop_firm(signal_id, asset, grade, r_mult)
-                print(f"  [{asset}] AMBIGUOUS same-candle TP+SL → conservatively marked SL.")
-                closed = True
-                break
-            if hit_sl:
-                r_mult = -1.0
-                close_trade(signal_id, sl, "SL", r_mult)
-                update_prop_firm(signal_id, asset, grade, r_mult)
-                print(f"  [{asset}] Closed: SL hit ({r_mult:+.2f}R)")
-                closed = True
-                break
-            if hit_tp:
-                r_mult = abs(tp - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
-                close_trade(signal_id, tp, "TP", r_mult)
-                update_prop_firm(signal_id, asset, grade, r_mult)
-                print(f"  [{asset}] Closed: TP hit ({r_mult:+.2f}R)")
-                closed = True
-                break
-
-        if closed:
-            continue
-
-        expiry_bars = int(TIMEFRAME_CONFIGS.get(str(timeframe).lower(), {}).get("expiry_bars", EXPIRY_BARS))
-        if bars_open >= expiry_bars:
-            last_price = float(df["Close"].iloc[-1])
-            risk_dist = abs(entry - sl)
-            r_mult = ((last_price - entry) / risk_dist if signal == "BUY"
-                      else (entry - last_price) / risk_dist) if risk_dist > 0 else 0
-            close_trade(signal_id, last_price, "EXPIRY", r_mult)
-            update_prop_firm(signal_id, asset, grade, r_mult)
-            print(f"  [{asset}] Closed: EXPIRED after {bars_open} bars ({r_mult:+.2f}R)")
+        if "ambiguous" in str(method):
+            print(f"  [{asset}] AMBIGUOUS same-candle TP+SL on {method} → conservatively marked SL.")
         else:
-            bump_bars_open(signal_id, bars_open)
-
+            print(f"  [{asset}] Closed: {reason} via {method} replay after {bars_open} bar(s) ({r_mult:+.2f}R)")
 
 def backfill_shadow_trade_plans(assets: set[str] | None = None, timeframes: set[str] | None = None, max_age_days: int = 3650) -> int:
     """Repair every legacy SHADOW / NO TRADE row that lacks a usable plan.
@@ -2267,13 +2455,9 @@ def backfill_shadow_trade_plans(assets: set[str] | None = None, timeframes: set[
 
 def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] | None = None) -> int:
     """
-    Hypothetically resolve NO TRADE (shadow) signals using the exact same
-    TP/SL/expiry logic as real trades, but writing only to shadow_* columns.
-    Returns the number of shadow rows resolved this run.
-
-    This is what lets the dashboard show "if you had taken every blocked idea,
-    your hypothetical win rate would have been X%" — clearly separate from the
-    real journal win rate, which only ever counts A+/A/B/C trades.
+    Hypothetically resolve NO TRADE (shadow) signals using 1-minute replay where
+    available, writing only to shadow_* columns. Older rows outside Yahoo's
+    1-minute retention window fall back to the signal timeframe candles.
     """
     backfill_shadow_trade_plans(assets=assets, timeframes=timeframes)
     shadow_trades = fetch_unresolved_shadow_trades(assets=assets, timeframes=timeframes)
@@ -2281,72 +2465,171 @@ def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] 
         print("[Shadow] No unresolved NO TRADE rows to evaluate.")
         return 0
 
-    print(f"[Shadow] Checking {len(shadow_trades)} unresolved NO TRADE row(s)...")
+    print(f"[Shadow] Checking {len(shadow_trades)} unresolved NO TRADE row(s) with 1-minute replay where available...")
     resolved = 0
     for t in shadow_trades:
-        asset, ticker, timeframe = t["asset"], t["ticker"], t["timeframe"]
-        signal, entry, sl, tp = str(t["signal"]).upper(), float(t["entry"]), float(t["sl"]), float(t["tp"])
-        signal_id = t["signal_id"]
-
-        if signal not in ("BUY", "SELL") or abs(entry - sl) <= 0 or sl == tp:
-            # A very old row may still have missed the backfill step because it
-            # had unusual data. Skip safely; it will remain visible as unresolved.
+        signal_id = t.get("signal_id")
+        result = replay_trade_outcome(t, use_minute=True)
+        if not result:
+            continue
+        reason = result.get("reason")
+        bars_open = int(result.get("bars_open") or 0)
+        method = str(result.get("method") or "unknown")
+        if reason == "OPEN":
+            if bars_open:
+                bump_bars_open(signal_id, bars_open)
             continue
 
-        df = get_timeframe_df(ticker, timeframe)
-        if df is None:
-            continue
-
-        created = pd.to_datetime(t["created_at"], utc=True)
-        df["Date"] = pd.to_datetime(df["Date"], utc=True)
-        new_bars = df[df["Date"] > created]
-        if new_bars.empty:
-            continue
-
-        bars_open = int(t.get("bars_open") or 0)
-        expiry_bars = int(TIMEFRAME_CONFIGS.get(str(timeframe).lower(), {}).get("expiry_bars", EXPIRY_BARS))
-        closed = False
-
-        for _, bar in new_bars.iterrows():
-            bars_open += 1
-            high, low = float(bar["High"]), float(bar["Low"])
-            if signal == "BUY":
-                hit_sl, hit_tp = low <= sl, high >= tp
-            else:
-                hit_sl, hit_tp = high >= sl, low <= tp
-
-            if hit_sl and hit_tp:
-                # Same conservative rule as real trades: ambiguous same-candle
-                # TP+SL is treated as SL.
-                close_shadow_trade(signal_id, sl, "SHADOW_SL", -1.0)
-                closed = True
-                break
-            if hit_sl:
-                close_shadow_trade(signal_id, sl, "SHADOW_SL", -1.0)
-                closed = True
-                break
-            if hit_tp:
-                r_mult = abs(tp - entry) / abs(entry - sl)
-                close_shadow_trade(signal_id, tp, "SHADOW_TP", r_mult)
-                closed = True
-                break
-
-        if closed:
-            resolved += 1
-            continue
-
-        if bars_open >= expiry_bars:
-            last_price = float(df["Close"].iloc[-1])
-            risk_dist = abs(entry - sl)
-            r_mult = ((last_price - entry) / risk_dist if signal == "BUY"
-                      else (entry - last_price) / risk_dist) if risk_dist > 0 else 0
-            close_shadow_trade(signal_id, last_price, "SHADOW_EXPIRY", r_mult)
-            resolved += 1
-        else:
-            bump_bars_open(signal_id, bars_open)
+        outcome = {"TP": "SHADOW_TP", "SL": "SHADOW_SL", "EXPIRY": "SHADOW_EXPIRY"}.get(str(reason), "SHADOW_EXPIRY")
+        close_shadow_trade(signal_id, float(result.get("price") or 0.0), outcome, float(result.get("r") or 0.0))
+        resolved += 1
 
     print(f"[Shadow] Resolved {resolved} NO TRADE hypothetical outcome(s) this run.")
     return resolved
+
+
+def fetch_existing_outcomes_for_replay(max_age_days: int = 30, limit: int = 5000) -> list[dict]:
+    """Fetch already-resolved rows that can be improved with 1-minute replay.
+
+    This includes real journal trades with CLOSED/EXPIRED status and shadow
+    research rows that already have a shadow outcome. It intentionally excludes
+    rows with unusable plans (Entry=SL=TP); those are handled by the shadow
+    plan backfill before unresolved shadow evaluation.
+    """
+    sql = """
+        SELECT *
+        FROM scanner_signals
+        WHERE created_at >= NOW() - (%s::int * INTERVAL '1 day')
+          AND UPPER(TRIM(COALESCE(signal, ''))) IN ('BUY', 'SELL')
+          AND COALESCE(entry, 0) > 0
+          AND ABS(COALESCE(entry,0) - COALESCE(sl,0)) > 0.00000001
+          AND ABS(COALESCE(sl,0) - COALESCE(tp,0)) > 0.00000001
+          AND (
+                UPPER(TRIM(COALESCE(status,''))) IN ('CLOSED_TP','CLOSED_SL','EXPIRED','CLOSED')
+             OR shadow_outcome IS NOT NULL
+          )
+        ORDER BY created_at ASC
+        LIMIT %s
+    """
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute(sql, (int(max_age_days), int(limit)))
+            rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception as exc:
+        print(f"[Replay1mBackfill] Fetch failed: {exc}")
+        return []
+
+
+def update_existing_outcome_from_replay(row: dict, result: dict) -> bool:
+    """Rewrite a resolved Supabase outcome using the replay engine result.
+
+    For real trades we update status/exit fields/r_multiple. For shadow research
+    we only update shadow_* fields. A+/A prop_firm_trades rows are also updated
+    so the cash P/L stored there matches the replayed R multiple.
+    """
+    signal_id = row.get("signal_id")
+    if not signal_id or not result:
+        return False
+    reason = str(result.get("reason") or "").upper()
+    if reason == "OPEN" or reason not in {"TP", "SL", "EXPIRY"}:
+        return False
+    exit_price = float(result.get("price") or 0.0)
+    r_mult = float(result.get("r") or 0.0)
+    exit_time = result.get("exit_time") or pd.Timestamp.now(tz="UTC")
+    try:
+        exit_ts = pd.to_datetime(exit_time, errors="coerce", utc=True)
+        if pd.isna(exit_ts):
+            exit_ts = pd.Timestamp.now(tz="UTC")
+    except Exception:
+        exit_ts = pd.Timestamp.now(tz="UTC")
+
+    is_shadow = str(row.get("status") or "").upper() == "SHADOW" or row.get("shadow_outcome") is not None
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                if is_shadow:
+                    outcome = {"TP": "SHADOW_TP", "SL": "SHADOW_SL", "EXPIRY": "SHADOW_EXPIRY"}.get(reason, "SHADOW_EXPIRY")
+                    cur.execute(
+                        """
+                        UPDATE scanner_signals
+                        SET shadow_outcome = %s,
+                            shadow_r_multiple = %s,
+                            shadow_exit_price = %s,
+                            shadow_closed_at = %s
+                        WHERE signal_id = %s
+                        """,
+                        (outcome, r_mult, exit_price, exit_ts.isoformat(), signal_id),
+                    )
+                else:
+                    status = {"TP": "CLOSED_TP", "SL": "CLOSED_SL", "EXPIRY": "EXPIRED"}.get(reason, "CLOSED")
+                    cur.execute(
+                        """
+                        UPDATE scanner_signals
+                        SET status = %s,
+                            exit_price = %s,
+                            exit_reason = %s,
+                            exit_at = %s,
+                            r_multiple = %s
+                        WHERE signal_id = %s
+                        """,
+                        (status, exit_price, reason, exit_ts.isoformat(), r_mult, signal_id),
+                    )
+                    if str(row.get("grade") or "").upper() in {"A+", "A"}:
+                        pnl_cash = float(ACCOUNT_SIZE) * float(RISK_PER_TRADE) * r_mult
+                        cur.execute(
+                            """
+                            UPDATE prop_firm_trades
+                            SET r_multiple = %s, pnl_cash = %s, closed_at = %s
+                            WHERE signal_id = %s
+                            """,
+                            (r_mult, pnl_cash, exit_ts.isoformat(), signal_id),
+                        )
+        conn.close()
+        return True
+    except Exception as exc:
+        print(f"[Replay1mBackfill] Update failed for {signal_id}: {exc}")
+        return False
+
+
+def replay_existing_resolved_outcomes(max_age_days: int | None = None, limit: int | None = None) -> int:
+    """Recalculate existing Supabase outcomes with 1-minute replay where possible.
+
+    Yahoo 1-minute data is only available for recent rows, so older rows are
+    recalculated through the same fallback timeframe replay. This is still safe
+    and deterministic, but the log separates true 1-minute improvements from
+    fallback updates.
+    """
+    days = int(max_age_days if max_age_days is not None else REPLAY_EXISTING_OUTCOMES_DAYS)
+    lim = int(limit if limit is not None else REPLAY_EXISTING_OUTCOMES_LIMIT)
+    rows = fetch_existing_outcomes_for_replay(days, lim)
+    if not rows:
+        print("[Replay1mBackfill] No existing resolved outcomes to replay.")
+        return 0
+
+    updated = 0
+    minute_updates = 0
+    fallback_updates = 0
+    for row in rows:
+        result = replay_trade_outcome(row, use_minute=True)
+        if not result or str(result.get("reason") or "").upper() == "OPEN":
+            continue
+        if update_existing_outcome_from_replay(row, result):
+            updated += 1
+            method = str(result.get("method") or "")
+            if method.startswith("1m"):
+                minute_updates += 1
+            else:
+                fallback_updates += 1
+
+    print(
+        f"[Replay1mBackfill] Replayed {updated} existing outcome(s): "
+        f"{minute_updates} using 1-minute data, {fallback_updates} using timeframe fallback."
+    )
+    return updated
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2377,6 +2660,8 @@ def run_scan() -> None:
     # 1. Resolve outcomes for everything already open BEFORE scanning for new setups.
     evaluate_open_trades(assets=set(scan_assets.keys()), timeframes=set(active_tfs))
     evaluate_shadow_trades(assets=set(scan_assets.keys()), timeframes=None)
+    if REPLAY_EXISTING_OUTCOMES:
+        replay_existing_resolved_outcomes()
 
     journaled, alerted, shadowed = 0, 0, 0
     assets_scanned = 0

@@ -60,7 +60,7 @@ except Exception:  # pragma: no cover
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "v7.3-no-trade-full-shadow-curve"
+APP_VERSION = "v7.3-user-journal-expiry-breakdown"
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "assets"
 LOGO_PATH = ASSETS_DIR / "benzino_logo.png"
@@ -5223,6 +5223,46 @@ def render_workflow(username: str, settings: dict) -> None:
             closed_cols,
             {"Signal":"signal", "Grade":"grade", "Status":"status", "Outcome":"outcome"},
             ["RR", "R Multiple", "pnl_cash", "balance_after"],
+        )
+
+        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
+        st.subheader("Expiry breakdown")
+        expiry_rules = {
+            "15m": {"bars": 56, "approx": "~14 hours"},
+            "1h": {"bars": 56, "approx": "~2.3 days"},
+            "4h": {"bars": 42, "approx": "~7 days"},
+            "1d": {"bars": 20, "approx": "~1 month"},
+        }
+        selected_tf = str(settings.get("view_timeframe") or settings.get("preferred_timeframe") or "All").lower()
+        if selected_tf not in expiry_rules:
+            selected_tf = "All"
+        expiry_rows = []
+        for tf, meta in expiry_rules.items():
+            expiry_rows.append({
+                "Timeframe": tf,
+                "Expiry Bars": int(meta["bars"]),
+                "Approx Window": meta["approx"],
+                "Currently Selected": "YES" if selected_tf == tf else "NO",
+            })
+        expiry_df = pd.DataFrame(expiry_rows)
+        selected_note = (
+            f"The selected {selected_tf} timeframe expires after {expiry_rules[selected_tf]['bars']} bars "
+            f"({expiry_rules[selected_tf]['approx']})."
+            if selected_tf in expiry_rules
+            else "Select a specific timeframe to see the exact expiry rule applied to that journal view."
+        )
+        st.caption(selected_note + " TP/SL checks use 1-minute replay where available; otherwise the scanner falls back to the signal timeframe candles.")
+        render_benzino_aggrid(
+            expiry_df,
+            key="journal_expiry_breakdown",
+            height=190,
+            page_size=4,
+            pinned=["Timeframe"],
+            badge_cols={"Currently Selected": "status"},
+            numeric_cols_right=["Expiry Bars"],
+            enable_search=False,
+            show_footer=False,
+            use_pagination=False,
         )
 
 
