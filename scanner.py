@@ -558,6 +558,22 @@ CAPITAL_AUTO_TRADE_USE_STOPS = os.environ.get("CAPITAL_AUTO_TRADE_USE_STOPS", "t
 CAPITAL_AUTO_TRADE_SIZE_RETRY = os.environ.get("CAPITAL_AUTO_TRADE_SIZE_RETRY", "true").strip().lower() in {"1", "true", "yes", "y"}
 CAPITAL_STRICT_1M_REPLAY_ONLY = os.environ.get("CAPITAL_STRICT_1M_REPLAY_ONLY", "true").strip().lower() in {"1", "true", "yes", "y"}
 CAPITAL_MARGIN_BUFFER_PCT = float(os.environ.get("CAPITAL_MARGIN_BUFFER_PCT", "0.95"))
+CAPITAL_FTMO_NORMALIZE_PNL = os.environ.get("CAPITAL_FTMO_NORMALIZE_PNL", "true").strip().lower() in {"1", "true", "yes", "y"}
+FTMO_COMPARISON_LEVERAGE = float(os.environ.get("FTMO_COMPARISON_LEVERAGE", "100"))
+
+# Capital.com execution leverage is broker-limited by asset class. BENZINO keeps
+# FTMO simulation at 1:100, then stores an FTMO-equivalent normalized P/L for
+# fair simulated-vs-actual comparison.
+CAPITAL_ASSET_CLASS = {
+    "BTCUSD": "crypto", "ETHUSD": "crypto",
+    "NVDA": "shares", "MU": "shares",
+    "SP500": "indices", "NAS100": "indices", "DOW30": "indices",
+    "XAUUSD": "commodities", "XAGUSD": "commodities", "OIL": "commodities", "BRENT": "commodities", "NATGAS": "commodities", "COPPER": "commodities",
+}
+CAPITAL_LEVERAGE_CAPS = {
+    "currencies": 100.0, "indices": 100.0, "commodities": 100.0,
+    "crypto": 20.0, "shares": 20.0, "bonds": 200.0, "interest_rates": 200.0,
+}
 _CAPITAL_LAST_ERROR = {"text": ""}
 
 # Schema migrations are intentionally OFF during normal scanner runs.
@@ -1671,6 +1687,12 @@ def capital_load_market_info(symbol: str) -> dict:
         for k in ["epic","min_size","max_size","step_size","min_stop_distance","max_stop_distance","min_limit_distance","max_limit_distance"]:
             if row.get(k) not in (None, ""):
                 out[k] = row.get(k)
+        # If the mapping exists but constraints are empty, refresh once from Capital.
+        numeric_keys = ["min_size","max_size","step_size","min_stop_distance","max_stop_distance","min_limit_distance","max_limit_distance"]
+        if not any(float(out.get(k) or 0) > 0 for k in numeric_keys):
+            refreshed = capital_refresh_market_constraints(symbol, out.get("epic"))
+            if refreshed:
+                out.update(refreshed)
         return out
     except Exception:
         return {}
@@ -1698,6 +1720,42 @@ def estimate_margin_required(sig, size: float, leverage: float) -> float:
         return abs(float(size) * float(sig.entry)) / max(1.0, float(leverage or 1))
     except Exception:
         return 0.0
+
+
+def capital_asset_class(asset: str) -> str:
+    asset = str(asset or "").upper().strip()
+    if asset in CAPITAL_ASSET_CLASS:
+        return CAPITAL_ASSET_CLASS[asset]
+    # Most remaining 6-letter symbols in the master universe are FX pairs.
+    if len(asset) == 6 and asset.isalpha():
+        return "currencies"
+    return "commodities"
+
+
+def capital_effective_leverage_for_asset(asset: str, market_info: dict | None = None) -> float:
+    """Return broker execution leverage used for margin/normalization.
+
+    Capital may expose margin/leverage in different shapes per endpoint, so the
+    asset-class cap is the reliable default. This does not change BENZINO/FTMO
+    simulation; it only describes the actual Capital execution environment.
+    """
+    cls = capital_asset_class(asset)
+    cap = float(CAPITAL_LEVERAGE_CAPS.get(cls, 100.0))
+    try:
+        market_info = market_info or {}
+        lev = _deep_find_number(market_info, ["leverage"], None)
+        if lev and lev > 0:
+            cap = min(cap, float(lev))
+    except Exception:
+        pass
+    return max(1.0, cap)
+
+
+def ftmo_normalization_factor(asset: str, market_info: dict | None = None) -> float:
+    if not CAPITAL_FTMO_NORMALIZE_PNL:
+        return 1.0
+    actual_lev = capital_effective_leverage_for_asset(asset, market_info)
+    return max(1.0, float(FTMO_COMPARISON_LEVERAGE) / max(1.0, actual_lev))
 
 def capital_load_saved_epic(symbol: str) -> str | None:
     """Read a previously resolved Capital.com epic from Supabase.
@@ -1764,6 +1822,38 @@ def capital_save_epic(symbol: str, epic: str, market: dict | None = None) -> Non
     except Exception as exc:
         # Non-fatal: mapping can still be used in-memory for this run.
         print(f"[Capital] Could not save epic map for {symbol}->{epic}: {exc}")
+
+
+def capital_refresh_market_constraints(symbol: str, epic: str | None = None) -> dict:
+    """Refresh/sync broker constraints into capital_epic_map when saved columns are empty.
+
+    This fixes rows that were created before constraint columns existed.
+    """
+    symbol = str(symbol or "").upper().strip()
+    epic = str(epic or "").strip() or capital_load_saved_epic(symbol) or symbol
+    if not symbol or not capital_configured():
+        return {}
+    market = None
+    # Try direct endpoint first, then search fallback.
+    for path, params in ((f"/markets/{epic}", None), ("/markets", {"searchTerm": epic}), ("/markets", {"searchTerm": symbol})):
+        data = capital_request("GET", path, params=params, retries=1)
+        if isinstance(data, dict):
+            if isinstance(data.get("instrument"), dict) or isinstance(data.get("dealingRules"), dict):
+                market = data
+                break
+            markets = data.get("markets") or data.get("items") or []
+            if isinstance(markets, dict):
+                markets = [markets]
+            if markets:
+                ranked = sorted(markets, key=lambda m: _capital_market_score(symbol, m), reverse=True)
+                market = ranked[0]
+                epic = str(market.get("epic") or epic)
+                break
+    if isinstance(market, dict) and market:
+        _CAPITAL_MARKET_CACHE[symbol] = market
+        capital_save_epic(symbol, epic, market)
+        return capital_extract_constraints(market) | {"epic": epic, "market_info": market}
+    return {}
 
 
 def capital_find_epic(symbol: str) -> str | None:
@@ -4000,8 +4090,9 @@ def record_capital_auto_order(sig: ScanResult, *, status: str, deal_reference: s
     sql = """
     INSERT INTO capital_auto_orders(
         signal_id, deal_reference, deal_id, scan_owner, environment, asset, timeframe,
-        direction, grade, epic, size, entry, sl, tp, status, error, raw_json, updated_at
-    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        direction, grade, epic, size, entry, sl, tp, status, error, raw_json,
+        ftmo_leverage, capital_leverage, ftmo_normalization_factor, updated_at
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
     ON CONFLICT (signal_id) DO UPDATE SET
         deal_reference = COALESCE(NULLIF(EXCLUDED.deal_reference,''), capital_auto_orders.deal_reference),
         deal_id = COALESCE(NULLIF(EXCLUDED.deal_id,''), capital_auto_orders.deal_id),
@@ -4019,6 +4110,9 @@ def record_capital_auto_order(sig: ScanResult, *, status: str, deal_reference: s
                     sig.asset, sig.timeframe, sig.signal, sig.grade, epic, float(size or 0),
                     float(sig.entry), float(sig.sl), float(sig.tp), status, error,
                     json.dumps(sanitize_for_json(raw or {}), allow_nan=False),
+                    float((raw or {}).get("ftmo_leverage") or FTMO_COMPARISON_LEVERAGE),
+                    float((raw or {}).get("capital_leverage") or capital_effective_leverage_for_asset(sig.asset, (raw or {}).get("broker_constraints") or {})),
+                    float((raw or {}).get("ftmo_normalization_factor") or ftmo_normalization_factor(sig.asset, (raw or {}).get("broker_constraints") or {})),
                 ))
         conn.close()
     except Exception as exc:
@@ -4139,7 +4233,8 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
     size_attempts = build_capital_size_attempts(float(trade_size), market_info) if CAPITAL_AUTO_TRADE_SIZE_RETRY else [float(trade_size)]
     available_margin = capital_available_margin()
     if available_margin is not None:
-        lev = float(sizing.get("leverage") or LEVERAGE or 1)
+        # Use Capital's effective leverage for the real margin check. FTMO stays 1:100 for simulation.
+        lev = capital_effective_leverage_for_asset(sig.asset, market_info)
         capped = []
         for x in size_attempts:
             if estimate_margin_required(sig, x, lev) <= available_margin * CAPITAL_MARGIN_BUFFER_PCT:
@@ -4206,7 +4301,7 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
     ok = bool(deal_reference) and (not confirm_status or confirm_status in {"ACCEPTED", "OPEN", "SUCCESS", "CONFIRMED"})
     status = "OPENED" if ok else "REJECTED"
     error = "" if ok else last_error
-    record_capital_auto_order(sig, status=status, deal_reference=deal_reference, deal_id=deal_id, epic=epic, size=confirmed_size, error=error, raw={"payload": last_payload, "original_size": trade_size, "adjusted_sl": adj_sl, "adjusted_tp": adj_tp, "broker_constraints": market_info, "sizing": sizing, "response": response or {}, "confirm": confirm or {}})
+    record_capital_auto_order(sig, status=status, deal_reference=deal_reference, deal_id=deal_id, epic=epic, size=confirmed_size, error=error, raw={"payload": last_payload, "original_size": trade_size, "adjusted_sl": adj_sl, "adjusted_tp": adj_tp, "broker_constraints": market_info, "sizing": sizing, "response": response or {}, "confirm": confirm or {}, "ftmo_leverage": FTMO_COMPARISON_LEVERAGE, "capital_leverage": capital_effective_leverage_for_asset(sig.asset, market_info), "ftmo_normalization_factor": ftmo_normalization_factor(sig.asset, market_info)})
     user_label = str(sizing.get("username") or SCAN_OWNER)
     if ok:
         print(f"[CapitalAuto] {sig.asset} {timeframe} {direction} {grade}: demo trade opened for {user_label} · size {confirmed_size} · ref {deal_reference}.")

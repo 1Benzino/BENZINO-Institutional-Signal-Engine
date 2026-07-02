@@ -372,6 +372,10 @@ def init_tables() -> None:
         exit_price NUMERIC,
         size NUMERIC,
         pnl NUMERIC,
+        pnl_ftmo_equiv NUMERIC,
+        ftmo_leverage NUMERIC DEFAULT 100,
+        capital_leverage NUMERIC,
+        ftmo_normalization_factor NUMERIC DEFAULT 1,
         currency TEXT,
         raw_json JSONB,
         updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -390,6 +394,10 @@ def init_tables() -> None:
         exit_diff NUMERIC,
         simulated_r NUMERIC,
         actual_pnl NUMERIC,
+        actual_pnl_ftmo_equiv NUMERIC,
+        ftmo_leverage NUMERIC DEFAULT 100,
+        capital_leverage NUMERIC,
+        ftmo_normalization_factor NUMERIC DEFAULT 1,
         simulated_outcome TEXT,
         actual_status TEXT,
         match_quality TEXT,
@@ -464,6 +472,14 @@ def init_tables() -> None:
                 cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS match_quality TEXT")
                 cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS actual_r NUMERIC")
                 cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS auto_trade BOOLEAN DEFAULT FALSE")
+                cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS actual_pnl_ftmo_equiv NUMERIC")
+                cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS ftmo_leverage NUMERIC DEFAULT 100")
+                cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS capital_leverage NUMERIC")
+                cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS ftmo_normalization_factor NUMERIC DEFAULT 1")
+                cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS pnl_ftmo_equiv NUMERIC")
+                cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS ftmo_leverage NUMERIC DEFAULT 100")
+                cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS capital_leverage NUMERIC")
+                cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS ftmo_normalization_factor NUMERIC DEFAULT 1")
                 cur.execute("ALTER TABLE prop_challenge_history ADD COLUMN IF NOT EXISTS failure_reason TEXT")
                 # Migration/fix: Telegram delivery must never control journal status.
                 # A+/A/B/C BUY/SELL setups are active journal trades; NO TRADE/HOLD stays SHADOW.
@@ -1313,7 +1329,7 @@ def load_capital_trade_comparisons(limit: int = 500) -> pd.DataFrame:
             c.opened_at, c.asset, c.direction, c.match_quality,
             c.simulated_entry, c.actual_entry,
             c.simulated_exit, c.actual_exit,
-            c.simulated_r, c.actual_r, c.actual_pnl, c.simulated_outcome, c.actual_status,
+            c.simulated_r, c.actual_r, c.actual_pnl, c.actual_pnl_ftmo_equiv, c.ftmo_normalization_factor, c.simulated_outcome, c.actual_status,
             c.signal_id, c.capital_trade_id, COALESCE(c.auto_trade, FALSE) AS auto_trade,
             ce.instrument_name, ce.environment, ce.status AS execution_status,
             ce.size, ce.currency, ce.updated_at
