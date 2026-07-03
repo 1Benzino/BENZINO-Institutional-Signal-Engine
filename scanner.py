@@ -4662,6 +4662,29 @@ def build_capital_size_attempts(base_size: float, market_info: dict) -> list[flo
         add(base_size / div, "down")
     return attempts[:10]
 
+
+def load_enabled_auto_trade_users_for_signal_fallback(sig) -> list[dict]:
+    """Load enabled user-owned Capital accounts without tying them to SCAN_OWNER."""
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT *
+                FROM user_capital_connections
+                WHERE COALESCE(enabled, FALSE) = TRUE
+                  AND COALESCE(auto_trade_enabled, FALSE) = TRUE
+                  AND COALESCE(api_key, '') <> ''
+                  AND COALESCE(identifier, '') <> ''
+                  AND COALESCE(password, '') <> ''
+                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+            """)
+            rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception as exc:
+        print(f"[CapitalAuto] Could not load enabled auto-trade users: {exc}")
+        return []
+
 def place_capital_auto_trade(sig: ScanResult) -> bool:
     """Place a Capital.com demo trade for one newly accepted BENZINO signal.
 
