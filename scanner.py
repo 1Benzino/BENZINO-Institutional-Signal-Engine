@@ -115,6 +115,27 @@ def load_local_env_file() -> None:
 
 load_local_env_file()
 
+
+# Safety guard: no legacy CAPITAL:* symbol should ever reach yfinance.
+_ORIGINAL_YF_DOWNLOAD = yf.download
+def _benzino_safe_yf_download(tickers, *args, **kwargs):
+    def _clean_one(t):
+        s = str(t or "").strip()
+        if s.upper().startswith("CAPITAL:"):
+            asset = s.split(":", 1)[1].strip().upper()
+            mapped = YAHOO_FALLBACK_TICKERS.get(asset, "")
+            if mapped:
+                return mapped
+            # Return a harmless impossible symbol rather than CAPITAL:* to avoid long Yahoo errors.
+            return "__BENZINO_SKIP__"
+        return s
+    if isinstance(tickers, (list, tuple, set)):
+        tickers = [_clean_one(t) for t in tickers]
+    else:
+        tickers = _clean_one(tickers)
+    return _ORIGINAL_YF_DOWNLOAD(tickers, *args, **kwargs)
+yf.download = _benzino_safe_yf_download
+
 try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
@@ -127,24 +148,23 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 MASTER_WATCHLIST = {
-    # Primary data source is now Capital.com because the user's TradingView charts
-    # use the Capital.com feed. Tickers are kept as CAPITAL:<asset_key>; the
-    # downloader resolves each asset key to the correct Capital.com epic at run
-    # time and falls back to Yahoo only when Capital.com is unavailable.
-    "XAUUSD": "CAPITAL:XAUUSD", "XAGUSD": "CAPITAL:XAGUSD", "OIL": "CAPITAL:OIL", "BRENT": "CAPITAL:BRENT",
-    "NATGAS": "CAPITAL:NATGAS", "COPPER": "CAPITAL:COPPER",
-    "EURUSD": "CAPITAL:EURUSD", "GBPUSD": "CAPITAL:GBPUSD", "USDJPY": "CAPITAL:USDJPY",
-    "USDCHF": "CAPITAL:USDCHF", "USDCAD": "CAPITAL:USDCAD", "AUDUSD": "CAPITAL:AUDUSD", "NZDUSD": "CAPITAL:NZDUSD",
-    "GBPJPY": "CAPITAL:GBPJPY", "EURJPY": "CAPITAL:EURJPY", "AUDJPY": "CAPITAL:AUDJPY",
-    "NZDJPY": "CAPITAL:NZDJPY", "CADJPY": "CAPITAL:CADJPY", "CHFJPY": "CAPITAL:CHFJPY",
-    "EURGBP": "CAPITAL:EURGBP", "EURAUD": "CAPITAL:EURAUD", "EURNZD": "CAPITAL:EURNZD",
-    "EURCAD": "CAPITAL:EURCAD", "EURCHF": "CAPITAL:EURCHF", "GBPAUD": "CAPITAL:GBPAUD",
-    "GBPNZD": "CAPITAL:GBPNZD", "GBPCAD": "CAPITAL:GBPCAD", "GBPCHF": "CAPITAL:GBPCHF",
-    "AUDCAD": "CAPITAL:AUDCAD", "AUDNZD": "CAPITAL:AUDNZD", "AUDCHF": "CAPITAL:AUDCHF",
-    "NZDCAD": "CAPITAL:NZDCAD", "NZDCHF": "CAPITAL:NZDCHF",
-    "BTCUSD": "CAPITAL:BTCUSD", "ETHUSD": "CAPITAL:ETHUSD",
-    "SP500": "CAPITAL:SP500", "NAS100": "CAPITAL:NAS100", "DOW30": "CAPITAL:DOW30",
-    "NVDA": "CAPITAL:NVDA", "MU": "CAPITAL:MU",
+    # Signal market data uses Yahoo/yfinance-compatible symbols.
+    # Capital.com epics are used only for broker execution, broker constraints,
+    # actual execution sync, and 1-minute Capital replay.
+    "XAUUSD": "GC=F", "XAGUSD": "SI=F", "OIL": "CL=F", "BRENT": "BZ=F",
+    "NATGAS": "NG=F", "COPPER": "HG=F",
+    "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "JPY=X",
+    "USDCHF": "CHF=X", "USDCAD": "CAD=X", "AUDUSD": "AUDUSD=X", "NZDUSD": "NZDUSD=X",
+    "GBPJPY": "GBPJPY=X", "EURJPY": "EURJPY=X", "AUDJPY": "AUDJPY=X",
+    "NZDJPY": "NZDJPY=X", "CADJPY": "CADJPY=X", "CHFJPY": "CHFJPY=X",
+    "EURGBP": "EURGBP=X", "EURAUD": "EURAUD=X", "EURNZD": "EURNZD=X",
+    "EURCAD": "EURCAD=X", "EURCHF": "EURCHF=X", "GBPAUD": "GBPAUD=X",
+    "GBPNZD": "GBPNZD=X", "GBPCAD": "GBPCAD=X", "GBPCHF": "GBPCHF=X",
+    "AUDCAD": "AUDCAD=X", "AUDNZD": "AUDNZD=X", "AUDCHF": "AUDCHF=X",
+    "NZDCAD": "NZDCAD=X", "NZDCHF": "NZDCHF=X",
+    "BTCUSD": "BTC-USD", "ETHUSD": "ETH-USD",
+    "SP500": "^GSPC", "NAS100": "^NDX", "DOW30": "^DJI",
+    "NVDA": "NVDA", "MU": "MU",
 }
 
 YAHOO_FALLBACK_TICKERS = {
@@ -535,12 +555,12 @@ SHADOW_EVAL_LIMIT = int(os.environ.get("SHADOW_EVAL_LIMIT", "400"))
 SHADOW_DB_UPDATE_BATCH_SIZE = int(os.environ.get("SHADOW_DB_UPDATE_BATCH_SIZE", "100"))
 SHADOW_BACKFILL_LIMIT = int(os.environ.get("SHADOW_BACKFILL_LIMIT", "800"))
 
-# One-off / safety replay controls.
+# One-off / safety replay controls. Default is OFF after historical cleanup.
 # When true, the scanner replays existing resolved Supabase outcomes using the
 # Capital.com 1-minute replay engine only. If Capital 1-minute data is not
 # available, the row stays open/unchecked for a later run; timeframe candle
 # fallback is intentionally disabled for clean Capital-only audit data.
-REPLAY_EXISTING_OUTCOMES = os.environ.get("REPLAY_EXISTING_OUTCOMES", "true").strip().lower() in {"1", "true", "yes", "y"}
+REPLAY_EXISTING_OUTCOMES = os.environ.get("REPLAY_EXISTING_OUTCOMES", "false").strip().lower() in {"1", "true", "yes", "y"}
 REPLAY_EXISTING_OUTCOMES_DAYS = int(os.environ.get("REPLAY_EXISTING_OUTCOMES_DAYS", "30"))
 REPLAY_EXISTING_OUTCOMES_LIMIT = int(os.environ.get("REPLAY_EXISTING_OUTCOMES_LIMIT", "300"))
 
@@ -551,9 +571,9 @@ CAPITAL_ACTIVITY_LOOKBACK_SECONDS = int(os.environ.get("CAPITAL_ACTIVITY_LOOKBAC
 CAPITAL_MATCH_WINDOW_HOURS = int(os.environ.get("CAPITAL_MATCH_WINDOW_HOURS", "2"))
 CAPITAL_AUTO_TRADE_ENABLED = os.environ.get("CAPITAL_AUTO_TRADE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y"}  # platform kill-switch; per-user toggle is in Supabase
 CAPITAL_AUTO_TRADE_REQUIRE_DEMO = os.environ.get("CAPITAL_AUTO_TRADE_REQUIRE_DEMO", "true").strip().lower() in {"1", "true", "yes", "y"}
-CAPITAL_AUTO_TRADE_GRADES = {g.strip().upper() for g in os.environ.get("CAPITAL_AUTO_TRADE_GRADES", "A+,A").split(",") if g.strip()}
-# Demo auto-trading is intentionally stricter than simulation: only A/A+ can be executed.
-CAPITAL_AUTO_TRADE_GRADES = CAPITAL_AUTO_TRADE_GRADES.intersection({"A+", "A"}) or {"A+", "A"}
+CAPITAL_AUTO_TRADE_GRADES = {g.strip().upper() for g in os.environ.get("CAPITAL_AUTO_TRADE_GRADES", "A+,A,B,C").split(",") if g.strip()}
+# Platform ceiling only. The actual grades tested on demo are chosen per user in user_capital_connections.auto_trade_grades.
+CAPITAL_AUTO_TRADE_GRADES = CAPITAL_AUTO_TRADE_GRADES.intersection({"A+", "A", "B", "C"}) or {"A+", "A", "B", "C"}
 CAPITAL_AUTO_TRADE_TIMEFRAMES = {t.strip().lower() for t in os.environ.get("CAPITAL_AUTO_TRADE_TIMEFRAMES", "15m,1h,4h,1d").split(",") if t.strip()}
 CAPITAL_AUTO_TRADE_OWNER = os.environ.get("CAPITAL_AUTO_TRADE_OWNER", "").strip()
 CAPITAL_AUTO_TRADE_MIN_SIZE = float(os.environ.get("CAPITAL_AUTO_TRADE_MIN_SIZE", "0.01"))
@@ -601,6 +621,41 @@ CAPITAL_FETCH_ACTIVITY_HISTORY = os.environ.get("CAPITAL_FETCH_ACTIVITY_HISTORY"
 LOCK_HISTORICAL_SIGNAL_PLANS = os.environ.get("LOCK_HISTORICAL_SIGNAL_PLANS", "true").strip().lower() in {"1", "true", "yes", "y"}
 FORBIDDEN_HISTORICAL_PLAN_KEYS = {"entry", "sl", "tp", "rr"}
 
+
+
+
+def load_enabled_user_capital_connection_for_sync() -> dict:
+    """Load one enabled user-owned Capital connection for actual execution sync.
+
+    CapitalSync should no longer require platform-wide CAPITAL_API_KEY /
+    CAPITAL_IDENTIFIER / CAPITAL_PASSWORD env values. The dashboard saves user
+    credentials in user_capital_connections, and the scanner reads them here.
+    """
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT username, api_key, identifier, password, account_type, enabled
+                FROM user_capital_connections
+                WHERE COALESCE(enabled, FALSE) = TRUE
+                  AND COALESCE(api_key, '') <> ''
+                  AND COALESCE(identifier, '') <> ''
+                  AND COALESCE(password, '') <> ''
+                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+        conn.close()
+        return dict(row) if row else {}
+    except Exception as exc:
+        print(f"[CapitalSync] Could not load user Capital connection: {exc}")
+        return {}
+
+
+# User-owned Capital connection bootstrap is deferred until after db_connect exists.
+_USER_CAPITAL_SYNC_CONN = {}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  RESULT DATACLASS
@@ -661,6 +716,41 @@ def db_connect():
     if psycopg2 is None:
         raise RuntimeError("psycopg2 is not installed — add psycopg2-binary to requirements_scanner.txt.")
     return psycopg2.connect(_clean_db_url(url), cursor_factory=RealDictCursor)
+
+
+
+def hydrate_capital_env_from_user_connection_if_missing() -> dict:
+    """Use latest enabled user Capital connection when platform env creds are absent."""
+    if os.environ.get("CAPITAL_API_KEY") and os.environ.get("CAPITAL_IDENTIFIER") and os.environ.get("CAPITAL_PASSWORD"):
+        return {}
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT *
+                FROM user_capital_connections
+                WHERE COALESCE(enabled, FALSE) = TRUE
+                  AND COALESCE(api_key, '') <> ''
+                  AND COALESCE(identifier, '') <> ''
+                  AND COALESCE(password, '') <> ''
+                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+                LIMIT 1
+            """)
+            row = cur.fetchone()
+        conn.close()
+        if not row:
+            return {}
+        row = dict(row)
+        os.environ["CAPITAL_API_KEY"] = str(row.get("api_key") or "")
+        os.environ["CAPITAL_IDENTIFIER"] = str(row.get("identifier") or "")
+        os.environ["CAPITAL_PASSWORD"] = str(row.get("password") or "")
+        acct = str(row.get("account_type") or "DEMO").strip().upper()
+        os.environ.setdefault("CAPITAL_API_URL", "https://demo-api-capital.backend-capital.com" if acct == "DEMO" else "https://api-capital.backend-capital.com")
+        print(f"[CapitalSync] Loaded user Capital connection for {row.get('username')} ({acct}).")
+        return row
+    except Exception as exc:
+        print(f"[CapitalSync] Could not hydrate user Capital connection: {exc}")
+        return {}
 
 
 def init_tables() -> None:
@@ -1522,6 +1612,40 @@ _CAPITAL_SESSION: dict = {"cst": "", "security_token": "", "ts": 0.0}
 _CAPITAL_EPIC_CACHE: dict[str, str | None] = {}
 _CAPITAL_MARKET_CACHE: dict[str, dict] = {}
 
+# If platform env credentials are missing, hydrate them from the latest enabled user connection.
+try:
+    _hydrated_capital_user = hydrate_capital_env_from_user_connection_if_missing()
+    if _hydrated_capital_user:
+        CAPITAL_API_KEY = os.environ.get("CAPITAL_API_KEY", "").strip()
+        CAPITAL_IDENTIFIER = os.environ.get("CAPITAL_IDENTIFIER", "").strip()
+        CAPITAL_PASSWORD = os.environ.get("CAPITAL_PASSWORD", "").strip()
+        CAPITAL_API_URL_RAW = os.environ.get("CAPITAL_API_URL", "").strip().rstrip("/")
+        if CAPITAL_API_URL_RAW:
+            CAPITAL_BASE_URL = CAPITAL_API_URL_RAW if CAPITAL_API_URL_RAW.endswith("/api/v1") else f"{CAPITAL_API_URL_RAW}/api/v1"
+except Exception as _hydrate_exc:
+    print(f"[CapitalSync] User Capital hydration skipped: {_hydrate_exc}")
+
+
+
+
+def refresh_capital_credentials_from_env() -> None:
+    """Refresh module-level Capital credential constants after env hydration."""
+    global CAPITAL_API_KEY, CAPITAL_IDENTIFIER, CAPITAL_PASSWORD, CAPITAL_API_URL_RAW, CAPITAL_BASE_URL
+    CAPITAL_API_KEY = os.environ.get("CAPITAL_API_KEY", "").strip()
+    CAPITAL_IDENTIFIER = os.environ.get("CAPITAL_IDENTIFIER", "").strip()
+    CAPITAL_PASSWORD = os.environ.get("CAPITAL_PASSWORD", "").strip()
+    CAPITAL_API_URL_RAW = os.environ.get("CAPITAL_API_URL", "").strip().rstrip("/")
+    if CAPITAL_API_URL_RAW:
+        CAPITAL_BASE_URL = CAPITAL_API_URL_RAW if CAPITAL_API_URL_RAW.endswith("/api/v1") else f"{CAPITAL_API_URL_RAW}/api/v1"
+
+def ensure_capital_credentials_loaded() -> bool:
+    """Ensure Capital credentials are available from env or user_capital_connections."""
+    if capital_configured():
+        return True
+    row = hydrate_capital_env_from_user_connection_if_missing()
+    if row:
+        refresh_capital_credentials_from_env()
+    return capital_configured()
 
 def capital_configured() -> bool:
     return bool(CAPITAL_ENABLED and CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD)
@@ -1537,24 +1661,36 @@ def capital_symbol_from_ticker(ticker: str) -> str:
 
 
 def yahoo_fallback_for_symbol(symbol: str, ticker: str = "") -> str:
-    """Return Yahoo fallback only when strict Capital mode is disabled.
+    """Return a safe non-CAPITAL fallback ticker.
 
-    The user validates charts on TradingView using the Capital.com feed, so a
-    Yahoo fallback can create false TP/SL outcomes. In strict mode every
-    MASTER_WATCHLIST asset must use Capital.com for both signal generation and
-    replay; if Capital data is unavailable, the scanner skips that asset/row
-    until Capital is available again.
+    Legacy Supabase rows can contain ticker='CAPITAL:ASSET'. Those must never be
+    sent into yfinance. If Capital 1m/history is unavailable for that legacy row,
+    either return the known fallback ticker or blank so the row is skipped cleanly.
     """
-    if CAPITAL_STRICT_ALL_ASSETS:
-        return ""
     symbol = str(symbol or "").strip().upper()
+    ticker = str(ticker or "").strip()
+
+    if is_capital_ticker(ticker):
+        symbol = capital_symbol_from_ticker(ticker)
+
     if symbol in YAHOO_FALLBACK_TICKERS:
         return YAHOO_FALLBACK_TICKERS[symbol]
-    ticker = str(ticker or "").strip()
+
     if is_capital_ticker(ticker):
         return ""
+
     return ticker
 
+
+
+def safe_yfinance_ticker(asset: str, ticker: str = "") -> str:
+    """Never allow CAPITAL:* symbols to reach yfinance."""
+    asset_norm = str(asset or "").strip().upper()
+    ticker_norm = str(ticker or "").strip()
+    if is_capital_ticker(ticker_norm):
+        asset_norm = capital_symbol_from_ticker(ticker_norm)
+        return YAHOO_FALLBACK_TICKERS.get(asset_norm, "")
+    return ticker_norm or YAHOO_FALLBACK_TICKERS.get(asset_norm, "")
 
 def preferred_data_ticker(asset: str, current_ticker: str = "") -> str:
     """Return the intended scanner data ticker for an asset.
@@ -2164,12 +2300,26 @@ def download(ticker: str, interval: str, period: str, retries: int = 3, pause_se
             print(f"[Capital] {symbol}: unavailable for {tf}; strict Capital mode active — skipping Yahoo fallback.")
             return None
 
-    # Yahoo fallback path. Used only when strict Capital mode is disabled or for
+    
+    # HOTFIX: never send CAPITAL: symbols to Yahoo during evaluation/backfill.
+    # If a legacy row still contains CAPITAL:XXX, convert it back to the asset
+    # name so the Capital EPIC mapping can be used instead of Yahoo.
+    if isinstance(ticker, str) and ticker.startswith("CAPITAL:"):
+        symbol = ticker.split(":", 1)[1]
+        capital_info = get_capital_epic(symbol)
+        if capital_info:
+            epic = capital_info.get("epic") or symbol
+            capital_df = fetch_capital_history(epic, tf)
+            if capital_df is not None and not capital_df.empty:
+                return capital_df
+        ticker = symbol
+
+# Yahoo fallback path. Used only when strict Capital mode is disabled or for
     # truly non-Capital tickers supplied outside MASTER_WATCHLIST.
     last_error = None
     for attempt in range(1, int(retries) + 1):
         try:
-            df = yf.download(ticker, interval=interval, period=period, auto_adjust=True, progress=False, threads=False)
+            df = yf.download(safe_yfinance_ticker(symbol if 'symbol' in locals() else asset if 'asset' in locals() else '', ticker), interval=interval, period=period, auto_adjust=True, progress=False, threads=False)
             if df is None or df.empty:
                 last_error = "empty response"
             else:
@@ -4233,6 +4383,7 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
       • max 4 accepted auto-orders per Nairobi day
     """
     asset = str(getattr(sig, "asset", "") or "").strip().upper()
+    grade = str(getattr(sig, "grade", "") or "").strip().upper()
     timeframe = _normalize_timeframe(getattr(sig, "timeframe", "") or DEFAULT_USER_TIMEFRAME)
     owner_filter = str(CAPITAL_AUTO_TRADE_OWNER or "").strip().lower()
     fallback = {
@@ -4527,7 +4678,7 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
     if CAPITAL_AUTO_TRADE_REQUIRE_DEMO and not CAPITAL_DEMO:
         print(f"[CapitalAuto] Refusing to auto-trade {sig.asset}: CAPITAL_DEMO is false.")
         return False
-    if not capital_configured():
+    if not ensure_capital_credentials_loaded():
         print(f"[CapitalAuto] Capital credentials missing — cannot auto-trade {sig.asset}.")
         return False
     if grade not in CAPITAL_AUTO_TRADE_GRADES or direction not in {"BUY", "SELL"} or timeframe not in CAPITAL_AUTO_TRADE_TIMEFRAMES:
@@ -4729,8 +4880,8 @@ def sync_capital_actual_executions() -> int:
     """Read Capital.com open positions/history into Supabase for comparison."""
     if not CAPITAL_SYNC_EXECUTIONS:
         return 0
-    if not capital_configured():
-        print("[CapitalSync] Capital.com credentials not configured — skipping actual execution sync.")
+    if not ensure_capital_credentials_loaded():
+        print("[CapitalSync] No enabled user Capital connection found — skipping actual execution sync.")
         return 0
     rows: list[dict] = []
     for pos in capital_fetch_open_positions():
