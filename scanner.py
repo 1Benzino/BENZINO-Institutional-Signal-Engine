@@ -486,6 +486,24 @@ SCAN_ALL_TIMEFRAMES_EVERY_RUN = os.environ.get("SCAN_ALL_TIMEFRAMES_EVERY_RUN", 
 SLOW_TIMEFRAME_WINDOW_MINUTES = int(os.environ.get("SLOW_TIMEFRAME_WINDOW_MINUTES", "15"))
 MTF_CONFIRMATION_TIMEFRAMES = ["15m", "1h", "4h"]
 _TF_CACHE: dict[tuple[str, str], pd.DataFrame | None] = {}
+_CAPITAL_PRICE_CACHE: dict[tuple[str, str, int], pd.DataFrame | None] = {}
+_RUNTIME_BREAKDOWN: dict[str, float] = {}
+
+
+def _runtime_add(name: str, seconds: float) -> None:
+    try:
+        _RUNTIME_BREAKDOWN[name] = float(_RUNTIME_BREAKDOWN.get(name, 0.0)) + float(seconds)
+    except Exception:
+        pass
+
+
+def _runtime_start() -> float:
+    return time.perf_counter()
+
+
+def _runtime_stop(name: str, start: float) -> None:
+    _runtime_add(name, time.perf_counter() - float(start))
+
 
 
 def active_timeframes_for_run(now: datetime | None = None, requested_timeframes: list[str] | None = None) -> list[str]:
@@ -1421,7 +1439,7 @@ def fetch_open_trades(assets: set[str] | None = None, timeframes: set[str] | Non
 
 
 def fetch_unresolved_shadow_trades(assets: set[str] | None = None, timeframes: set[str] | None = None,
-                                   max_age_days: int = 3650, limit: int | None = None) -> list[dict]:
+                                   max_age_days: int = 3650, limit: int | None = None, due_only: bool = False) -> list[dict]:
     """
     NO TRADE signals are never alerted and never touch the prop ledger, but they
     ARE still worth tracking hypothetically: "if a trader had taken this blocked
@@ -1444,6 +1462,19 @@ def fetch_unresolved_shadow_trades(assets: set[str] | None = None, timeframes: s
             if timeframes:
                 sql += " AND timeframe = ANY(%s)"
                 params.append(list(timeframes))
+            if due_only:
+                sql += """
+                  AND (
+                        replay_checked_at IS NULL
+                        OR replay_checked_at <= NOW() - CASE LOWER(COALESCE(timeframe, '15m'))
+                            WHEN '15m' THEN INTERVAL '15 minutes'
+                            WHEN '1h' THEN INTERVAL '1 hour'
+                            WHEN '4h' THEN INTERVAL '4 hours'
+                            WHEN '1d' THEN INTERVAL '1 day'
+                            ELSE INTERVAL '15 minutes'
+                        END
+                  )
+                """
             sql += " ORDER BY created_at ASC LIMIT %s"
             params.append(int(limit or SHADOW_EVAL_LIMIT))
             cur.execute(sql, tuple(params))
@@ -1848,7 +1879,13 @@ def capital_start_session() -> bool:
 
 def capital_request(method: str, path: str, *, params: dict | None = None, json_body: dict | None = None, retries: int = 2) -> dict | None:
     if not capital_configured():
-        return None
+        _runtime_stop("capital_api", _t0)
+    return None
+    _t0 = _runtime_start()
+    try:
+        _RUNTIME_BREAKDOWN["capital_api_calls"] = float(_RUNTIME_BREAKDOWN.get("capital_api_calls", 0.0)) + 1.0
+    except Exception:
+        pass
     for attempt in range(1, retries + 1):
         try:
             url = f"{CAPITAL_BASE_URL}{path}"
@@ -1866,12 +1903,14 @@ def capital_request(method: str, path: str, *, params: dict | None = None, json_
                     print(f"[Capital] {method} {path} failed: HTTP {resp.status_code} {resp.text[:160]}")
                 time.sleep(0.5)
                 continue
+            _runtime_stop("capital_api", _t0)
             return resp.json()
         except Exception as exc:
             _CAPITAL_LAST_ERROR["text"] = str(exc)
             if attempt == retries:
                 print(f"[Capital] {method} {path} failed: {exc}")
             time.sleep(0.5)
+    _runtime_stop("capital_api", _t0)
     return None
 
 
@@ -2345,23 +2384,34 @@ def capital_prices_to_df(data: dict) -> pd.DataFrame | None:
 
 
 def capital_download(symbol: str, timeframe: str, max_rows: int = 1000) -> pd.DataFrame | None:
-    """Download OHLCV from Capital.com for a BENZINO asset key."""
+    """Download/cache OHLCV from Capital.com for a BENZINO asset key."""
     if not capital_configured():
         return None
     symbol = str(symbol or "").strip().upper()
     timeframe = str(timeframe or "15m").strip().lower()
+    max_rows_i = int(min(max_rows, 1000))
+    cache_key = (symbol, timeframe, max_rows_i)
+    if cache_key in _CAPITAL_PRICE_CACHE:
+        cached = _CAPITAL_PRICE_CACHE[cache_key]
+        return cached.copy() if cached is not None else None
+    _t0 = _runtime_start()
     resolution = CAPITAL_RESOLUTION_MAP.get(timeframe, "MINUTE_15")
     epic = capital_find_epic(symbol)
     if not epic:
+        _CAPITAL_PRICE_CACHE[cache_key] = None
+        _runtime_stop("capital_candle_fetch", _t0)
         return None
-    params = {"resolution": resolution, "max": int(min(max_rows, 1000))}
+    params = {"resolution": resolution, "max": max_rows_i}
     data = capital_request("GET", f"/prices/{epic}", params=params, retries=2)
     df = capital_prices_to_df(data or {})
+    ok = False
     if df is not None and len(df) >= 50:
-        return df
+        ok = True
     if df is not None and timeframe == "1m" and len(df) >= 5:
-        return df
-    return None
+        ok = True
+    _CAPITAL_PRICE_CACHE[cache_key] = df.copy() if ok else None
+    _runtime_stop("capital_candle_fetch", _t0)
+    return df.copy() if ok else None
 
 
 def should_use_capital_for_ticker(ticker: str) -> bool:
@@ -3640,6 +3690,19 @@ def backfill_shadow_trade_plans(assets: set[str] | None = None, timeframes: set[
             if timeframes:
                 sql += " AND timeframe = ANY(%s)"
                 params.append(list(timeframes))
+            if due_only:
+                sql += """
+                  AND (
+                        replay_checked_at IS NULL
+                        OR replay_checked_at <= NOW() - CASE LOWER(COALESCE(timeframe, '15m'))
+                            WHEN '15m' THEN INTERVAL '15 minutes'
+                            WHEN '1h' THEN INTERVAL '1 hour'
+                            WHEN '4h' THEN INTERVAL '4 hours'
+                            WHEN '1d' THEN INTERVAL '1 day'
+                            ELSE INTERVAL '15 minutes'
+                        END
+                  )
+                """
             sql += " ORDER BY created_at ASC LIMIT %s"
             params.append(int(SHADOW_BACKFILL_LIMIT))
             cur.execute(sql, tuple(params))
@@ -3707,6 +3770,7 @@ def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] 
         assets=assets,
         timeframes=timeframes,
         limit=SHADOW_EVAL_LIMIT,
+        due_only=True,
     )
     if not shadow_trades:
         print("[Shadow] No unresolved NO TRADE rows to evaluate.")
@@ -5186,27 +5250,45 @@ def run_scan() -> None:
     print(f"{'='*70}\n")
 
     _TF_CACHE.clear()
+    _MINUTE_REPLAY_CACHE.clear()
+    _CAPITAL_PRICE_CACHE.clear()
+    _RUNTIME_BREAKDOWN.clear()
+    _t = _runtime_start()
     init_tables()
+    _runtime_stop("db_init", _t)
+    _t = _runtime_start()
     refresh_missing_capital_constraints(limit=40)
+    _runtime_stop("capital_constraints", _t)
     if LOCK_HISTORICAL_SIGNAL_PLANS:
         print("[Replay1mBackfill] Historical signal plans locked: entry/sl/tp are preserved; only outcomes are updated.")
+    _t = _runtime_start()
     force_open_graded_setups()
+    _runtime_stop("force_open_fix", _t)
 
     # 1. Resolve outcomes for everything already open BEFORE scanning for new setups.
     # Important: outcome evaluation must NOT be limited to active_tfs. A 4h/1d
     # trade can hit TP/SL while the scheduled run is only generating 15m signals.
     # Therefore every run checks every open timeframe using Capital.com replay.
     all_replay_tfs = set(TIMEFRAME_CONFIGS.keys())
+    _t = _runtime_start()
     evaluate_open_trades(assets=set(scan_assets.keys()), timeframes=all_replay_tfs)
+    _runtime_stop("open_trade_replay", _t)
+    _t = _runtime_start()
     evaluate_shadow_trades(assets=set(scan_assets.keys()), timeframes=all_replay_tfs)
+    _runtime_stop("shadow_replay", _t)
     if REPLAY_EXISTING_OUTCOMES:
+        _t = _runtime_start()
         replay_existing_resolved_outcomes()
+        _runtime_stop("historical_resolved_replay", _t)
+    _t = _runtime_start()
     sync_capital_actual_executions()
+    _runtime_stop("execution_audit_sync", _t)
 
     journaled, alerted, shadowed = 0, 0, 0
     assets_scanned = 0
     asset_seconds: list[float] = []
 
+    _scan_loop_start = _runtime_start()
     for asset, ticker in scan_assets.items():
         asset_start = time.perf_counter()
         asset_attempted = False
@@ -5274,7 +5356,10 @@ def run_scan() -> None:
             assets_scanned += 1
             asset_seconds.append(time.perf_counter() - asset_start)
 
+    _runtime_stop("signal_generation_loop", _scan_loop_start)
+    _t = _runtime_start()
     force_open_graded_setups()
+    _runtime_stop("force_open_fix", _t)
     finished = datetime.now(timezone.utc)
     elapsed = (finished - started).total_seconds()
     print(f"\n{'='*70}")
@@ -5282,6 +5367,15 @@ def run_scan() -> None:
     open_count = len(fetch_open_trades(assets=set(scan_assets.keys()), timeframes=set(active_tfs)))
     print(f"  Journaled (A+/A/B/C): {journaled} | Open trades: {open_count} | Alerted: {alerted} | Shadowed (NO TRADE): {shadowed}")
     print(f"  Runtime: fastest asset {min(asset_seconds) if asset_seconds else 0:.1f}s | slowest {max(asset_seconds) if asset_seconds else 0:.1f}s | avg {float(np.mean(asset_seconds)) if asset_seconds else 0:.1f}s")
+    if _RUNTIME_BREAKDOWN:
+        ordered_runtime = sorted(_RUNTIME_BREAKDOWN.items(), key=lambda kv: kv[1], reverse=True)
+        print("  Runtime breakdown:")
+        for name, seconds in ordered_runtime:
+            if name == "capital_api_calls":
+                continue
+            print(f"    - {name}: {seconds:.1f}s")
+        if "capital_api_calls" in _RUNTIME_BREAKDOWN:
+            print(f"    - capital_api_calls: {int(_RUNTIME_BREAKDOWN.get('capital_api_calls', 0))}")
     if ENABLE_LEGACY_GLOBAL_PROP_LEDGER:
         state = load_prop_firm_state()
         print(f"  Legacy global prop ledger: equity ${float(state['current_equity']):,.2f} "

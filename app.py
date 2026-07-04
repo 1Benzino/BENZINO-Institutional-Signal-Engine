@@ -1746,33 +1746,33 @@ def verify_prop_history_rebuild() -> dict:
 
 
 def prop_session_from_timestamp(ts) -> str:
-    """Trading-session label in Nairobi display time.
+    """Return the same session bucket used by the User Journal tables.
 
-    This is intentionally simple and stable:
-      Asia:     00:00–07:59 EAT
-      London:   08:00–15:59 EAT
-      New York: 16:00–23:59 EAT
+    Keeping Prop Firm and User Journal on the same session taxonomy prevents the
+    prop cards from showing one answer while the journal session table shows
+    another. Buckets are in Nairobi/EAT display time:
+      Asia: 00:00–06:59
+      London AM: 07:00–11:59
+      London/NY Overlap: 12:00–16:59
+      New York PM: 17:00–21:59
+      Late / Rollover: 22:00–23:59
     """
-    try:
-        hour = pd.to_datetime(ts, utc=True).tz_convert(NAIROBI_TZ).hour
-    except Exception:
-        return "Unknown"
-    if 0 <= hour < 8:
-        return "Asia"
-    if 8 <= hour < 16:
-        return "London"
-    return "New York"
+    return session_name(ts)
 
 
 def prop_session_open_hour(session: str) -> int | None:
-    """Return the Nairobi hour when a named prop session opens."""
+    """Return the Nairobi hour when a named prop session bucket opens."""
     session = str(session or "").strip().lower()
     if session == "asia":
         return 0
-    if session == "london":
-        return 8
-    if session in {"new york", "newyork", "ny"}:
-        return 16
+    if session in {"london", "london am"}:
+        return 7
+    if session in {"london/ny overlap", "london ny overlap", "overlap"}:
+        return 12
+    if session in {"new york", "new york pm", "newyork", "ny"}:
+        return 17
+    if session in {"late / rollover", "late/rollover", "rollover", "late"}:
+        return 22
     return None
 
 
@@ -1789,10 +1789,36 @@ def prop_is_one_hour_after_session_open(ts, session: str) -> bool:
 
 
 def prop_best_session_profile(df: pd.DataFrame, min_trades: int = PROP_MIN_SESSION_TRADES) -> dict:
-    """Find the user's dynamic best prop session from closed A/A+ trades only."""
+    """Find the user's dynamic best prop session from user-scoped closed A/A+ trades.
+
+    This intentionally mirrors the User Journal "By session" table:
+      • same session buckets via session_name()/prop_session_from_timestamp()
+      • closed/resolved A+ and A trades only
+      • current tracking period only, because simulate_prop_challenge_cycles()
+        applies tracking_started_at before calling this helper
+      • minimum sample threshold before the session is allowed to filter prop picks
+
+    Ranking favours win rate first because the prop challenge cares most about
+    avoiding drawdown/breaches. Profit factor and net R are tie-breakers.
+    """
+    base = {
+        "best_session": "All sessions",
+        "profit_factor": 0.0,
+        "win_rate": 0.0,
+        "net_r": 0.0,
+        "trade_count": 0,
+        "sample_ready": False,
+        "all_sessions": [],
+        "source": "User Journal closed A+/A trades in current tracking period",
+        "selection_rule": f"Highest win rate among sessions with at least {int(min_trades)} closed A+/A trades; profit factor and net R break ties.",
+    }
     if df is None or df.empty:
-        return {"best_session": "All sessions", "profit_factor": 0.0, "win_rate": 0.0, "trade_count": 0, "sample_ready": False}
+        return base
     work = df.copy()
+    if "grade" in work.columns:
+        work = work[work["grade"].astype(str).str.upper().isin(["A+", "A"])].copy()
+    if work.empty:
+        return base
     if "prop_event_time" not in work.columns:
         event_time = pd.to_datetime(work.get("exit_at", pd.Series(pd.NaT, index=work.index)), errors="coerce", utc=True)
         created_time = pd.to_datetime(work.get("created_at", pd.Series(pd.NaT, index=work.index)), errors="coerce", utc=True)
@@ -1811,15 +1837,31 @@ def prop_best_session_profile(df: pd.DataFrame, min_trades: int = PROP_MIN_SESSI
         pf = gross_profit / gross_loss if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
         wr = float((g["r_multiple"] > 0).mean() * 100) if len(g) else 0.0
         net = float(g["r_multiple"].sum())
-        rows.append({"best_session": session, "profit_factor": pf, "win_rate": wr, "net_r": net, "trade_count": int(len(g)), "sample_ready": len(g) >= min_trades})
+        rows.append({
+            "best_session": session,
+            "profit_factor": pf,
+            "win_rate": wr,
+            "net_r": net,
+            "trade_count": int(len(g)),
+            "sample_ready": len(g) >= min_trades,
+        })
     if not rows:
-        return {"best_session": "All sessions", "profit_factor": 0.0, "win_rate": 0.0, "trade_count": 0, "sample_ready": False}
+        return base
     eligible = [r for r in rows if r["sample_ready"]]
-    ranked = sorted(eligible or rows, key=lambda r: (r["profit_factor"], r["win_rate"], r["net_r"], r["trade_count"]), reverse=True)
-    out = ranked[0]
-    out["all_sessions"] = rows
+    ranked_pool = eligible if eligible else rows
+    ranked = sorted(ranked_pool, key=lambda r: (r["win_rate"], r["profit_factor"], r["net_r"], r["trade_count"]), reverse=True)
+    out = dict(base)
+    if eligible:
+        out.update(ranked[0])
+        out["sample_ready"] = True
+    else:
+        # Show the best provisional session for transparency, but do not let it
+        # filter prop picks until the minimum sample threshold has been met.
+        out.update(ranked[0])
+        out["sample_ready"] = False
+        out["active_filter_session"] = "All sessions"
+    out["all_sessions"] = sorted(rows, key=lambda r: (r["trade_count"], r["win_rate"]), reverse=True)
     return out
-
 
 def apply_prop_best_session_trade_filter(df: pd.DataFrame, profile: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Apply Prop Firm v2: best session only, max 4 trades/day.
@@ -6531,10 +6573,11 @@ def render_workflow(username: str, settings: dict) -> None:
         session_label = str(best_session_info.get("best_session", "All sessions"))
         sample_note = f"{int(best_session_info.get('trade_count', 0) or 0)} A/A+ trades"
         if not bool(best_session_info.get("sample_ready", False)):
-            sample_note += f" · minimum {PROP_MIN_SESSION_TRADES} required"
+            sample_note += f" · minimum {PROP_MIN_SESSION_TRADES} required · filter not active"
         with bs1: metric_card("Best trading session", session_label, sample_note)
         with bs2: metric_card("Session profit factor", f"{float(best_session_info.get('profit_factor', 0.0) or 0.0):.2f}", "A/A+ closed trades only")
-        with bs3: metric_card("Session win rate", f"{float(best_session_info.get('win_rate', 0.0) or 0.0):.2f}%", "Used for prop trade filter")
+        with bs3: metric_card("Session win rate", f"{float(best_session_info.get('win_rate', 0.0) or 0.0):.2f}%", "Used for prop trade filter once sample is ready")
+        st.caption("Prop session source: User Journal closed A+/A trades, current tracking period, same session buckets as the Journal By session table. The filter recalculates on each app load/replay.")
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         p1, p2, p3 = st.columns(3)
@@ -7253,25 +7296,17 @@ def render_workflow(username: str, settings: dict) -> None:
                 f"Your {user_prop_tf} prop challenge is active in {user_prop_phase} and currently sits at {user_prop_roi:+.2f}% from the $10,000 starting balance after {user_prop_closed} closed prop trade(s) across {user_prop_days} trading day(s). The instruction is to preserve drawdown first, then allow only the strongest A+/A opportunities in your best-performing session."
             )
 
-        aa_closed = resolved[resolved.get("grade", pd.Series(dtype=str)).astype(str).isin(["A+", "A"])] if not resolved.empty and "grade" in resolved.columns else pd.DataFrame()
-        if not aa_closed.empty and "session" in aa_closed.columns:
-            session_perf = aa_closed.groupby("session").apply(
-                lambda g: pd.Series({
-                    "trades": len(closed_resolved_trades(g)),
-                    "win_rate": win_rate_group(g),
-                    "avg_r": pd.to_numeric(g.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean(),
-                    "net_r": pd.to_numeric(g.get("r_multiple", pd.Series(dtype=float)), errors="coerce").sum(),
-                }), include_groups=False
-            ).reset_index()
-            supported = session_perf[session_perf["trades"] >= 5].sort_values(["avg_r", "win_rate", "net_r"], ascending=False)
-            if not supported.empty:
-                srow = supported.iloc[0]
+        if user_best_session and user_best_session.get("trade_count", 0):
+            prop_parts.append(
+                f"The prop session source is your User Journal closed A+/A trades in the current tracking period, using the same session buckets as the Journal By session table. The current best candidate is {user_best_session.get('best_session')} with {int(user_best_session.get('trade_count', 0) or 0)} closed A+/A trade(s), a {float(user_best_session.get('win_rate', 0.0) or 0.0):.2f}% win rate, and {float(user_best_session.get('profit_factor', 0.0) or 0.0):.2f} profit factor."
+            )
+            if user_best_session.get("sample_ready"):
                 prop_parts.append(
-                    f"The best supported A+/A session in your current sample is {srow['session']}, with {int(srow['trades'])} closed trade(s), a {srow['win_rate']:.2f}% win rate, and {srow['net_r']:+.2f}R net performance. Prop auto-trading should ignore the first hour of that session, then take only the first four eligible A+/A demo trades per day."
+                    f"Because that session has at least {PROP_MIN_SESSION_TRADES} closed A+/A trades, the prop filter is active: wait one hour after {user_best_session.get('best_session')} opens, then take only the first four eligible A+/A demo trades per Nairobi day."
                 )
             else:
                 prop_parts.append(
-                    "There is not enough A+/A session evidence yet to make the session filter fully reliable. Until the sample grows, the system should remain conservative and avoid treating a small winning streak as proof of edge."
+                    f"The prop session filter is not active yet because no session has at least {PROP_MIN_SESSION_TRADES} closed A+/A trades. Until the sample is ready, the challenge replay should not force a small-sample session edge."
                 )
         else:
             prop_parts.append(
