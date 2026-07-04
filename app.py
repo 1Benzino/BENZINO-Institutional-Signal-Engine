@@ -5835,6 +5835,142 @@ def render_market_news(username: str, settings: dict) -> None:
         )
 
 
+
+def render_user_journal_history_page(username: str, settings: dict) -> None:
+    """Render archived User Journal reset periods from user_journal_history.
+
+    This is the canonical history table used after a user resets journal tracking.
+    It is intentionally read-only: reset/archive remains under Settings → Reset.
+    """
+    workflow_commentary(
+        "History stores each archived User Journal tracking period after you reset tracking. "
+        "Each period keeps the starting balance, ending balance, realised P/L, win rate, "
+        "grade growth, balance-curve points, trade details, and the settings snapshot used at the time."
+    )
+
+    try:
+        hist = read_df(
+            """
+            SELECT id, period_number, started_at, finished_at, starting_balance, ending_balance,
+                   realised_pnl, win_rate, grade_a_plus_growth, grade_a_growth,
+                   grade_b_growth, grade_c_growth, trade_count,
+                   balance_curve_json, trades_json, settings_snapshot, created_at
+            FROM user_journal_history
+            WHERE scan_owner = %s
+            ORDER BY COALESCE(period_number, 0) DESC, finished_at DESC, created_at DESC
+            """,
+            (username,),
+        )
+    except Exception as exc:
+        st.error(f"Could not load User Journal history: {exc}")
+        return
+
+    if hist.empty:
+        st.info("No archived User Journal periods yet. Use Settings → Reset to archive the current period before starting fresh.")
+        return
+
+    latest = hist.iloc[0]
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        metric_card("Archived periods", f"{len(hist):,}", "Completed tracking periods")
+    with c2:
+        metric_card("Latest ending balance", f"${float(pd.to_numeric(latest.get('ending_balance', 0), errors='coerce') or 0):,.2f}")
+    with c3:
+        metric_card("Latest P/L", f"${float(pd.to_numeric(latest.get('realised_pnl', 0), errors='coerce') or 0):+,.2f}")
+    with c4:
+        wr = pd.to_numeric(latest.get('win_rate', 0), errors='coerce')
+        metric_card("Latest win rate", f"{float(wr) if pd.notna(wr) else 0:.2f}%")
+
+    summary_cols = [
+        "period_number", "started_at", "finished_at", "starting_balance", "ending_balance",
+        "realised_pnl", "win_rate", "grade_a_plus_growth", "grade_a_growth",
+        "grade_b_growth", "grade_c_growth", "trade_count"
+    ]
+    summary = hist[[c for c in summary_cols if c in hist.columns]].copy()
+    rename_map = {
+        "period_number": "Period", "started_at": "Started", "finished_at": "Finished",
+        "starting_balance": "Starting Balance", "ending_balance": "Ending Balance",
+        "realised_pnl": "Realised P/L", "win_rate": "Win Rate",
+        "grade_a_plus_growth": "A+ Growth", "grade_a_growth": "A Growth",
+        "grade_b_growth": "B Growth", "grade_c_growth": "C Growth", "trade_count": "Trades",
+    }
+    summary = summary.rename(columns=rename_map)
+    for col in ["Started", "Finished"]:
+        if col in summary.columns:
+            summary[col] = summary[col].apply(fmt_nairobi)
+    for col in ["Starting Balance", "Ending Balance", "Realised P/L", "A+ Growth", "A Growth", "B Growth", "C Growth"]:
+        if col in summary.columns:
+            summary[col] = pd.to_numeric(summary[col], errors="coerce").apply(lambda v: f"${v:,.2f}" if pd.notna(v) else "")
+    if "Win Rate" in summary.columns:
+        summary["Win Rate"] = pd.to_numeric(summary["Win Rate"], errors="coerce").apply(lambda v: f"{v:.2f}%" if pd.notna(v) else "")
+
+    render_benzino_aggrid(
+        summary,
+        key="user_journal_history_summary",
+        title="Archived Periods",
+        height=320,
+        page_size=10,
+        pinned=["Period"],
+        numeric_cols_right=["Trades"],
+    )
+
+    period_options = []
+    for _, row in hist.iterrows():
+        period_no = row.get("period_number", "")
+        finished = fmt_nairobi(row.get("finished_at", ""))
+        period_options.append(f"Period {period_no} · {finished}")
+    selected_label = st.selectbox("View archived period", period_options, key="user_journal_history_period_select")
+    selected_idx = period_options.index(selected_label) if selected_label in period_options else 0
+    selected = hist.iloc[selected_idx]
+
+    def _json_value(value, fallback):
+        if isinstance(value, (list, dict)):
+            return value
+        if value in (None, "") or (isinstance(value, float) and pd.isna(value)):
+            return fallback
+        try:
+            return json.loads(value)
+        except Exception:
+            return fallback
+
+    curve = _json_value(selected.get("balance_curve_json"), [])
+    trades_json = _json_value(selected.get("trades_json"), [])
+
+    if isinstance(curve, list) and curve:
+        curve_df = pd.DataFrame(curve)
+        if not curve_df.empty and {"resolved_at", "balance"}.issubset(set(curve_df.columns)):
+            curve_df["resolved_at"] = pd.to_datetime(curve_df["resolved_at"], errors="coerce")
+            curve_df["balance"] = pd.to_numeric(curve_df["balance"], errors="coerce")
+            curve_df = curve_df.dropna(subset=["resolved_at", "balance"])
+            if not curve_df.empty:
+                st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
+                st.markdown("<div class='benzino-panel-title'>Archived Balance Curve</div>", unsafe_allow_html=True)
+                fig = go.Figure()
+                group_col = "group" if "group" in curve_df.columns else None
+                groups = curve_df[group_col].dropna().unique().tolist() if group_col else ["Balance"]
+                for group in groups:
+                    g = curve_df[curve_df[group_col].astype(str).eq(str(group))] if group_col else curve_df
+                    g = g.sort_values("resolved_at")
+                    fig.add_trace(go.Scatter(x=g["resolved_at"], y=g["balance"], mode="lines", name=str(group)))
+                fig.update_layout(height=360, margin=dict(l=20, r=20, t=30, b=20), yaxis_title="Balance")
+                st.plotly_chart(fig, use_container_width=True)
+
+    if isinstance(trades_json, list) and trades_json:
+        trades_df = pd.DataFrame(trades_json)
+        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
+        render_benzino_aggrid(
+            trades_df,
+            key="user_journal_history_trades",
+            title="Archived Trade Details",
+            height=420,
+            page_size=15,
+            pinned=[c for c in ["asset", "signal", "grade"] if c in trades_df.columns],
+            badge_cols={"signal": "signal", "grade": "grade", "status": "status", "outcome": "outcome"},
+            numeric_cols_right=[c for c in ["entry", "sl", "tp", "rr", "r_multiple", "pnl_cash", "balance_after"] if c in trades_df.columns],
+        )
+    else:
+        st.info("This archived period has no saved trade details.")
+
 def render_workflow(username: str, settings: dict) -> None:
     page_header("Workflow", "")
     raw_df = enrich_position_sizing(load_signals_for_user(username, settings), settings)
