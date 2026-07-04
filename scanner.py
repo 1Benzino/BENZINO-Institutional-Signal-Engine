@@ -959,6 +959,48 @@ def init_tables() -> None:
     CREATE INDEX IF NOT EXISTS idx_capital_comparison_asset
         ON capital_trade_comparisons (asset, opened_at DESC);
 
+    CREATE TABLE IF NOT EXISTS capital_execution_audit (
+        id TEXT PRIMARY KEY,
+        capital_trade_id TEXT REFERENCES capital_executed_trades(id),
+        signal_id TEXT REFERENCES scanner_signals(signal_id),
+        scan_owner TEXT,
+        asset TEXT,
+        timeframe TEXT,
+        direction TEXT,
+        grade TEXT,
+        auto_trade BOOLEAN DEFAULT TRUE,
+        planned_entry NUMERIC,
+        executed_entry NUMERIC,
+        entry_slippage NUMERIC,
+        planned_sl NUMERIC,
+        planned_tp NUMERIC,
+        planned_exit NUMERIC,
+        actual_exit NUMERIC,
+        exit_slippage NUMERIC,
+        planned_r NUMERIC,
+        actual_r NUMERIC,
+        broker_pnl NUMERIC,
+        broker_pnl_ftmo_equiv NUMERIC,
+        ftmo_leverage NUMERIC DEFAULT 100,
+        capital_leverage NUMERIC,
+        ftmo_normalization_factor NUMERIC DEFAULT 1,
+        replay_outcome TEXT,
+        broker_status TEXT,
+        size NUMERIC,
+        currency TEXT,
+        environment TEXT,
+        epic TEXT,
+        deal_reference TEXT,
+        deal_id TEXT,
+        opened_at TIMESTAMPTZ,
+        closed_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_capital_execution_audit_owner_time
+        ON capital_execution_audit (scan_owner, opened_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_capital_execution_audit_signal
+        ON capital_execution_audit (signal_id);
+
     CREATE TABLE IF NOT EXISTS benzino_signal_counter (
         id      INTEGER PRIMARY KEY DEFAULT 1,
         counter BIGINT NOT NULL DEFAULT 0,
@@ -4926,16 +4968,27 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
     return ok
 
 
-def rebuild_capital_auto_comparisons(limit: int = 500) -> int:
-    """Build comparison rows for auto-traded signals using stored signal_id links."""
+def rebuild_capital_execution_audit(limit: int = 500) -> int:
+    """Build the Capital.com Execution Audit from BENZINO-created broker orders.
+
+    This is no longer a simulated-vs-actual matching engine. Because Capital.com is
+    the pricing source, the audit starts from capital_auto_orders (orders BENZINO
+    actually sent), links the imported Capital.com execution row by deal id/reference,
+    and records execution quality: planned levels, broker fills, slippage, broker
+    P/L, and replay/broker outcome.
+    """
     try:
         conn = db_connect()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT ao.*, ss.exit_price AS simulated_exit, ss.r_multiple AS simulated_r,
-                           ss.status AS simulated_outcome, ss.exit_reason, ss.created_at AS signal_created_at
+                    SELECT
+                        ao.*,
+                        ss.exit_price AS replay_exit,
+                        ss.r_multiple AS replay_r,
+                        ss.status AS replay_status,
+                        ss.exit_reason AS replay_exit_reason
                     FROM capital_auto_orders ao
                     LEFT JOIN scanner_signals ss ON ss.signal_id = ao.signal_id
                     WHERE ao.status IN ('OPENED','CLOSED','ACCEPTED')
@@ -4945,73 +4998,107 @@ def rebuild_capital_auto_comparisons(limit: int = 500) -> int:
                     (int(limit),),
                 )
                 rows = [dict(r) for r in cur.fetchall()]
-                inserted = 0
+                upserted = 0
                 for row in rows:
-                    # Try to locate the latest imported actual row by deal id/reference.
                     actual = None
                     if row.get("deal_id") or row.get("deal_reference"):
                         cur.execute(
                             """
-                            SELECT * FROM capital_executed_trades
-                            WHERE (deal_id = %s AND %s <> '') OR (deal_reference = %s AND %s <> '')
+                            SELECT *
+                            FROM capital_executed_trades
+                            WHERE (deal_id = %s AND %s <> '')
+                               OR (deal_reference = %s AND %s <> '')
                             ORDER BY updated_at DESC
                             LIMIT 1
                             """,
-                            (row.get("deal_id") or "", row.get("deal_id") or "", row.get("deal_reference") or "", row.get("deal_reference") or ""),
+                            (
+                                row.get("deal_id") or "", row.get("deal_id") or "",
+                                row.get("deal_reference") or "", row.get("deal_reference") or "",
+                            ),
                         )
                         actual = cur.fetchone()
                     actual = dict(actual) if actual else {}
-                    comp_id = deterministic_uuid_text(f"AUTO::{row.get('signal_id')}")
+
+                    planned_entry = _parse_float_or_none(row.get("entry"))
+                    executed_entry = _parse_float_or_none(actual.get("entry_price")) or planned_entry
+                    planned_exit = _parse_float_or_none(row.get("replay_exit"))
+                    actual_exit = _parse_float_or_none(actual.get("exit_price"))
+                    entry_slippage = (executed_entry - planned_entry) if executed_entry is not None and planned_entry is not None else None
+                    exit_slippage = (actual_exit - planned_exit) if actual_exit is not None and planned_exit is not None else None
+
                     actual_r = None
                     try:
-                        entry = float(row.get("entry") or 0)
                         sl = float(row.get("sl") or 0)
-                        pnl_exit = _parse_float_or_none(actual.get("exit_price"))
-                        if pnl_exit is not None and abs(entry - sl) > 0:
-                            actual_r = r_multiple_for_exit(str(row.get("direction")), entry, sl, pnl_exit, "ACTUAL")
+                        if actual_exit is not None and planned_entry is not None and abs(planned_entry - sl) > 0:
+                            actual_r = r_multiple_for_exit(str(row.get("direction")), planned_entry, sl, actual_exit, "ACTUAL")
                     except Exception:
                         actual_r = None
+
+                    audit_id = deterministic_uuid_text(f"EXEC_AUDIT::{row.get('signal_id')}")
                     cur.execute(
                         """
-                        INSERT INTO capital_trade_comparisons(
-                            id, capital_trade_id, signal_id, asset, direction,
-                            simulated_entry, actual_entry, simulated_exit, actual_exit,
-                            simulated_r, actual_r, actual_pnl, simulated_outcome, actual_status,
-                            match_quality, opened_at, auto_trade, updated_at
-                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,NOW())
+                        INSERT INTO capital_execution_audit(
+                            id, capital_trade_id, signal_id, scan_owner, asset, timeframe,
+                            direction, grade, auto_trade,
+                            planned_entry, executed_entry, entry_slippage,
+                            planned_sl, planned_tp, planned_exit, actual_exit, exit_slippage,
+                            planned_r, actual_r, broker_pnl, broker_pnl_ftmo_equiv,
+                            ftmo_leverage, capital_leverage, ftmo_normalization_factor,
+                            replay_outcome, broker_status, size, currency, environment, epic,
+                            deal_reference, deal_id, opened_at, closed_at, updated_at
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
                         ON CONFLICT (id) DO UPDATE SET
                             capital_trade_id = EXCLUDED.capital_trade_id,
-                            actual_entry = EXCLUDED.actual_entry,
+                            executed_entry = EXCLUDED.executed_entry,
+                            entry_slippage = EXCLUDED.entry_slippage,
+                            planned_exit = EXCLUDED.planned_exit,
                             actual_exit = EXCLUDED.actual_exit,
-                            simulated_r = EXCLUDED.simulated_r,
+                            exit_slippage = EXCLUDED.exit_slippage,
+                            planned_r = EXCLUDED.planned_r,
                             actual_r = EXCLUDED.actual_r,
-                            actual_pnl = EXCLUDED.actual_pnl,
-                            simulated_outcome = EXCLUDED.simulated_outcome,
-                            actual_status = EXCLUDED.actual_status,
-                            match_quality = EXCLUDED.match_quality,
+                            broker_pnl = EXCLUDED.broker_pnl,
+                            broker_pnl_ftmo_equiv = EXCLUDED.broker_pnl_ftmo_equiv,
+                            replay_outcome = EXCLUDED.replay_outcome,
+                            broker_status = EXCLUDED.broker_status,
+                            size = EXCLUDED.size,
+                            currency = EXCLUDED.currency,
+                            environment = EXCLUDED.environment,
+                            deal_reference = EXCLUDED.deal_reference,
+                            deal_id = EXCLUDED.deal_id,
+                            opened_at = EXCLUDED.opened_at,
+                            closed_at = EXCLUDED.closed_at,
                             updated_at = NOW()
                         """,
                         (
-                            comp_id, actual.get("id"), row.get("signal_id"), row.get("asset"), row.get("direction"),
-                            _parse_float_or_none(row.get("entry")), _parse_float_or_none(actual.get("entry_price")) or _parse_float_or_none(row.get("entry")),
-                            _parse_float_or_none(row.get("simulated_exit")), _parse_float_or_none(actual.get("exit_price")),
-                            _parse_float_or_none(row.get("simulated_r")), actual_r, _parse_float_or_none(actual.get("pnl")),
-                            row.get("simulated_outcome") or row.get("exit_reason"), actual.get("status") or row.get("status"),
-                            "AUTO_MATCHED", actual.get("opened_at") or row.get("created_at"),
+                            audit_id, actual.get("id"), row.get("signal_id"), row.get("scan_owner"), row.get("asset"), row.get("timeframe"),
+                            row.get("direction"), row.get("grade"),
+                            planned_entry, executed_entry, entry_slippage,
+                            _parse_float_or_none(row.get("sl")), _parse_float_or_none(row.get("tp")), planned_exit, actual_exit, exit_slippage,
+                            _parse_float_or_none(row.get("replay_r")), actual_r,
+                            _parse_float_or_none(actual.get("pnl")), _parse_float_or_none(actual.get("pnl_ftmo_equiv")),
+                            _parse_float_or_none(row.get("ftmo_leverage")), _parse_float_or_none(row.get("capital_leverage")), _parse_float_or_none(row.get("ftmo_normalization_factor")),
+                            row.get("replay_status") or row.get("replay_exit_reason"), actual.get("status") or row.get("status"),
+                            _parse_float_or_none(actual.get("size")) or _parse_float_or_none(row.get("size")), actual.get("currency"), actual.get("environment") or row.get("environment"), row.get("epic"),
+                            row.get("deal_reference"), row.get("deal_id"), actual.get("opened_at") or row.get("created_at"), actual.get("closed_at"),
                         ),
                     )
-                    inserted += 1
+                    upserted += 1
         conn.close()
-        if inserted:
-            print(f"[CapitalCompare] Updated {inserted} auto-trade comparison row(s).")
-        return inserted
+        if upserted:
+            print(f"[ExecutionAudit] Updated {upserted} Capital.com execution audit row(s).")
+        return upserted
     except Exception as exc:
-        print(f"[CapitalCompare] Auto comparison rebuild failed: {exc}")
+        print(f"[ExecutionAudit] Audit rebuild failed: {exc}")
         return 0
 
 
+def rebuild_capital_auto_comparisons(limit: int = 500) -> int:
+    """Backward-compatible wrapper. New code writes capital_execution_audit only."""
+    return rebuild_capital_execution_audit(limit=limit)
+
+
 def sync_capital_actual_executions() -> int:
-    """Read Capital.com open positions/history into Supabase for comparison."""
+    """Read Capital.com open positions/history into Supabase for the Execution Audit."""
     if not CAPITAL_SYNC_EXECUTIONS:
         return 0
     if not ensure_capital_credentials_loaded():
@@ -5027,9 +5114,8 @@ def sync_capital_actual_executions() -> int:
         if normalised:
             rows.append(normalised)
     saved = upsert_capital_executed_trades(rows)
-    compared = rebuild_capital_trade_comparisons()
-    auto_compared = rebuild_capital_auto_comparisons()
-    print(f"[CapitalSync] Saved {saved} actual execution row(s); manual comparisons rebuilt: {compared}; auto comparisons updated: {auto_compared}.")
+    audited = rebuild_capital_execution_audit()
+    print(f"[CapitalSync] Saved {saved} actual execution row(s); execution audit rows updated: {audited}.")
     return saved
 
 

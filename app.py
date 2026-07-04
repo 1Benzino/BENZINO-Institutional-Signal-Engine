@@ -267,25 +267,28 @@ def init_tables() -> None:
         settings_json TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS user_journal_tracking_history (
+    CREATE TABLE IF NOT EXISTS user_journal_history (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        username TEXT NOT NULL,
-        previous_tracking_started_at TIMESTAMPTZ,
-        reset_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        scan_owner TEXT,
+        period_number INTEGER,
+        started_at TIMESTAMPTZ,
+        finished_at TIMESTAMPTZ,
         starting_balance NUMERIC,
         ending_balance NUMERIC,
         realised_pnl NUMERIC,
         win_rate NUMERIC,
-        total_trades INTEGER,
-        closed_trades INTEGER,
-        grade_summary JSONB,
-        curve_points JSONB,
-        trade_details JSONB,
+        grade_a_plus_growth NUMERIC,
+        grade_a_growth NUMERIC,
+        grade_b_growth NUMERIC,
+        grade_c_growth NUMERIC,
+        trade_count INTEGER,
+        balance_curve_json JSONB,
+        trades_json JSONB,
         settings_snapshot JSONB,
         created_at TIMESTAMPTZ DEFAULT NOW()
     );
-    CREATE INDEX IF NOT EXISTS idx_user_journal_tracking_history_user_reset
-        ON user_journal_tracking_history(username, reset_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_user_journal_history_owner_finished
+        ON user_journal_history(scan_owner, finished_at DESC);
     CREATE TABLE IF NOT EXISTS user_watchlists (
         scan_owner TEXT NOT NULL,
         asset TEXT NOT NULL,
@@ -439,6 +442,46 @@ def init_tables() -> None:
         opened_at TIMESTAMPTZ,
         updated_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS capital_execution_audit (
+        id TEXT PRIMARY KEY,
+        capital_trade_id TEXT REFERENCES capital_executed_trades(id),
+        signal_id TEXT REFERENCES scanner_signals(signal_id),
+        scan_owner TEXT,
+        asset TEXT,
+        timeframe TEXT,
+        direction TEXT,
+        grade TEXT,
+        auto_trade BOOLEAN DEFAULT TRUE,
+        planned_entry NUMERIC,
+        executed_entry NUMERIC,
+        entry_slippage NUMERIC,
+        planned_sl NUMERIC,
+        planned_tp NUMERIC,
+        planned_exit NUMERIC,
+        actual_exit NUMERIC,
+        exit_slippage NUMERIC,
+        planned_r NUMERIC,
+        actual_r NUMERIC,
+        broker_pnl NUMERIC,
+        broker_pnl_ftmo_equiv NUMERIC,
+        ftmo_leverage NUMERIC DEFAULT 100,
+        capital_leverage NUMERIC,
+        ftmo_normalization_factor NUMERIC DEFAULT 1,
+        replay_outcome TEXT,
+        broker_status TEXT,
+        size NUMERIC,
+        currency TEXT,
+        environment TEXT,
+        epic TEXT,
+        deal_reference TEXT,
+        deal_id TEXT,
+        opened_at TIMESTAMPTZ,
+        closed_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_capital_execution_audit_owner_time
+        ON capital_execution_audit (scan_owner, opened_at DESC);
+
     CREATE TABLE IF NOT EXISTS prop_challenge_history (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         scan_owner TEXT,
@@ -475,6 +518,28 @@ def init_tables() -> None:
                 cur.execute(ddl)
                 cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user'")
                 cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT")
+                # User Journal archive compatibility. Users may have created this table manually.
+                cur.execute("CREATE TABLE IF NOT EXISTS user_journal_history (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), created_at TIMESTAMPTZ DEFAULT NOW())")
+                for _col_sql in [
+                    "ALTER TABLE user_journal_history ADD COLUMN IF NOT EXISTS scan_owner TEXT",
+                    "ALTER TABLE user_journal_history ADD COLUMN IF NOT EXISTS period_number INTEGER",
+                    "ALTER TABLE user_journal_history ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ",
+                    "ALTER TABLE user_journal_history ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ",
+                    "ALTER TABLE user_journal_history ADD COLUMN IF NOT EXISTS starting_balance NUMERIC",
+                    "ALTER TABLE user_journal_history ADD COLUMN IF NOT EXISTS ending_balance NUMERIC",
+                    "ALTER TABLE user_journal_history ADD COLUMN IF NOT EXISTS realised_pnl NUMERIC",
+                    "ALTER TABLE user_journal_history ADD COLUMN IF NOT EXISTS win_rate NUMERIC",
+                    "ALTER TABLE user_journal_history ADD COLUMN IF NOT EXISTS grade_a_plus_growth NUMERIC",
+                    "ALTER TABLE user_journal_history ADD COLUMN IF NOT EXISTS grade_a_growth NUMERIC",
+                    "ALTER TABLE user_journal_history ADD COLUMN IF NOT EXISTS grade_b_growth NUMERIC",
+                    "ALTER TABLE user_journal_history ADD COLUMN IF NOT EXISTS grade_c_growth NUMERIC",
+                    "ALTER TABLE user_journal_history ADD COLUMN IF NOT EXISTS trade_count INTEGER",
+                    "ALTER TABLE user_journal_history ADD COLUMN IF NOT EXISTS balance_curve_json JSONB",
+                    "ALTER TABLE user_journal_history ADD COLUMN IF NOT EXISTS trades_json JSONB",
+                    "ALTER TABLE user_journal_history ADD COLUMN IF NOT EXISTS settings_snapshot JSONB",
+                ]:
+                    cur.execute(_col_sql)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_user_journal_history_owner_finished ON user_journal_history(scan_owner, finished_at DESC)")
                 cur.execute("ALTER TABLE user_telegram_settings ADD COLUMN IF NOT EXISTS alerts_enabled BOOLEAN DEFAULT FALSE")
                 cur.execute("ALTER TABLE user_telegram_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()")
                 cur.execute("""
@@ -532,6 +597,13 @@ def init_tables() -> None:
                 cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS ftmo_leverage NUMERIC DEFAULT 100")
                 cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS capital_leverage NUMERIC")
                 cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS ftmo_normalization_factor NUMERIC DEFAULT 1")
+                cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS scan_owner TEXT")
+                cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS timeframe TEXT")
+                cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS grade TEXT")
+                cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS planned_sl NUMERIC")
+                cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS planned_tp NUMERIC")
+                cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS broker_pnl_ftmo_equiv NUMERIC")
+                cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ")
                 cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS pnl_ftmo_equiv NUMERIC")
                 cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS ftmo_leverage NUMERIC DEFAULT 100")
                 cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS capital_leverage NUMERIC")
@@ -1377,31 +1449,40 @@ def load_prop_firm_trades(limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFrame:
     return numeric_cols(df, ["r_multiple", "pnl_cash", "entry", "sl", "tp"])
 
 
-def load_capital_trade_comparisons(limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFrame:
-    """Actual Capital.com executions matched against simulated BENZINO signals."""
+def load_capital_execution_audit(limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFrame:
+    """Capital.com execution audit rows created from BENZINO auto-orders."""
+    username = active_username()
     df = read_df(
         """
         SELECT
-            c.opened_at, c.asset, c.direction, c.match_quality,
-            c.simulated_entry, c.actual_entry,
-            c.simulated_exit, c.actual_exit,
-            c.simulated_r, c.actual_r, c.actual_pnl, c.actual_pnl_ftmo_equiv, c.ftmo_normalization_factor, c.simulated_outcome, c.actual_status,
-            c.signal_id, c.capital_trade_id, COALESCE(c.auto_trade, FALSE) AS auto_trade,
-            ce.instrument_name, ce.environment, ce.status AS execution_status,
-            ce.size, ce.currency, ce.updated_at
-        FROM capital_trade_comparisons c
-        LEFT JOIN capital_executed_trades ce ON ce.id = c.capital_trade_id
-        ORDER BY c.opened_at DESC NULLS LAST, c.updated_at DESC
+            a.opened_at, a.closed_at, a.scan_owner, a.asset, a.timeframe, a.direction, a.grade,
+            COALESCE(a.auto_trade, TRUE) AS auto_trade,
+            a.planned_entry, a.executed_entry, a.entry_slippage,
+            a.planned_sl, a.planned_tp, a.planned_exit, a.actual_exit, a.exit_slippage,
+            a.planned_r, a.actual_r, a.broker_pnl, a.broker_pnl_ftmo_equiv,
+            a.replay_outcome, a.broker_status, a.signal_id, a.capital_trade_id,
+            a.size, a.currency, a.environment, a.epic, a.deal_reference, a.deal_id, a.updated_at,
+            ce.instrument_name, ce.status AS execution_status
+        FROM capital_execution_audit a
+        LEFT JOIN capital_executed_trades ce ON ce.id = a.capital_trade_id
+        WHERE (%s = '' OR a.scan_owner = %s)
+        ORDER BY a.opened_at DESC NULLS LAST, a.updated_at DESC
         LIMIT %s
         """,
-        (limit,),
+        (username, username, limit),
     )
     if df.empty:
         return df
     return numeric_cols(df, [
-        "simulated_entry", "actual_entry", "simulated_exit",
-        "actual_exit", "simulated_r", "actual_r", "actual_pnl", "size"
+        "planned_entry", "executed_entry", "entry_slippage", "planned_sl", "planned_tp",
+        "planned_exit", "actual_exit", "exit_slippage", "planned_r", "actual_r",
+        "broker_pnl", "broker_pnl_ftmo_equiv", "size"
     ])
+
+
+def load_capital_trade_comparisons(limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFrame:
+    """Backward-compatible alias: the app now reads the Execution Audit table."""
+    return load_capital_execution_audit(limit=limit)
 
 
 def load_capital_executed_trades(limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFrame:
@@ -1639,6 +1720,29 @@ def rebuild_all_user_prop_histories_from_scanner(reset_legacy_ledgers: bool = Tr
             continue
     return result
 
+
+
+def verify_prop_history_rebuild() -> dict:
+    """Check whether the old global prop ledger is empty and user prop histories exist."""
+    out = {"legacy_state_rows": 0, "legacy_trade_rows": 0, "history_rows": 0, "user_history_rows": 0, "users": 0, "warnings": []}
+    try:
+        state_df = read_df("SELECT COUNT(*) AS n FROM prop_firm_state")
+        trades_df = read_df("SELECT COUNT(*) AS n FROM prop_firm_trades")
+        hist_df = read_df("SELECT scan_owner, COUNT(*) AS n, MIN(started_at) AS first_started, MAX(finished_at) AS last_finished FROM prop_challenge_history GROUP BY scan_owner ORDER BY scan_owner")
+        users_df = read_df("SELECT username FROM users ORDER BY username")
+        out["legacy_state_rows"] = int(state_df.iloc[0].get("n", 0)) if not state_df.empty else 0
+        out["legacy_trade_rows"] = int(trades_df.iloc[0].get("n", 0)) if not trades_df.empty else 0
+        out["history_rows"] = int(hist_df["n"].sum()) if not hist_df.empty and "n" in hist_df.columns else 0
+        out["user_history_rows"] = int(hist_df[hist_df["scan_owner"].astype(str).str.contains("::prop::", regex=False)]["n"].sum()) if not hist_df.empty and "scan_owner" in hist_df.columns else 0
+        out["users"] = int(len(users_df)) if not users_df.empty else 0
+        out["history_table"] = hist_df
+        if out["legacy_state_rows"] or out["legacy_trade_rows"]:
+            out["warnings"].append("Legacy global prop tables are not empty. Run the rebuild with legacy ledger clearing enabled.")
+        if out["users"] and out["user_history_rows"] == 0:
+            out["warnings"].append("No per-user prop challenge history rows were found. This may be normal only if there are no closed A+/A trades yet.")
+    except Exception as exc:
+        out["warnings"].append(f"Verification failed: {exc}")
+    return out
 
 
 def prop_session_from_timestamp(ts) -> str:
@@ -5760,111 +5864,117 @@ def render_workflow(username: str, settings: dict) -> None:
     t1, t2, t3, t_cap, t4, t5, t6 = st.tabs(["User Journal", "System Performance", "Prop Firm", "Capital.com", "No Trade Tracker", "Coach AI", "Explain AI"])
 
     with t1:
-        workflow_commentary("This view shows the logged-in user's watchlist-scoped journal trades for the selected timeframe. Open, closed, and resolved outcomes update from Supabase as the scanner evaluates TP, SL, and expiry.")
-        c1, c2, c3, c4 = st.columns(4)
-        resolved = closed_resolved_trades(closed_trades)
-        won_trades = int(resolved_outcome_masks(closed_trades)[0].sum()) if not closed_trades.empty else 0
-        with c1: metric_card("Total journaled", f"{len(trades):,}", "A+/A/B/C setups")
-        with c2: metric_card("Open", f"{len(open_trades):,}", "Currently active")
-        with c3: metric_card("Closed", f"{len(closed_trades):,}", "Resolved trades")
-        with c4: metric_card("Won", f"{won_trades:,}", "Winning trades")
+        uj_entries_tab, uj_history_tab = st.tabs(["Entries", "History"])
+        with uj_entries_tab:
+                workflow_commentary("This view shows the logged-in user's watchlist-scoped journal trades for the selected timeframe. Open, closed, and resolved outcomes update from Supabase as the scanner evaluates TP, SL, and expiry.")
+                c1, c2, c3, c4 = st.columns(4)
+                resolved = closed_resolved_trades(closed_trades)
+                won_trades = int(resolved_outcome_masks(closed_trades)[0].sum()) if not closed_trades.empty else 0
+                with c1: metric_card("Total journaled", f"{len(trades):,}", "A+/A/B/C setups")
+                with c2: metric_card("Open", f"{len(open_trades):,}", "Currently active")
+                with c3: metric_card("Closed", f"{len(closed_trades):,}", "Resolved trades")
+                with c4: metric_card("Won", f"{won_trades:,}", "Winning trades")
 
-        st.subheader("Account performance")
-        render_performance_strip(trades, settings, prop_mode=False)
-        if len(resolved):
-            st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-            st.subheader("User split analysis")
-            ug1, ug2 = st.columns(2)
-            with ug1:
-                grade_perf = resolved.groupby("grade").apply(lambda g: pd.Series({"win_rate": win_rate_group(g), "trades": len(closed_resolved_trades(g))}), include_groups=False).reset_index()
-                st.markdown("**By grade**")
-                render_benzino_aggrid(grade_perf, key="journal_grade_perf", height=240, page_size=10, pinned=["grade"], badge_cols={"grade":"grade", "Grade":"grade"}, numeric_cols_right=[c for c in grade_perf.columns if c not in ["grade", "Grade"]], enable_search=False, show_footer=False, use_pagination=False)
-            with ug2:
-                session_perf = resolved.groupby("session").apply(lambda g: pd.Series({"win_rate": win_rate_group(g), "trades": len(closed_resolved_trades(g))}), include_groups=False).reset_index()
-                st.markdown("**By session**")
-                render_benzino_aggrid(session_perf, key="journal_session_perf", height=240, page_size=10, pinned=["session"], numeric_cols_right=[c for c in session_perf.columns if c not in ["session", "Session"]], enable_search=False, show_footer=False, use_pagination=False)
-            ut1, ut2 = st.columns(2)
-            with ut1:
-                timeframe_perf = resolved.groupby("timeframe").apply(lambda g: pd.Series({"win_rate": win_rate_group(g), "trades": len(closed_resolved_trades(g))}), include_groups=False).reset_index()
-                st.markdown("**By timeframe**")
-                render_benzino_aggrid(timeframe_perf, key="journal_timeframe_perf", height=240, page_size=10, pinned=["timeframe"], numeric_cols_right=[c for c in timeframe_perf.columns if c != "timeframe"], enable_search=False, show_footer=False, use_pagination=False)
-            with ut2:
-                asset_perf = resolved.groupby("asset").apply(lambda g: pd.Series({"win_rate": win_rate_group(g), "trades": len(closed_resolved_trades(g))}), include_groups=False).reset_index()
-                st.markdown("**By asset**")
-                render_benzino_aggrid(asset_perf.sort_values("trades", ascending=False), key="journal_asset_perf", height=240, page_size=10, pinned=["asset"], numeric_cols_right=[c for c in asset_perf.columns if c != "asset"], enable_search=False, show_footer=False, use_pagination=False)
+                st.subheader("Account performance")
+                render_performance_strip(trades, settings, prop_mode=False)
+                if len(resolved):
+                    st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
+                    st.subheader("User split analysis")
+                    ug1, ug2 = st.columns(2)
+                    with ug1:
+                        grade_perf = resolved.groupby("grade").apply(lambda g: pd.Series({"win_rate": win_rate_group(g), "trades": len(closed_resolved_trades(g))}), include_groups=False).reset_index()
+                        st.markdown("**By grade**")
+                        render_benzino_aggrid(grade_perf, key="journal_grade_perf", height=240, page_size=10, pinned=["grade"], badge_cols={"grade":"grade", "Grade":"grade"}, numeric_cols_right=[c for c in grade_perf.columns if c not in ["grade", "Grade"]], enable_search=False, show_footer=False, use_pagination=False)
+                    with ug2:
+                        session_perf = resolved.groupby("session").apply(lambda g: pd.Series({"win_rate": win_rate_group(g), "trades": len(closed_resolved_trades(g))}), include_groups=False).reset_index()
+                        st.markdown("**By session**")
+                        render_benzino_aggrid(session_perf, key="journal_session_perf", height=240, page_size=10, pinned=["session"], numeric_cols_right=[c for c in session_perf.columns if c not in ["session", "Session"]], enable_search=False, show_footer=False, use_pagination=False)
+                    ut1, ut2 = st.columns(2)
+                    with ut1:
+                        timeframe_perf = resolved.groupby("timeframe").apply(lambda g: pd.Series({"win_rate": win_rate_group(g), "trades": len(closed_resolved_trades(g))}), include_groups=False).reset_index()
+                        st.markdown("**By timeframe**")
+                        render_benzino_aggrid(timeframe_perf, key="journal_timeframe_perf", height=240, page_size=10, pinned=["timeframe"], numeric_cols_right=[c for c in timeframe_perf.columns if c != "timeframe"], enable_search=False, show_footer=False, use_pagination=False)
+                    with ut2:
+                        asset_perf = resolved.groupby("asset").apply(lambda g: pd.Series({"win_rate": win_rate_group(g), "trades": len(closed_resolved_trades(g))}), include_groups=False).reset_index()
+                        st.markdown("**By asset**")
+                        render_benzino_aggrid(asset_perf.sort_values("trades", ascending=False), key="journal_asset_perf", height=240, page_size=10, pinned=["asset"], numeric_cols_right=[c for c in asset_perf.columns if c != "asset"], enable_search=False, show_footer=False, use_pagination=False)
 
-        def _render_journal_signal_grid(source_df: pd.DataFrame, table_title: str, key_prefix: str, cols: list[str], badge_map: dict, numeric_right: list[str]) -> None:
-            prepared = prepare_signal_table(source_df[[c for c in cols if c in source_df.columns]])
-            title_col, sig_col, grade_col, status_col, search_col = st.columns([3.6, 1.0, 1.0, 1.15, 2.25], vertical_alignment="center")
-            with title_col:
-                st.markdown(f"<div class='benzino-panel-title'>{html.escape(table_title)}</div>", unsafe_allow_html=True)
-            with sig_col:
-                signal_choice = st.selectbox("Signal", ["All", "BUY", "SELL", "HOLD", "NO TRADE"], label_visibility="collapsed", key=f"{key_prefix}_signal_filter")
-            with grade_col:
-                grade_choice = st.selectbox("Grade", ["All", "A+", "A", "B", "C", "NO TRADE"], label_visibility="collapsed", key=f"{key_prefix}_grade_filter")
-            with status_col:
-                status_options = ["All"] + sorted([str(v) for v in prepared.get("Status", pd.Series(dtype=str)).dropna().astype(str).unique() if str(v).strip()]) if "Status" in prepared.columns else ["All"]
-                status_choice = st.selectbox("Status", status_options, label_visibility="collapsed", key=f"{key_prefix}_status_filter_inline")
-            with search_col:
-                search_choice = st.text_input(f"Search {table_title}", placeholder="Search…", label_visibility="collapsed", key=f"{key_prefix}_search")
-            if signal_choice != "All" and "Signal" in prepared.columns:
-                prepared = prepared[prepared["Signal"].astype(str).str.upper().str.contains(signal_choice, na=False)]
-            if grade_choice != "All" and "Grade" in prepared.columns:
-                prepared = prepared[prepared["Grade"].astype(str).str.upper().eq(grade_choice.upper())]
-            if status_choice != "All" and "Status" in prepared.columns:
-                prepared = prepared[prepared["Status"].astype(str).eq(status_choice)]
-            if search_choice:
-                q = str(search_choice).lower().strip()
-                prepared = prepared[prepared.astype(str).apply(lambda col: col.str.lower().str.contains(q, na=False)).any(axis=1)]
-            render_benzino_aggrid(
-                prepared,
-                key=key_prefix,
-                height=420,
-                page_size=10,
-                pinned=["Asset", "Signal", "Grade", "Age"],
-                badge_cols=badge_map,
-                numeric_cols_right=numeric_right,
-                enable_search=False,
-                title=None,
-            )
+                def _render_journal_signal_grid(source_df: pd.DataFrame, table_title: str, key_prefix: str, cols: list[str], badge_map: dict, numeric_right: list[str]) -> None:
+                    prepared = prepare_signal_table(source_df[[c for c in cols if c in source_df.columns]])
+                    title_col, sig_col, grade_col, status_col, search_col = st.columns([3.6, 1.0, 1.0, 1.15, 2.25], vertical_alignment="center")
+                    with title_col:
+                        st.markdown(f"<div class='benzino-panel-title'>{html.escape(table_title)}</div>", unsafe_allow_html=True)
+                    with sig_col:
+                        signal_choice = st.selectbox("Signal", ["All", "BUY", "SELL", "HOLD", "NO TRADE"], label_visibility="collapsed", key=f"{key_prefix}_signal_filter")
+                    with grade_col:
+                        grade_choice = st.selectbox("Grade", ["All", "A+", "A", "B", "C", "NO TRADE"], label_visibility="collapsed", key=f"{key_prefix}_grade_filter")
+                    with status_col:
+                        status_options = ["All"] + sorted([str(v) for v in prepared.get("Status", pd.Series(dtype=str)).dropna().astype(str).unique() if str(v).strip()]) if "Status" in prepared.columns else ["All"]
+                        status_choice = st.selectbox("Status", status_options, label_visibility="collapsed", key=f"{key_prefix}_status_filter_inline")
+                    with search_col:
+                        search_choice = st.text_input(f"Search {table_title}", placeholder="Search…", label_visibility="collapsed", key=f"{key_prefix}_search")
+                    if signal_choice != "All" and "Signal" in prepared.columns:
+                        prepared = prepared[prepared["Signal"].astype(str).str.upper().str.contains(signal_choice, na=False)]
+                    if grade_choice != "All" and "Grade" in prepared.columns:
+                        prepared = prepared[prepared["Grade"].astype(str).str.upper().eq(grade_choice.upper())]
+                    if status_choice != "All" and "Status" in prepared.columns:
+                        prepared = prepared[prepared["Status"].astype(str).eq(status_choice)]
+                    if search_choice:
+                        q = str(search_choice).lower().strip()
+                        prepared = prepared[prepared.astype(str).apply(lambda col: col.str.lower().str.contains(q, na=False)).any(axis=1)]
+                    render_benzino_aggrid(
+                        prepared,
+                        key=key_prefix,
+                        height=420,
+                        page_size=10,
+                        pinned=["Asset", "Signal", "Grade", "Age"],
+                        badge_cols=badge_map,
+                        numeric_cols_right=numeric_right,
+                        enable_search=False,
+                        title=None,
+                    )
 
-        open_view = add_trade_pnl_columns(open_trades, settings)
-        open_cols = ["created_at", "created_at_eat", "asset", "timeframe", "signal", "grade", "entry", "sl", "tp", "rr", "risk_cash", "potential_tp_cash", "potential_sl_cash", "bars_open", "session"]
-        _render_journal_signal_grid(
-            open_view,
-            "Open trades",
-            "journal_open_trades",
-            open_cols,
-            {"Signal":"signal", "Grade":"grade", "Status":"status"},
-            ["Entry", "SL", "TP", "RR", "risk_cash", "potential_tp_cash", "potential_sl_cash"],
-        )
-        closed_view = add_trade_pnl_columns(closed_trades, settings)
-        closed_cols = ["created_at", "created_at_eat", "asset", "timeframe", "signal", "grade", "status", "outcome", "r_multiple", "pnl_cash", "balance_after", "exit_reason", "session"]
-        _render_journal_signal_grid(
-            closed_view,
-            "Closed trades",
-            "journal_closed_trades",
-            closed_cols,
-            {"Signal":"signal", "Grade":"grade", "Status":"status", "Outcome":"outcome"},
-            ["RR", "R Multiple", "pnl_cash", "balance_after"],
-        )
+                open_view = add_trade_pnl_columns(open_trades, settings)
+                open_cols = ["created_at", "created_at_eat", "asset", "timeframe", "signal", "grade", "entry", "sl", "tp", "rr", "risk_cash", "potential_tp_cash", "potential_sl_cash", "bars_open", "session"]
+                _render_journal_signal_grid(
+                    open_view,
+                    "Open trades",
+                    "journal_open_trades",
+                    open_cols,
+                    {"Signal":"signal", "Grade":"grade", "Status":"status"},
+                    ["Entry", "SL", "TP", "RR", "risk_cash", "potential_tp_cash", "potential_sl_cash"],
+                )
+                closed_view = add_trade_pnl_columns(closed_trades, settings)
+                closed_cols = ["created_at", "created_at_eat", "asset", "timeframe", "signal", "grade", "status", "outcome", "r_multiple", "pnl_cash", "balance_after", "exit_reason", "session"]
+                _render_journal_signal_grid(
+                    closed_view,
+                    "Closed trades",
+                    "journal_closed_trades",
+                    closed_cols,
+                    {"Signal":"signal", "Grade":"grade", "Status":"status", "Outcome":"outcome"},
+                    ["RR", "R Multiple", "pnl_cash", "balance_after"],
+                )
 
-        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-        expiry_rules = {
-            "15m": {"bars": 56, "approx": "~14 hours"},
-            "1h": {"bars": 56, "approx": "~2.3 days"},
-            "4h": {"bars": 42, "approx": "~7 days"},
-            "1d": {"bars": 20, "approx": "~1 month"},
-        }
-        selected_tf = str(settings.get("view_timeframe") or settings.get("preferred_timeframe") or "All").lower()
-        selected_note = (
-            f"Expiry rule: selected {selected_tf} trades expire after {expiry_rules[selected_tf]['bars']} bars "
-            f"({expiry_rules[selected_tf]['approx']}). TP/SL checks use Capital 1-minute replay."
-            if selected_tf in expiry_rules
-            else "Expiry rule: 15m and 1h expire after 56 bars, 4h after 42 bars, and 1d after 20 bars. TP/SL checks use Capital 1-minute replay."
-        )
-        st.caption(selected_note)
+                st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
+                expiry_rules = {
+                    "15m": {"bars": 56, "approx": "~14 hours"},
+                    "1h": {"bars": 56, "approx": "~2.3 days"},
+                    "4h": {"bars": 42, "approx": "~7 days"},
+                    "1d": {"bars": 20, "approx": "~1 month"},
+                }
+                selected_tf = str(settings.get("view_timeframe") or settings.get("preferred_timeframe") or "All").lower()
+                selected_note = (
+                    f"Expiry rule: selected {selected_tf} trades expire after {expiry_rules[selected_tf]['bars']} bars "
+                    f"({expiry_rules[selected_tf]['approx']}). TP/SL checks use Capital 1-minute replay."
+                    if selected_tf in expiry_rules
+                    else "Expiry rule: 15m and 1h expire after 56 bars, 4h after 42 bars, and 1d after 20 bars. TP/SL checks use Capital 1-minute replay."
+                )
+                st.caption(selected_note)
 
+
+
+        with uj_history_tab:
+            render_user_journal_history_page(username, settings)
 
     with t2:
         # System Performance must use the full Supabase scanner history, not the user's
@@ -6732,56 +6842,61 @@ def render_workflow(username: str, settings: dict) -> None:
             st.info("No completed prop-firm challenges have been archived yet. Passed or failed attempts will appear here automatically.")
 
     with t_cap:
-        workflow_commentary("Activation stays under Settings. This page shows Capital auto-trade execution, simulated-vs-actual comparison, and imported broker rows for the logged-in user's visible data.")
+        workflow_commentary("Activation stays under Settings. This page shows the Capital.com Execution Audit: auto-traded broker rows, fill quality, planned-vs-filled prices, realised P/L, and broker status for the logged-in user's visible data.")
 
-        cap_comp = load_capital_trade_comparisons(limit=APP_TABLE_MAX_ROWS)
+        cap_comp = load_capital_execution_audit(limit=APP_TABLE_MAX_ROWS)
         cap_raw = load_capital_executed_trades(limit=APP_TABLE_MAX_ROWS)
         if cap_comp.empty and cap_raw.empty:
-            st.info("No Capital.com auto-trade executions have been imported yet. Once a user enables Capital demo auto-trading, this section will show simulated vs actual results.")
+            st.info("No Capital.com executions have been imported yet. Once a user enables Capital.com demo auto-trading, this section will show the Execution Audit.")
         else:
             auto_count = int(pd.Series(cap_comp.get("auto_trade", pd.Series(dtype=bool))).fillna(False).astype(bool).sum()) if not cap_comp.empty else 0
             matched_count = len(cap_comp)
-            total_actual_pnl = float(pd.to_numeric(cap_comp.get("actual_pnl", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not cap_comp.empty else 0.0
-            sim_series = pd.to_numeric(cap_comp.get("simulated_r", pd.Series(dtype=float)), errors="coerce").dropna() if not cap_comp.empty else pd.Series(dtype=float)
+            total_broker_pnl = float(pd.to_numeric(cap_comp.get("broker_pnl", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not cap_comp.empty else 0.0
+            sim_series = pd.to_numeric(cap_comp.get("planned_r", pd.Series(dtype=float)), errors="coerce").dropna() if not cap_comp.empty else pd.Series(dtype=float)
             actual_series = pd.to_numeric(cap_comp.get("actual_r", pd.Series(dtype=float)), errors="coerce").dropna() if not cap_comp.empty else pd.Series(dtype=float)
             avg_sim_r = float(sim_series.mean()) if len(sim_series) else None
             avg_actual_r = float(actual_series.mean()) if len(actual_series) else None
-            avg_r_text = f"Sim {avg_sim_r:+.2f}R / Actual {avg_actual_r:+.2f}R" if avg_sim_r is not None and avg_actual_r is not None else (f"Sim {avg_sim_r:+.2f}R / Actual n/a" if avg_sim_r is not None else "n/a")
+            avg_r_text = f"Plan {avg_sim_r:+.2f}R / Broker {avg_actual_r:+.2f}R" if avg_sim_r is not None and avg_actual_r is not None else (f"Plan {avg_sim_r:+.2f}R / Broker n/a" if avg_sim_r is not None else "n/a")
 
             ec1, ec2, ec3, ec4 = st.columns(4)
             with ec1: metric_card("Auto executions", f"{auto_count:,}", "Opened by BENZINO on Capital.com")
-            with ec2: metric_card("Matched signals", f"{matched_count:,}", "Linked by signal ID")
-            with ec3: metric_card("Avg R", avg_r_text, "Simulation vs execution")
-            with ec4: metric_card("Actual P/L", f"${total_actual_pnl:+,.2f}", "Capital.com reported P/L")
+            with ec2: metric_card("Audited executions", f"{matched_count:,}", "BENZINO orders audited against broker fills")
+            with ec3: metric_card("Avg R", avg_r_text, "Replay result vs broker close")
+            with ec4: metric_card("Actual P/L", f"${total_broker_pnl:+,.2f}", "Capital.com reported P/L")
 
             st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-            st.markdown("<h3 style='margin:18px 0 8px;color:#E8EDF2'>Simulated vs actual</h3>", unsafe_allow_html=True)
-            st.markdown("<div class='grey-note' style='font-size:clamp(16px,1vw,20px);line-height:1.6;margin-bottom:8px;'>This compares BENZINO's simulated signal outcome against trades BENZINO opened on your Capital.com demo account. Historical signal plans stay locked; the focus here is whether the auto-executed trade matched the simulated result.</div>", unsafe_allow_html=True)
-            render_capital_match_quality_legend()
+            st.markdown("<h3 style='margin:18px 0 8px;color:#E8EDF2'>Execution Audit</h3>", unsafe_allow_html=True)
+            st.markdown("<div class='grey-note' style='font-size:clamp(16px,1vw,20px);line-height:1.6;margin-bottom:8px;'>This audits Capital.com demo trades opened by BENZINO. Since Capital.com is now the pricing source, this section focuses on execution quality: planned price, broker fill, close price, realised P/L, order size, and broker status.</div>", unsafe_allow_html=True)
 
             if not cap_comp.empty:
                 comp = cap_comp.copy()
                 comp["Opened"] = pd.to_datetime(comp.get("opened_at"), errors="coerce", utc=True).dt.tz_convert(NAIROBI_TZ).dt.strftime("%Y-%m-%d %H:%M")
                 comp_display = comp.rename(columns={
                     "asset": "Asset",
+                    "timeframe": "Timeframe",
+                    "grade": "Grade",
                     "direction": "Direction",
-                    "match_quality": "Match",
-                    "simulated_entry": "Sim Entry",
-                    "actual_entry": "Actual Entry",
-                    "simulated_exit": "Sim Exit",
-                    "actual_exit": "Actual Exit",
-                    "simulated_r": "Sim R",
-                    "actual_r": "Actual R",
-                    "actual_pnl": "Actual P/L",
-                    "simulated_outcome": "Sim Outcome",
-                    "actual_status": "Actual Status",
+                    "planned_entry": "Planned Entry",
+                    "executed_entry": "Executed Entry",
+                    "entry_slippage": "Entry Slippage",
+                    "planned_sl": "Planned SL",
+                    "planned_tp": "Planned TP",
+                    "planned_exit": "Replay Exit",
+                    "actual_exit": "Broker Exit",
+                    "exit_slippage": "Exit Slippage",
+                    "planned_r": "Replay R",
+                    "actual_r": "Broker R",
+                    "broker_pnl": "Broker P/L",
+                    "broker_pnl_ftmo_equiv": "FTMO-Equivalent P/L",
+                    "replay_outcome": "Replay Outcome",
+                    "broker_status": "Broker Status",
                     "instrument_name": "Instrument",
                     "environment": "Environment",
                     "size": "Size",
                     "currency": "Currency",
                     "auto_trade": "Auto Trade",
                 })
-                order = ["Opened", "Asset", "Direction", "Match", "Auto Trade", "Sim Entry", "Actual Entry", "Sim Exit", "Actual Exit", "Sim R", "Actual R", "Actual P/L", "Sim Outcome", "Actual Status", "Instrument", "Environment", "Size", "Currency", "signal_id"]
+                order = ["Opened", "Asset", "Timeframe", "Grade", "Direction", "Auto Trade", "Planned Entry", "Executed Entry", "Entry Slippage", "Planned SL", "Planned TP", "Replay Exit", "Broker Exit", "Exit Slippage", "Replay R", "Broker R", "Broker P/L", "FTMO-Equivalent P/L", "Replay Outcome", "Broker Status", "Instrument", "Environment", "Size", "Currency", "signal_id"]
                 comp_display = comp_display[[c for c in order if c in comp_display.columns] + [c for c in comp_display.columns if c not in order]]
                 comp_display = apply_market_price_formatting(comp_display)
 
@@ -6790,24 +6905,24 @@ def render_workflow(username: str, settings: dict) -> None:
                     asset_opts = ["All"] + sorted([x for x in comp_display.get("Asset", pd.Series(dtype=str)).dropna().astype(str).unique() if x])
                     cap_asset_filter = st.selectbox("Execution asset", asset_opts, key="capital_exec_asset_filter")
                 with cf2:
-                    st.markdown("<div class='grey-note' style='margin-top:4px;'>Auto-traded rows are matched by the originating BENZINO signal ID, so entry/exit drift stats are intentionally removed.</div>", unsafe_allow_html=True)
+                    st.markdown("<div class='grey-note' style='margin-top:4px;'>Auto-traded rows are audited from the originating BENZINO order. The focus is broker execution quality, not a separate match-quality score.</div>", unsafe_allow_html=True)
                 if cap_asset_filter != "All" and "Asset" in comp_display.columns:
                     comp_display = comp_display[comp_display["Asset"].astype(str).eq(cap_asset_filter)]
 
                 render_benzino_aggrid(
                     comp_display,
-                    key="capital_execution_comparison",
-                    title="Capital comparison rows",
+                    key="capital_execution_audit",
+                    title="Capital.com execution audit",
                     height=420,
                     page_size=25,
-                    pinned=["Opened", "Asset", "Direction", "Match"],
-                    badge_cols={"Direction":"signal", "Match":"status", "Sim Outcome":"status", "Actual Status":"status", "Auto Trade":"status"},
-                    numeric_cols_right=["Sim Entry", "Actual Entry", "Sim Exit", "Actual Exit", "Sim R", "Actual R", "Actual P/L", "Size"],
+                    pinned=["Opened", "Asset", "Direction", "Auto Trade"],
+                    badge_cols={"Direction":"signal", "Replay Outcome":"status", "Broker Status":"status", "Auto Trade":"status"},
+                    numeric_cols_right=["Planned Entry", "Executed Entry", "Entry Slippage", "Planned SL", "Planned TP", "Replay Exit", "Broker Exit", "Exit Slippage", "Replay R", "Broker R", "Broker P/L", "FTMO-Equivalent P/L", "Size"],
                     enable_search=True,
                     show_footer=True,
                 )
             elif not cap_raw.empty:
-                st.warning("Capital.com executions were imported, but none are linked to BENZINO auto-traded signals yet.")
+                st.warning("Capital.com executions were imported, but BENZINO auto-traded audit rows are not available yet.")
 
 
     with t4:
@@ -7417,31 +7532,49 @@ def save_user_journal_tracking_snapshot(username: str, settings: dict) -> tuple[
             win_rate = 0.0
 
     try:
+        # Canonical archive table used by Workflow → User Journal → History.
+        period_df = read_df("SELECT COALESCE(MAX(period_number), 0) + 1 AS next_period FROM user_journal_history WHERE scan_owner = %s", (username,))
+        period_number = int(period_df.iloc[0].get("next_period", 1)) if not period_df.empty else 1
+
+        def _grade_growth_value(grade_name: str) -> float:
+            try:
+                if 'closed' not in locals() or closed is None or closed.empty or 'grade' not in closed.columns:
+                    return 0.0
+                g = closed[closed['grade'].astype(str).str.upper().str.strip().eq(grade_name)].copy()
+                return float(pd.to_numeric(g.get('pnl_cash', 0), errors='coerce').fillna(0.0).sum()) if not g.empty else 0.0
+            except Exception:
+                return 0.0
+
         execute(
             """
-            INSERT INTO user_journal_tracking_history(
-                username, previous_tracking_started_at, reset_at, starting_balance, ending_balance,
-                realised_pnl, win_rate, total_trades, closed_trades, grade_summary,
-                curve_points, trade_details, settings_snapshot
+            INSERT INTO user_journal_history(
+                scan_owner, period_number, started_at, finished_at, starting_balance,
+                ending_balance, realised_pnl, win_rate, grade_a_plus_growth, grade_a_growth,
+                grade_b_growth, grade_c_growth, trade_count, balance_curve_json,
+                trades_json, settings_snapshot
             )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb)
             """,
             (
                 username,
+                period_number,
                 previous_started,
                 reset_at.isoformat(),
                 start_balance,
                 ending_balance,
                 realised_pnl,
                 win_rate,
+                _grade_growth_value('A+'),
+                _grade_growth_value('A'),
+                _grade_growth_value('B'),
+                _grade_growth_value('C'),
                 total_trades,
-                closed_trades,
-                json.dumps(grade_summary, default=str),
-                json.dumps(curve_points, default=str),
-                json.dumps(trade_details, default=str),
-                json.dumps(settings, default=str),
+                json.dumps(curve_points),
+                json.dumps(trade_details),
+                json.dumps(settings),
             ),
         )
+
         settings["tracking_started_at"] = reset_at.isoformat()
         save_settings(username, settings)
         return True, f"Tracking reset saved. Archived {closed_trades:,} closed trade(s), {total_trades:,} total trade(s), and ${realised_pnl:+,.2f} realised P/L."
@@ -7820,7 +7953,7 @@ def render_settings(username: str, settings: dict) -> None:
                     st.success("Capital.com settings saved.")
                     st.rerun()
 
-            settings_commentary("Execution details, simulated-vs-actual comparison rows, and match-quality explanations now live under Workflow → Capital.com.")
+            settings_commentary("Execution details and broker audit rows now live under Workflow → Capital.com.")
         except Exception as exc:
             st.error(f"Capital.com settings error: {exc}")
 
@@ -7829,7 +7962,7 @@ def render_settings(username: str, settings: dict) -> None:
 
     with tab_reset:
         workflow_commentary_header("Journal Tracking Reset", "Resetting starts a fresh User Journal tracking period from now. Before the reset, BENZINO archives the current period with starting balance, ending balance, realised P/L, win rate, grade-level growth, balance-curve points, trade details, dates, and the settings snapshot used for that period.")
-        hist = read_df("SELECT reset_at, previous_tracking_started_at, starting_balance, ending_balance, realised_pnl, win_rate, total_trades, closed_trades FROM user_journal_tracking_history WHERE username = %s ORDER BY reset_at DESC LIMIT 20", (username,))
+        hist = read_df("SELECT finished_at AS reset_at, started_at AS previous_tracking_started_at, starting_balance, ending_balance, realised_pnl, win_rate, trade_count AS total_trades, trade_count AS closed_trades FROM user_journal_history WHERE scan_owner = %s ORDER BY finished_at DESC LIMIT 20", (username,))
         r1, r2, r3 = st.columns(3)
         with r1: metric_card("Current tracking since", fmt_nairobi(settings.get("tracking_started_at", "")) or "Not set")
         with r2: metric_card("Account start", f"${float(settings.get('account_size', 10000) or 10000):,.2f}")
@@ -7854,7 +7987,7 @@ def render_settings(username: str, settings: dict) -> None:
                     hist_view[col] = pd.to_numeric(hist_view[col], errors="coerce").apply(lambda v: f"${v:,.2f}" if pd.notna(v) else "")
             if "win_rate" in hist_view.columns:
                 hist_view["win_rate"] = pd.to_numeric(hist_view["win_rate"], errors="coerce").apply(lambda v: f"{v:.2f}%" if pd.notna(v) else "")
-            render_benzino_aggrid(hist_view, key="journal_tracking_history", title="Journal Tracking History", height=320, page_size=10, pinned=["reset_at"], numeric_cols_right=["total_trades", "closed_trades"])
+            render_benzino_aggrid(hist_view, key="user_journal_history", title="User Journal History", height=320, page_size=10, pinned=["reset_at"], numeric_cols_right=["total_trades", "closed_trades"])
         if is_admin():
             st.divider()
             st.subheader("Admin tools")
@@ -7886,6 +8019,19 @@ def render_settings(username: str, settings: dict) -> None:
                     st.rerun()
                 else:
                     st.error("Confirmation text did not match.")
+
+            if st.button("Verify prop history rebuild", type="secondary"):
+                check = verify_prop_history_rebuild()
+                if check.get("warnings"):
+                    st.warning("Prop rebuild verification found items to review.")
+                    for warning in check.get("warnings", []):
+                        st.write(f"• {warning}")
+                else:
+                    st.success("Prop rebuild verification passed. Legacy global prop tables are empty and per-user history exists where available.")
+                st.caption(f"Legacy state rows: {check.get('legacy_state_rows', 0)} · legacy trade rows: {check.get('legacy_trade_rows', 0)} · per-user history rows: {check.get('user_history_rows', 0)}")
+                hist_table = check.get("history_table")
+                if isinstance(hist_table, pd.DataFrame) and not hist_table.empty:
+                    render_benzino_aggrid(hist_table, key="prop_rebuild_verify_table", title="Prop History Scopes", height=260, page_size=10, pinned=["scan_owner"], numeric_cols_right=["n"])
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
