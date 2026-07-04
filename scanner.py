@@ -1737,6 +1737,30 @@ _CAPITAL_SESSION: dict = {"cst": "", "security_token": "", "ts": 0.0}
 _CAPITAL_EPIC_CACHE: dict[str, str | None] = {}
 _CAPITAL_MARKET_CACHE: dict[str, dict] = {}
 
+_CAPITAL_UNRESOLVED_EPIC_CACHE: set[str] = set()
+
+def capital_saved_epic_needs_refresh(symbol: str, epic: str | None) -> bool:
+    """True when a saved capital_epic_map value is probably an asset label, not a broker epic.
+
+    The capital_epic_map table is useful as BENZINO's persistent asset -> broker
+    epic resolver, but earlier rows were seeded as AUDUSD -> AUDUSD etc. Those
+    direct labels cause /prices/AUDUSD 404s on many Capital.com accounts. If a
+    saved value is just the asset name (or another plain label without Capital's
+    dotted epic format), refresh it through /markets and overwrite the table.
+    """
+    symbol = str(symbol or "").strip().upper()
+    epic = str(epic or "").strip()
+    if not symbol or not epic:
+        return True
+    upper_epic = epic.upper()
+    if upper_epic == symbol:
+        return True
+    # Most Capital CFD epics look like CS.D.EURUSD.MINI.IP. Plain values such
+    # as US500, US30, NVDA, GBPUSD are search terms, not reliable price epics.
+    if "." not in epic and upper_epic in {symbol, "US500", "US30", "NASDAQ100", "OIL_BRENT"}:
+        return True
+    return False
+
 # If platform env credentials are missing, hydrate them from the latest enabled user connection.
 try:
     _hydrated_capital_user = hydrate_capital_env_from_user_connection_if_missing()
@@ -2314,19 +2338,28 @@ def capital_find_epic(symbol: str) -> str | None:
         return None
     if symbol in _CAPITAL_EPIC_CACHE:
         return _CAPITAL_EPIC_CACHE[symbol]
+    if symbol in _CAPITAL_UNRESOLVED_EPIC_CACHE:
+        return None
 
     saved_epic = capital_load_saved_epic(symbol)
-    if saved_epic:
+    if saved_epic and not capital_saved_epic_needs_refresh(symbol, saved_epic):
         _CAPITAL_EPIC_CACHE[symbol] = saved_epic
         return saved_epic
 
-    candidates = CAPITAL_EPIC_HINTS.get(symbol, [symbol])
-    # Forex pairs generally resolve directly or through a simple search term.
-    if symbol.endswith("USD") or symbol.endswith("JPY") or symbol.endswith("CHF") or symbol.endswith("CAD") or symbol.endswith("AUD") or symbol.endswith("NZD") or symbol.endswith("GBP") or symbol.endswith("EUR"):
-        candidates = [symbol] + [c for c in candidates if c != symbol]
+    if saved_epic:
+        print(f"[CapitalMapping] {symbol}: saved epic {saved_epic} looks like a label/search term; refreshing via /markets.")
+
+    candidates = []
+    if saved_epic:
+        candidates.append(saved_epic)
+    candidates.extend(CAPITAL_EPIC_HINTS.get(symbol, []))
+    candidates.append(symbol)
+    # De-duplicate while preserving order.
+    seen = set()
+    candidates = [c for c in candidates if c and not (str(c).upper() in seen or seen.add(str(c).upper()))]
 
     for candidate in candidates:
-        data = capital_request("GET", "/markets", params={"searchTerm": candidate}, retries=2)
+        data = capital_request("GET", "/markets", params={"searchTerm": candidate}, retries=1)
         markets = []
         if isinstance(data, dict):
             markets = data.get("markets") or data.get("items") or data.get("market") or []
@@ -2341,15 +2374,14 @@ def capital_find_epic(symbol: str) -> str | None:
             _CAPITAL_EPIC_CACHE[symbol] = epic
             _CAPITAL_MARKET_CACHE[symbol] = best or {}
             capital_save_epic(symbol, epic, best or {})
-            print(f"[Capital] {symbol} mapped to epic {epic} and saved.")
+            if epic != saved_epic:
+                print(f"[CapitalMapping] {symbol}: mapped to broker epic {epic} and saved.")
             return epic
 
-    # Last chance: sometimes the symbol itself is already the epic.
-    _CAPITAL_EPIC_CACHE[symbol] = symbol
-    capital_save_epic(symbol, symbol)
-    print(f"[Capital] {symbol} using direct epic {symbol} and saved.")
-    return symbol
-
+    _CAPITAL_UNRESOLVED_EPIC_CACHE.add(symbol)
+    _CAPITAL_EPIC_CACHE[symbol] = None
+    print(f"[CapitalMapping] {symbol}: no valid Capital.com epic found; replay/signal candle fetch skipped.")
+    return None
 
 # Backward-compatible alias used by the auto-trade layer.
 # The strict Capital feed resolver is capital_find_epic().
@@ -2528,37 +2560,37 @@ def capital_download_range(symbol: str, timeframe: str, start_ts, end_ts, max_ro
 
 
 def get_minute_replay_df_for_window(ticker: str, entry_ts, expiry_ts) -> pd.DataFrame | None:
-    """Return Capital.com 1-minute candles covering one trade's exact replay window."""
+    """Return Capital.com 1-minute candles covering one trade's replay window.
+
+    Runtime-safe design: fetch recent 1-minute candles once per asset per run,
+    then reuse that cached dataframe for every trade on the same asset. Older
+    trades whose replay window is outside Capital.com's recent 1-minute cache
+    are left pending instead of generating hundreds of rejected from/to requests.
+    """
     ticker = str(ticker or "").strip()
     if not ticker:
         return None
-
     start = pd.to_datetime(entry_ts, utc=True, errors="coerce")
     end = pd.to_datetime(expiry_ts, utc=True, errors="coerce")
-    if pd.isna(start) or pd.isna(end):
+    if pd.isna(start) or pd.isna(end) or end <= start:
         return None
 
-    if should_use_capital_for_ticker(ticker):
-        symbol = capital_symbol_from_ticker(ticker)
-        df = capital_download_range(symbol, "1m", start, end, max_rows=1000)
-        if df is not None and not df.empty:
-            return df.copy()
-
-        # Recent-data fallback inside Capital only: useful when from/to is not
-        # supported for a particular market but the trade is inside the latest
-        # 1000 one-minute candles.
-        recent = get_minute_replay_df(ticker)
-        if recent is not None and not recent.empty:
-            recent = recent.copy()
-            recent["Date"] = pd.to_datetime(recent["Date"], utc=True, errors="coerce")
-            recent = recent.dropna(subset=["Date"]).sort_values("Date")
-            covered = recent[(recent["Date"] > start) & (recent["Date"] <= end)]
-            if not covered.empty:
-                return recent
-
+    recent = get_minute_replay_df(ticker)
+    if recent is None or recent.empty:
+        return None
+    recent = recent.copy()
+    recent["Date"] = pd.to_datetime(recent["Date"], utc=True, errors="coerce")
+    recent = recent.dropna(subset=["Date"]).sort_values("Date")
+    if recent.empty:
         return None
 
-    return get_minute_replay_df(ticker)
+    # The cached recent dataframe must actually cover the replay interval.
+    # If it does not, keep the trade pending for now; do not fall back to Yahoo
+    # and do not hammer Capital with invalid historical ranges.
+    if recent["Date"].min() > start or recent["Date"].max() < min(end, pd.Timestamp.now(tz="UTC")):
+        return None
+    window = recent[(recent["Date"] >= (start - pd.Timedelta(minutes=2))) & (recent["Date"] <= (end + pd.Timedelta(minutes=2)))].copy()
+    return window if not window.empty else None
 
 def should_use_capital_for_ticker(ticker: str) -> bool:
     return capital_configured() and (is_capital_ticker(ticker) or CAPITAL_PRIMARY_ALL_ASSETS)
@@ -2717,8 +2749,9 @@ def get_minute_replay_df(ticker: str) -> pd.DataFrame | None:
     ticker = str(ticker or "").strip()
     if not ticker:
         return None
-    if ticker in _MINUTE_REPLAY_CACHE:
-        cached = _MINUTE_REPLAY_CACHE[ticker]
+    cache_key = capital_symbol_from_ticker(ticker) if should_use_capital_for_ticker(ticker) else ticker
+    if cache_key in _MINUTE_REPLAY_CACHE:
+        cached = _MINUTE_REPLAY_CACHE[cache_key]
         return cached.copy() if cached is not None else None
 
     # Capital.com 1-minute path.
@@ -2729,18 +2762,18 @@ def get_minute_replay_df(ticker: str) -> pd.DataFrame | None:
             df = df.copy()
             df["Date"] = pd.to_datetime(df["Date"], utc=True, errors="coerce")
             df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
-            _MINUTE_REPLAY_CACHE[ticker] = df.copy()
+            _MINUTE_REPLAY_CACHE[cache_key] = df.copy()
             return df.copy()
         if CAPITAL_STRICT_ALL_ASSETS:
             print(f"[Replay1m] {symbol}: Capital.com minute data unavailable; strict Capital.com pricing active — no Yahoo fallback.")
-            _MINUTE_REPLAY_CACHE[ticker] = None
+            _MINUTE_REPLAY_CACHE[cache_key] = None
             return None
         fallback = yahoo_fallback_for_symbol(symbol, ticker)
         if fallback:
             print(f"[Replay1m] {symbol}: Capital.com minute data unavailable; fallback allowed, using Yahoo {fallback}.")
             ticker_yahoo = fallback
         else:
-            _MINUTE_REPLAY_CACHE[ticker] = None
+            _MINUTE_REPLAY_CACHE[cache_key] = None
             return None
     else:
         if CAPITAL_STRICT_ALL_ASSETS:
@@ -2750,7 +2783,7 @@ def get_minute_replay_df(ticker: str) -> pd.DataFrame | None:
                 _MINUTE_REPLAY_CACHE[ticker] = get_minute_replay_df(capital_ticker)
                 return _MINUTE_REPLAY_CACHE[ticker].copy() if _MINUTE_REPLAY_CACHE[ticker] is not None else None
             print(f"[Replay1m] {ticker}: skipped because strict Capital.com pricing is enabled.")
-            _MINUTE_REPLAY_CACHE[ticker] = None
+            _MINUTE_REPLAY_CACHE[cache_key] = None
             return None
         ticker_yahoo = ticker
 
@@ -2758,7 +2791,7 @@ def get_minute_replay_df(ticker: str) -> pd.DataFrame | None:
     try:
         df = yf.download(ticker_yahoo, interval="1m", period="7d", auto_adjust=True, progress=False, threads=False)
         if df is None or df.empty:
-            _MINUTE_REPLAY_CACHE[ticker] = None
+            _MINUTE_REPLAY_CACHE[cache_key] = None
             return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -2769,14 +2802,14 @@ def get_minute_replay_df(ticker: str) -> pd.DataFrame | None:
         df = df.dropna(subset=[date_col]).rename(columns={date_col: "Date"})
         needed = {"Date", "Open", "High", "Low", "Close"}
         if not needed.issubset(set(df.columns)):
-            _MINUTE_REPLAY_CACHE[ticker] = None
+            _MINUTE_REPLAY_CACHE[cache_key] = None
             return None
         df = df.sort_values("Date").reset_index(drop=True)
-        _MINUTE_REPLAY_CACHE[ticker] = df.copy()
+        _MINUTE_REPLAY_CACHE[cache_key] = df.copy()
         return df.copy()
     except Exception as exc:
         print(f"[Replay1m] {ticker_yahoo}: 1-minute download failed: {exc}")
-        _MINUTE_REPLAY_CACHE[ticker] = None
+        _MINUTE_REPLAY_CACHE[cache_key] = None
         return None
 
 

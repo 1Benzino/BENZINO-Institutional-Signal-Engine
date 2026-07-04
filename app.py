@@ -1865,6 +1865,30 @@ def prop_best_session_profile(df: pd.DataFrame, min_trades: int = PROP_MIN_SESSI
     out["all_sessions"] = sorted(rows, key=lambda r: (r["trade_count"], r["win_rate"]), reverse=True)
     return out
 
+
+def journal_session_win_rate_for_session(df: pd.DataFrame, session: str) -> tuple[float, int]:
+    """Return the User Journal win rate for a session using all resolved journal grades.
+
+    Prop selection itself still uses A+/A sample quality, but the card labelled
+    "Session win rate" should match the User Journal By session table so the
+    user does not see two different win rates for the same named session.
+    """
+    if df is None or df.empty or not session or session == "All sessions":
+        return 0.0, 0
+    try:
+        work = closed_resolved_trades(df.copy())
+        if work is None or work.empty:
+            return 0.0, 0
+        if "session" not in work.columns:
+            created = pd.to_datetime(work.get("created_at", pd.Series(pd.NaT, index=work.index)), errors="coerce", utc=True)
+            work["session"] = created.apply(session_name)
+        scoped = work[work["session"].astype(str).eq(str(session))].copy()
+        if scoped.empty:
+            return 0.0, 0
+        return float(win_rate_group(scoped)), int(len(scoped))
+    except Exception:
+        return 0.0, 0
+
 def apply_prop_best_session_trade_filter(df: pd.DataFrame, profile: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Apply Prop Firm v2: best session only, max 4 trades/day.
 
@@ -6008,6 +6032,8 @@ def render_user_journal_history_page(username: str, settings: dict) -> None:
 
     if isinstance(trades_json, list) and trades_json:
         trades_df = pd.DataFrame(trades_json)
+        last_cols = [c for c in ["entry", "sl", "tp", "Entry", "SL", "TP"] if c in trades_df.columns]
+        trades_df = trades_df[[c for c in trades_df.columns if c not in last_cols] + last_cols]
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         render_benzino_aggrid(
             trades_df,
@@ -6580,13 +6606,17 @@ def render_workflow(username: str, settings: dict) -> None:
         best_session_info = prop_sim.get("best_session", {}) if isinstance(prop_sim, dict) else {}
         bs1, bs2, bs3 = st.columns(3)
         session_label = str(best_session_info.get("best_session", "All sessions"))
-        sample_note = f"{int(best_session_info.get('trade_count', 0) or 0)} A/A+ trades"
-        if not bool(best_session_info.get("sample_ready", False)):
-            sample_note += f" · minimum {PROP_MIN_SESSION_TRADES} required · filter not active"
+        sample_count = int(best_session_info.get('trade_count', 0) or 0)
+        sample_ready = bool(best_session_info.get("sample_ready", False))
+        if sample_ready:
+            sample_note = f"Filter active · waits 1 hour after {session_label} opens · max {PROP_MAX_TRADES_PER_DAY}/day"
+        else:
+            sample_note = f"Provisional only · {sample_count}/{PROP_MIN_SESSION_TRADES} A+/A closed trades · all sessions allowed"
+        journal_wr, journal_session_count = journal_session_win_rate_for_session(trades, session_label)
         with bs1: metric_card("Best trading session", session_label, sample_note)
-        with bs2: metric_card("Session profit factor", f"{float(best_session_info.get('profit_factor', 0.0) or 0.0):.2f}", "A/A+ closed trades only")
-        with bs3: metric_card("Session win rate", f"{float(best_session_info.get('win_rate', 0.0) or 0.0):.2f}%", "Used for prop trade filter once sample is ready")
-        st.caption("Prop session source: User Journal closed A+/A trades, current tracking period, same session buckets as the Journal By session table. The filter recalculates on each app load/replay.")
+        with bs2: metric_card("Session profit factor", f"{float(best_session_info.get('profit_factor', 0.0) or 0.0):.2f}", "A+/A closed trades only")
+        with bs3: metric_card("Journal session win rate", f"{journal_wr:.2f}%", f"{journal_session_count} resolved User Journal trade(s)")
+        st.caption("Prop session source: User Journal entry sessions in the current tracking period. The best-session filter uses closed A+/A trades once the minimum sample is ready; the displayed win rate matches the User Journal By session table.")
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         p1, p2, p3 = st.columns(3)
@@ -7396,7 +7426,7 @@ def render_workflow(username: str, settings: dict) -> None:
                 review_display["Raw Signal ID"] = review_display["Signal ID"].astype(str).values
             else:
                 review_display["Raw Signal ID"] = ""
-            preferred_cols = ["Asset", "Timeframe", "Signal", "Grade", "Status", "Outcome", "R Multiple", "Session", "Created At", "Entry", "SL", "TP", "Raw Signal ID"]
+            preferred_cols = ["Asset", "Timeframe", "Signal", "Grade", "Status", "Outcome", "R Multiple", "Session", "Created At", "Raw Signal ID", "Entry", "SL", "TP"]
             review_display = review_display[[c for c in preferred_cols if c in review_display.columns] + [c for c in review_display.columns if c not in preferred_cols and c != "Review Case"]]
 
             title_col, sig_col, grade_col, status_col, search_col = st.columns([4.0, 1.1, 1.1, 1.25, 2.2], vertical_alignment="center")
