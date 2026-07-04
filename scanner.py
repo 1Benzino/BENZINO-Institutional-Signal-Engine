@@ -4293,6 +4293,28 @@ def prop_session_from_timestamp_scanner(ts) -> str:
     return "New York"
 
 
+def prop_session_open_hour_scanner(session: str) -> int | None:
+    session = str(session or "").strip().lower()
+    if session == "asia":
+        return 0
+    if session == "london":
+        return 8
+    if session in {"new york", "newyork", "ny"}:
+        return 16
+    return None
+
+
+def prop_is_one_hour_after_session_open_scanner(ts, session: str) -> bool:
+    open_hour = prop_session_open_hour_scanner(session)
+    if open_hour is None:
+        return True
+    try:
+        dt = pd.to_datetime(ts, utc=True).tz_convert(NAIROBI_TZ)
+    except Exception:
+        return False
+    return dt.hour >= open_hour + 1
+
+
 def capital_best_session_profile_for_user(username: str, timeframe: str, assets: set[str]) -> dict:
     """Dynamic best session from closed A/A+ simulated trades only."""
     username = str(username or "").strip().lower()
@@ -4469,11 +4491,14 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
         watch_assets = {a.upper() for a in watch.keys()} or {asset}
         session_profile = capital_best_session_profile_for_user(username, timeframe, watch_assets)
         best_session = str(session_profile.get("best_session") or "")
-        current_session = prop_session_from_timestamp_scanner(getattr(sig, "candle_close", "") or getattr(sig, "created_at", ""))
+        signal_time_for_session = getattr(sig, "candle_close", "") or getattr(sig, "created_at", "")
+        current_session = prop_session_from_timestamp_scanner(signal_time_for_session)
         if not session_profile.get("sample_ready"):
             return {**fallback, "username": username, "auto_trade_allowed": False, "skip_reason": session_profile.get("reason") or "best_session_not_ready", "session_profile": session_profile}
         if current_session != best_session:
             return {**fallback, "username": username, "auto_trade_allowed": False, "skip_reason": f"outside_best_session:{current_session}!={best_session}", "session_profile": session_profile}
+        if not prop_is_one_hour_after_session_open_scanner(signal_time_for_session, best_session):
+            return {**fallback, "username": username, "auto_trade_allowed": False, "skip_reason": f"first_hour_after_best_session_open:{best_session}", "session_profile": session_profile, "current_session": current_session}
         taken_today = capital_auto_trades_taken_today(username)
         if taken_today >= CAPITAL_AUTO_TRADE_MAX_PER_DAY:
             return {**fallback, "username": username, "auto_trade_allowed": False, "skip_reason": "daily_auto_trade_cap_reached", "session_profile": session_profile}

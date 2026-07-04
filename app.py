@@ -1543,6 +1543,84 @@ def rebuild_prop_challenge_history_from_trades(username: str, timeframe: str, hi
             continue
 
 
+def rebuild_all_user_prop_histories_from_scanner(reset_legacy_ledgers: bool = True) -> dict:
+    """Rebuild every user's prop challenge history from scanner_signals.
+
+    This is the clean-replay path used after prop rules change. It intentionally
+    ignores the old incremental prop_firm_state / prop_firm_trades ledger and
+    recreates prop_challenge_history from each user's own watchlist, activation
+    timestamp, and preferred timeframe using the current simulator rules.
+    """
+    result = {"users": 0, "histories": 0, "errors": []}
+    try:
+        if reset_legacy_ledgers:
+            execute("DELETE FROM prop_firm_trades")
+            execute("DELETE FROM prop_firm_state")
+        execute("DELETE FROM prop_challenge_history")
+    except Exception as exc:
+        result["errors"].append(f"Could not clear old prop ledgers: {exc}")
+        return result
+
+    users_df = read_df("SELECT username FROM users ORDER BY username")
+    if users_df.empty:
+        return result
+
+    raw = read_df(
+        """
+        SELECT *
+        FROM scanner_signals
+        WHERE grade IN ('A+', 'A')
+          AND signal IN ('BUY', 'SELL')
+        ORDER BY created_at ASC
+        LIMIT %s
+        """,
+        (APP_TABLE_MAX_ROWS,),
+    )
+    if raw.empty:
+        result["users"] = int(len(users_df))
+        return result
+
+    raw = numeric_cols(raw, [
+        "confidence", "edge_score", "ml_prob", "entry", "sl", "tp", "rr",
+        "rsi", "atr", "exit_price", "r_multiple", "bars_open", "mtf_score",
+        "shadow_r_multiple",
+    ])
+    for col in ["created_at", "exit_at", "shadow_closed_at", "candle_close"]:
+        if col in raw.columns:
+            raw[col] = pd.to_datetime(raw[col], errors="coerce", utc=True)
+
+    raw_closed = closed_resolved_trades(raw)
+    if raw_closed.empty:
+        result["users"] = int(len(users_df))
+        return result
+
+    for _, user_row in users_df.iterrows():
+        username_i = normalize_username(user_row.get("username", ""))
+        if not username_i:
+            continue
+        try:
+            settings_i = load_settings(username_i)
+            timeframe_i = str(settings_i.get("preferred_timeframe") or settings_i.get("view_timeframe") or "1h").lower()
+            started_i = str(settings_i.get("tracking_started_at", "") or "")
+            watchlist_i = sorted(set(load_user_watchlist(username_i).keys()))
+
+            scoped = raw_closed.copy()
+            if watchlist_i and "asset" in scoped.columns:
+                scoped = scoped[scoped["asset"].astype(str).str.upper().isin(watchlist_i)].copy()
+            if timeframe_i and timeframe_i != "all" and "timeframe" in scoped.columns:
+                scoped = scoped[scoped["timeframe"].astype(str).str.lower().eq(timeframe_i)].copy()
+
+            sim = simulate_prop_challenge_cycles(scoped, started_i, 10000.0)
+            histories = sim.get("history", []) or []
+            rebuild_prop_challenge_history_from_trades(username_i, timeframe_i, histories)
+            result["users"] += 1
+            result["histories"] += len(histories)
+        except Exception as exc:
+            result["errors"].append(f"{username_i}: {exc}")
+            continue
+    return result
+
+
 
 def prop_session_from_timestamp(ts) -> str:
     """Trading-session label in Nairobi display time.
@@ -1561,6 +1639,30 @@ def prop_session_from_timestamp(ts) -> str:
     if 8 <= hour < 16:
         return "London"
     return "New York"
+
+
+def prop_session_open_hour(session: str) -> int | None:
+    """Return the Nairobi hour when a named prop session opens."""
+    session = str(session or "").strip().lower()
+    if session == "asia":
+        return 0
+    if session == "london":
+        return 8
+    if session in {"new york", "newyork", "ny"}:
+        return 16
+    return None
+
+
+def prop_is_one_hour_after_session_open(ts, session: str) -> bool:
+    """True once the session has been open for at least one hour."""
+    open_hour = prop_session_open_hour(session)
+    if open_hour is None:
+        return True
+    try:
+        dt = pd.to_datetime(ts, utc=True).tz_convert(NAIROBI_TZ)
+    except Exception:
+        return False
+    return dt.hour >= open_hour + 1
 
 
 def prop_best_session_profile(df: pd.DataFrame, min_trades: int = PROP_MIN_SESSION_TRADES) -> dict:
@@ -1617,6 +1719,16 @@ def apply_prop_best_session_trade_filter(df: pd.DataFrame, profile: dict) -> tup
             outside["prop_skip_reason"] = "Skipped — outside best session"
             skipped_parts.append(outside)
         eligible = eligible[eligible["prop_session"] == best].copy()
+
+        # Do not take the first trades immediately at session open.
+        # The prop model waits until the best session has been open for one hour,
+        # then takes the first eligible A+/A trades up to the daily cap.
+        first_hour_mask = ~eligible["prop_event_time"].apply(lambda ts: prop_is_one_hour_after_session_open(ts, best))
+        first_hour = eligible[first_hour_mask].copy()
+        if not first_hour.empty:
+            first_hour["prop_skip_reason"] = "Skipped — first hour after best-session open"
+            skipped_parts.append(first_hour)
+        eligible = eligible[~first_hour_mask].copy()
     eligible["_daily_rank"] = eligible.groupby("prop_day_all").cumcount() + 1
     taken = eligible[eligible["_daily_rank"] <= PROP_MAX_TRADES_PER_DAY].copy()
     capped = eligible[eligible["_daily_rank"] > PROP_MAX_TRADES_PER_DAY].copy()
@@ -2364,6 +2476,73 @@ def compute_dashboard_summary(df: pd.DataFrame, settings: dict) -> dict:
     return out
 
 
+
+def add_balance_extreme_labels(
+    fig,
+    data: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    group_col: str | None = None,
+    currency_prefix: str = "$",
+) -> None:
+    """Label lowest, highest, and current balance for each balance-curve line."""
+    if data is None or data.empty or x_col not in data.columns or y_col not in data.columns:
+        return
+
+    work = data.copy()
+    work[x_col] = pd.to_datetime(work[x_col], errors="coerce", utc=True)
+    work[y_col] = pd.to_numeric(work[y_col], errors="coerce")
+    work = work.dropna(subset=[x_col, y_col]).sort_values(x_col)
+    if work.empty:
+        return
+
+    groups = [("", work)]
+    if group_col and group_col in work.columns:
+        groups = [(str(name), grp.copy()) for name, grp in work.groupby(group_col, sort=False) if grp is not None and not grp.empty]
+
+    seen_points: set[tuple[str, int, str]] = set()
+    for group_name, grp in groups:
+        grp = grp.sort_values(x_col).reset_index(drop=True)
+        if grp.empty:
+            continue
+
+        label_prefix = f"{group_name} · " if group_name else ""
+        picks = [
+            ("Low", int(grp[y_col].idxmin()), -34, -10),
+            ("High", int(grp[y_col].idxmax()), 34, 10),
+            ("Current", int(grp.index[-1]), 0, 44),
+        ]
+        for label, idx, yshift, xshift in picks:
+            try:
+                row = grp.loc[idx]
+                y_val = float(row[y_col])
+                x_val = row[x_col]
+            except Exception:
+                continue
+            # Avoid stacking duplicate low/high/current labels when a short curve
+            # has the same point for more than one role. Keep Current preferred.
+            key = (group_name, idx, "point")
+            if key in seen_points and label != "Current":
+                continue
+            seen_points.add(key)
+            fig.add_annotation(
+                x=x_val,
+                y=y_val,
+                text=f"{label_prefix}{label}: {currency_prefix}{y_val:,.2f}",
+                showarrow=True,
+                arrowhead=2,
+                arrowsize=0.8,
+                arrowwidth=1,
+                ax=xshift,
+                ay=yshift,
+                bgcolor="rgba(15,34,53,0.92)",
+                bordercolor="rgba(232,237,242,0.28)",
+                borderwidth=1,
+                borderpad=4,
+                font=dict(size=11, color="#E8EDF2"),
+            )
+
+
 def render_balance_curve(df: pd.DataFrame, settings: dict, title: str = "Balance curve", split_by_grade: bool = False, include_overall: bool = False) -> None:
     """Render realised balance curves from the user's visible Supabase rows.
 
@@ -2443,17 +2622,21 @@ def render_balance_curve(df: pd.DataFrame, settings: dict, title: str = "Balance
             title=title,
             category_orders={"Grade Group": grade_group_order},
         )
+        add_balance_extreme_labels(fig, chart_df, "curve_time", "grade_balance_after", "Grade Group")
         fig.update_layout(
             yaxis_title=f"Balance after ({account:,.0f} start, {risk_pct:.2f}% risk)",
             xaxis_title="Resolved at",
-            height=380,
-            margin=dict(l=20, r=20, t=20, b=35),
+            height=430,
+            margin=dict(l=20, r=90, t=25, b=40),
+            hovermode="x unified",
         )
     else:
         closed = closed.sort_values("curve_time").copy()
         closed["balance_after"] = account + pd.to_numeric(closed["pnl_cash"], errors="coerce").fillna(0.0).cumsum()
-        fig = px.line(closed, x="curve_time", y="balance_after", color="timeframe" if "timeframe" in closed.columns else None, title=title)
-        fig.update_layout(yaxis_title="Balance after", xaxis_title="Resolved at", height=380, margin=dict(l=20, r=20, t=20, b=35))
+        color_col = "timeframe" if "timeframe" in closed.columns else None
+        fig = px.line(closed, x="curve_time", y="balance_after", color=color_col, title=title)
+        add_balance_extreme_labels(fig, closed, "curve_time", "balance_after", color_col)
+        fig.update_layout(yaxis_title="Balance after", xaxis_title="Resolved at", height=430, margin=dict(l=20, r=90, t=25, b=40), hovermode="x unified")
 
     st.plotly_chart(fig, use_container_width=True)
 
@@ -6609,9 +6792,10 @@ def render_workflow(username: str, settings: dict) -> None:
                 name="No Trade only",
                 hovertemplate="%{x|%Y-%m-%d %H:%M}<br>Balance: $%{y:,.2f}<extra></extra>",
             ))
+            add_balance_extreme_labels(fig, shadow_curve, "curve_time", "Balance")
             fig.update_layout(
-                height=420,
-                margin=dict(t=20, b=45, l=20, r=20),
+                height=460,
+                margin=dict(t=25, b=45, l=20, r=90),
                 paper_bgcolor="#0E1117",
                 plot_bgcolor="#0E1117",
                 font=dict(color="#E8EDF2"),
@@ -6703,28 +6887,39 @@ def render_workflow(username: str, settings: dict) -> None:
 
     with t5:
         workflow_commentary("Coach AI reviews your journal patterns and turns trade history into practical behaviour, risk, and execution guidance. The guidance is split between prop-firm discipline and broader user-journal improvement.")
-        prop_state = load_prop_firm_state()
-        prop_status = str(prop_state.get("status") or "ACTIVE").upper()
 
         resolved = closed_resolved_trades(closed_trades) if not closed_trades.empty else pd.DataFrame()
         prop_parts = []
         journal_parts = []
 
-        if prop_status == "FAILED":
+        # Coach AI must coach the logged-in user's replayed prop challenge, not
+        # the old global prop_firm_state ledger. These values are produced in
+        # the Prop Firm tab from the user's watchlist, preferred timeframe,
+        # activation date, and A+/A-only challenge stream.
+        user_prop_status = str(locals().get("status", "ACTIVE") or "ACTIVE").upper()
+        user_prop_roi = float(locals().get("roi_pct", 0.0) or 0.0)
+        user_prop_phase = str(locals().get("active_phase_name", "Phase 1 Challenge") or "Phase 1 Challenge")
+        user_prop_tf = str(locals().get("challenge_tf", settings.get("preferred_timeframe", "1h")) or "1h")
+        user_prop_closed = int(locals().get("closed_count", 0) or 0)
+        user_prop_days = int(locals().get("trading_days", 0) or 0)
+        user_prop_fail_reason = str(locals().get("fail_reason", "") or "")
+        user_best_session = {}
+        try:
+            user_best_session = (locals().get("prop_sim", {}) or {}).get("best_session", {}) or {}
+        except Exception:
+            user_best_session = {}
+
+        if user_prop_status == "FAILED":
             prop_parts.append(
-                "The official prop challenge has failed, so the coaching priority is preservation rather than recovery. The right action is to pause new prop-risk decisions, review whether the breach came from trade quality, daily-loss pressure, correlation, or too many trades in the wrong session, then only restart under the new A+/A best-session rules."
+                f"Your {user_prop_tf} prop challenge is currently FAILED{f' because {user_prop_fail_reason}' if user_prop_fail_reason else ''}. The coaching priority is preservation rather than recovery: pause new prop-risk decisions, review the user-scoped A+/A trades that caused the breach, then let the next cycle restart under the best-session and daily-cap rules."
             )
-        elif prop_status == "PASSED":
+        elif user_prop_status == "PASSED":
             prop_parts.append(
-                "The official prop challenge has reached its pass condition. Coach AI would treat this as a lock-in moment: protect the result, let the cycle archive cleanly, and restart from a fresh challenge rather than continuing to press risk after the edge has already done its job."
+                f"Your {user_prop_tf} prop challenge has reached its pass condition. Coach AI treats this as a lock-in moment: protect the result, let the cycle archive cleanly, and restart from a fresh user challenge rather than continuing to press risk after the target has already been achieved."
             )
         else:
-            try:
-                roi_now = (float(prop_state.get("current_equity") or 0) / float(prop_state.get("starting_balance") or 1) - 1) * 100
-            except Exception:
-                roi_now = 0.0
             prop_parts.append(
-                f"The prop challenge is active and currently sits at {roi_now:+.2f}% from the starting balance. That means the system should behave like a funded-account simulator: preserve drawdown first, then allow only the strongest A+/A opportunities in the user's best-performing session."
+                f"Your {user_prop_tf} prop challenge is active in {user_prop_phase} and currently sits at {user_prop_roi:+.2f}% from the $10,000 starting balance after {user_prop_closed} closed prop trade(s) across {user_prop_days} trading day(s). The instruction is to preserve drawdown first, then allow only the strongest A+/A opportunities in your best-performing session."
             )
 
         aa_closed = resolved[resolved.get("grade", pd.Series(dtype=str)).astype(str).isin(["A+", "A"])] if not resolved.empty and "grade" in resolved.columns else pd.DataFrame()
@@ -6741,7 +6936,7 @@ def render_workflow(username: str, settings: dict) -> None:
             if not supported.empty:
                 srow = supported.iloc[0]
                 prop_parts.append(
-                    f"The best supported A+/A session in the current sample is {srow['session']}, with {int(srow['trades'])} closed trade(s), a {srow['win_rate']:.2f}% win rate, and {srow['net_r']:+.2f}R net performance. Prop auto-trading should focus there and stop at a maximum of four demo trades per day."
+                    f"The best supported A+/A session in your current sample is {srow['session']}, with {int(srow['trades'])} closed trade(s), a {srow['win_rate']:.2f}% win rate, and {srow['net_r']:+.2f}R net performance. Prop auto-trading should ignore the first hour of that session, then take only the first four eligible A+/A demo trades per day."
                 )
             else:
                 prop_parts.append(
@@ -6754,8 +6949,12 @@ def render_workflow(username: str, settings: dict) -> None:
 
         a_open = len(open_trades[open_trades["grade"].isin(["A+", "A"])]) if not open_trades.empty and "grade" in open_trades.columns else 0
         bc_open = len(open_trades[open_trades["grade"].isin(["B", "C"])]) if not open_trades.empty and "grade" in open_trades.columns else 0
+        if user_best_session and user_best_session.get("sample_ready"):
+            prop_parts.append(
+                f"Your current prop session filter is {user_best_session.get('best_session')}. The engine should wait one hour after that session opens before accepting trades, then stop after four eligible A+/A entries for the Nairobi trading day."
+            )
         prop_parts.append(
-            f"Current open exposure contains {a_open} A+/A trade(s) and {bc_open} B/C trade(s). For prop-firm logic, the practical instruction is simple: reserve challenge risk for A+/A only, cap the day at four trades, and let weaker grades remain simulation research."
+            f"Current open exposure contains {a_open} A+/A trade(s) and {bc_open} B/C trade(s). For prop-firm logic, the practical instruction is simple: reserve challenge risk for A+/A only, avoid the first hour of the best session, cap the day at four trades, and let weaker grades remain simulation research."
         )
 
         if len(closed_trades) < 10 or resolved.empty:
@@ -7404,9 +7603,27 @@ def render_settings(username: str, settings: dict) -> None:
                 if confirm == "DELETE GLOBAL SCANNER DATA":
                     execute("DELETE FROM prop_firm_trades")
                     execute("DELETE FROM prop_firm_state")
+                    execute("DELETE FROM prop_challenge_history")
                     execute("DELETE FROM scanner_signals")
                     execute("DELETE FROM scanner_runtime_log")
-                    st.success("Global scanner data cleared.")
+                    st.success("Global scanner data and all prop ledgers cleared.")
+                else:
+                    st.error("Confirmation text did not match.")
+
+            st.markdown("**Prop replay tools**")
+            st.caption("Use this after prop-firm rules change. It clears the old legacy prop ledgers, then rebuilds every user's challenge history from scanner_signals using the current rules.")
+            rebuild_confirm = st.text_input("Type REBUILD PROP HISTORY to replay all user prop histories")
+            if st.button("Admin rebuild all prop firm history", type="secondary"):
+                if rebuild_confirm == "REBUILD PROP HISTORY":
+                    outcome = rebuild_all_user_prop_histories_from_scanner(reset_legacy_ledgers=True)
+                    if outcome.get("errors"):
+                        st.warning(f"Rebuild completed with {len(outcome.get('errors', []))} warning(s). Users: {outcome.get('users', 0)} · histories: {outcome.get('histories', 0)}")
+                        with st.expander("Rebuild warnings"):
+                            for err in outcome.get("errors", [])[:50]:
+                                st.write(err)
+                    else:
+                        st.success(f"Prop history rebuilt. Users: {outcome.get('users', 0)} · completed challenges: {outcome.get('histories', 0)}")
+                    st.rerun()
                 else:
                     st.error("Confirmation text did not match.")
 
