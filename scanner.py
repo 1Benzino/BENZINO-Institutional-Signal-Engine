@@ -377,7 +377,11 @@ def build_scan_plan(now: datetime | None = None) -> tuple[dict[str, str], list[s
     """
     now = now or datetime.now(timezone.utc)
 
-    assets: dict[str, str] = dict(MASTER_WATCHLIST)
+    # Capital.com is now the scanner pricing source of truth.
+    # Keep MASTER_WATCHLIST as Yahoo fallback metadata, but pass CAPITAL:<asset>
+    # through the scan loop so signal candles, trade plans, replay, and execution
+    # all resolve from the same Capital.com feed.
+    assets: dict[str, str] = {asset: f"CAPITAL:{asset}" for asset in MASTER_WATCHLIST}
     requested_tfs: set[str] = set(SCAN_TIMEFRAMES)
 
     if not requested_tfs:
@@ -544,6 +548,10 @@ CHALLENGE_PROFIT_TARGET    = 0.10
 CHALLENGE_MAX_DAILY_LOSS   = 0.05
 CHALLENGE_MAX_TOTAL_LOSS   = 0.10
 CHALLENGE_MIN_TRADING_DAYS = 4
+# Legacy global prop ledger is no longer used for user-facing prop analytics.
+# User prop challenges are rebuilt/simulated per logged-in user in app.py.
+# Keep this off unless you explicitly need the old SCAN_OWNER aggregate ledger for debugging.
+ENABLE_LEGACY_GLOBAL_PROP_LEDGER = os.environ.get("ENABLE_LEGACY_GLOBAL_PROP_LEDGER", "false").strip().lower() in {"1", "true", "yes", "y"}
 
 GRADE_RANK = {"A+": 4, "A": 3, "B": 2, "C": 1, "NO TRADE": 0}
 
@@ -1267,7 +1275,35 @@ def open_trade_for_slot(asset: str, timeframe: str) -> dict | None:
         return None  # fail open — better to risk a rare dup than to block all alerts
 
 
-def close_trade(signal_id: str, exit_price: float, exit_reason: str, r_multiple: float) -> bool:
+def _to_db_timestamp(value):
+    """Convert pandas/python timestamps to an ISO string acceptable by Postgres."""
+    if value is None:
+        return None
+    try:
+        ts = pd.to_datetime(value, errors="coerce", utc=True)
+        if pd.isna(ts):
+            return None
+        return ts.isoformat()
+    except Exception:
+        return None
+
+
+def mark_replay_checked(signal_id: str, bars: int | None = None) -> None:
+    """Record that an open trade was checked by the 1-minute replay engine."""
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                if bars is None:
+                    cur.execute("UPDATE scanner_signals SET replay_checked_at = NOW() WHERE signal_id = %s", (signal_id,))
+                else:
+                    cur.execute("UPDATE scanner_signals SET bars_open = %s, replay_checked_at = NOW() WHERE signal_id = %s", (int(bars), signal_id))
+        conn.close()
+    except Exception as e:
+        print(f"[DB] mark_replay_checked failed: {e}")
+
+
+def close_trade(signal_id: str, exit_price: float, exit_reason: str, r_multiple: float, exit_time=None) -> bool:
     """Close an OPEN trade exactly once.
 
     Historical outcomes must be immutable. The old update matched only signal_id,
@@ -1277,7 +1313,7 @@ def close_trade(signal_id: str, exit_price: float, exit_reason: str, r_multiple:
     """
     sql = """
     UPDATE scanner_signals
-    SET status = %s, exit_price = %s, exit_reason = %s, exit_at = NOW(), r_multiple = %s
+    SET status = %s, exit_price = %s, exit_reason = %s, exit_at = COALESCE(%s::timestamptz, NOW()), r_multiple = %s, replay_checked_at = NOW()
     WHERE signal_id = %s
       AND UPPER(TRIM(COALESCE(status, ''))) = 'OPEN'
       AND exit_at IS NULL;
@@ -1287,7 +1323,7 @@ def close_trade(signal_id: str, exit_price: float, exit_reason: str, r_multiple:
         conn = db_connect()
         with conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (status, exit_price, exit_reason, r_multiple, signal_id))
+                cur.execute(sql, (status, exit_price, exit_reason, _to_db_timestamp(exit_time), r_multiple, signal_id))
                 changed = int(cur.rowcount or 0) > 0
         conn.close()
         return changed
@@ -1301,13 +1337,13 @@ def bump_bars_open(signal_id: str, bars: int) -> None:
         conn = db_connect()
         with conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE scanner_signals SET bars_open = %s WHERE signal_id = %s", (bars, signal_id))
+                cur.execute("UPDATE scanner_signals SET bars_open = %s, replay_checked_at = NOW() WHERE signal_id = %s", (bars, signal_id))
         conn.close()
     except Exception:
         pass
 
 
-def fetch_open_trades(assets: set[str] | None = None, timeframes: set[str] | None = None) -> list[dict]:
+def fetch_open_trades(assets: set[str] | None = None, timeframes: set[str] | None = None, due_only: bool = False) -> list[dict]:
     try:
         conn = db_connect()
         with conn.cursor() as cur:
@@ -1319,6 +1355,19 @@ def fetch_open_trades(assets: set[str] | None = None, timeframes: set[str] | Non
             if timeframes:
                 sql += " AND timeframe = ANY(%s)"
                 params.append(list(timeframes))
+            if due_only:
+                sql += """
+                    AND (
+                        replay_checked_at IS NULL
+                        OR replay_checked_at <= NOW() - CASE LOWER(COALESCE(timeframe, '15m'))
+                            WHEN '15m' THEN INTERVAL '15 minutes'
+                            WHEN '1h' THEN INTERVAL '1 hour'
+                            WHEN '4h' THEN INTERVAL '4 hours'
+                            WHEN '1d' THEN INTERVAL '1 day'
+                            ELSE INTERVAL '15 minutes'
+                        END
+                    )
+                """
             sql += " ORDER BY created_at ASC"
             cur.execute(sql, tuple(params))
             rows = [dict(r) for r in cur.fetchall()]
@@ -1479,6 +1528,8 @@ def update_prop_firm(signal_id: str, asset: str, grade: str, r_multiple: float) 
     This function is called immediately when an OPEN trade closes via TP, SL,
     or expiry, so prop equity updates as soon as the scanner resolves the trade.
     """
+    if not ENABLE_LEGACY_GLOBAL_PROP_LEDGER:
+        return
     if grade not in ("A+", "A"):
         return
 
@@ -1695,12 +1746,17 @@ def safe_yfinance_ticker(asset: str, ticker: str = "") -> str:
 def preferred_data_ticker(asset: str, current_ticker: str = "") -> str:
     """Return the intended scanner data ticker for an asset.
 
-    New rows use CAPITAL:<asset>. Old Supabase rows may still contain Yahoo
-    tickers; replay can still upgrade them to Capital.com by using the asset key.
+    Capital.com is the source of truth for BENZINO pricing. New scans and
+    historical replay use CAPITAL:<asset> whenever credentials are available.
+    Yahoo symbols are retained only as metadata/fallback and are not used when
+    CAPITAL_STRICT_ALL_ASSETS is true.
     """
     asset = str(asset or "").strip().upper()
+    current_ticker = str(current_ticker or "").strip()
+    if is_capital_ticker(current_ticker):
+        return current_ticker
     if capital_configured() and CAPITAL_PRIMARY_ALL_ASSETS and asset in MASTER_WATCHLIST:
-        return MASTER_WATCHLIST[asset]
+        return f"CAPITAL:{asset}"
     return current_ticker or MASTER_WATCHLIST.get(asset, "")
 
 
@@ -2267,7 +2323,21 @@ def capital_download(symbol: str, timeframe: str, max_rows: int = 1000) -> pd.Da
 
 
 def should_use_capital_for_ticker(ticker: str) -> bool:
-    return capital_configured() and is_capital_ticker(ticker)
+    return capital_configured() and (is_capital_ticker(ticker) or CAPITAL_PRIMARY_ALL_ASSETS)
+
+
+def asset_symbol_from_any_ticker(ticker: str) -> str:
+    """Resolve BENZINO asset key from CAPITAL:<asset>, direct asset, or legacy Yahoo ticker."""
+    ticker = str(ticker or "").strip()
+    if is_capital_ticker(ticker):
+        return capital_symbol_from_ticker(ticker)
+    upper = ticker.upper()
+    if upper in MASTER_WATCHLIST:
+        return upper
+    for asset, yahoo in MASTER_WATCHLIST.items():
+        if str(yahoo).strip().upper() == upper:
+            return asset
+    return upper.replace("=X", "").replace("-USD", "USD").replace("^", "")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2275,51 +2345,40 @@ def should_use_capital_for_ticker(ticker: str) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def download(ticker: str, interval: str, period: str, retries: int = 3, pause_seconds: float = 2.0) -> pd.DataFrame | None:
-    """Download OHLCV data.
+    """Download OHLCV data from Capital.com first.
 
-    Capital.com is the primary source for CAPITAL:<asset> tickers so BENZINO
-    matches the user's TradingView Capital.com charts. In strict mode, Yahoo is
-    not used as a fallback because it can produce wrong TP/SL outcomes.
+    When CAPITAL_STRICT_ALL_ASSETS is true, Yahoo is never used for scanner
+    candles. This prevents signal prices, TP/SL levels, replay outcomes, and
+    Capital.com execution comparisons from being built on different feeds.
     """
     ticker = str(ticker or "").strip()
-    # Capital.com path.
-    if should_use_capital_for_ticker(ticker):
-        symbol = capital_symbol_from_ticker(ticker)
-        interval_to_tf = {"1m": "1m", "15m": "15m", "30m": "30m", "60m": "1h", "1h": "1h", "1d": "1d"}
-        tf = interval_to_tf.get(str(interval).lower(), "15m")
-        # For 4h we call get_timeframe_df directly with timeframe="4h"; download()
-        # only sees the base interval. Synthetic resampling remains supported.
+    symbol = asset_symbol_from_any_ticker(ticker)
+    interval_to_tf = {"1m": "1m", "15m": "15m", "30m": "30m", "60m": "1h", "1h": "1h", "1d": "1d"}
+    tf = interval_to_tf.get(str(interval).lower(), "15m")
+
+    if capital_configured() and CAPITAL_PRIMARY_ALL_ASSETS and symbol in MASTER_WATCHLIST:
         df = capital_download(symbol, tf, max_rows=1000)
         if df is not None and not df.empty:
             return df
+        if CAPITAL_STRICT_ALL_ASSETS:
+            print(f"[Capital] {symbol}: unavailable for {tf}; strict Capital.com pricing active — skipped.")
+            return None
         fallback = yahoo_fallback_for_symbol(symbol, ticker)
         if fallback:
-            print(f"[Capital] {symbol}: unavailable for {tf}; falling back to Yahoo {fallback}.")
+            print(f"[Capital] {symbol}: unavailable for {tf}; fallback allowed, using Yahoo {fallback}.")
             ticker = fallback
         else:
-            print(f"[Capital] {symbol}: unavailable for {tf}; strict Capital mode active — skipping Yahoo fallback.")
             return None
 
-    
-    # HOTFIX: never send CAPITAL: symbols to Yahoo during evaluation/backfill.
-    # If a legacy row still contains CAPITAL:XXX, convert it back to the asset
-    # name so the Capital EPIC mapping can be used instead of Yahoo.
-    if isinstance(ticker, str) and ticker.startswith("CAPITAL:"):
-        symbol = ticker.split(":", 1)[1]
-        capital_info = get_capital_epic(symbol)
-        if capital_info:
-            epic = capital_info.get("epic") or symbol
-            capital_df = fetch_capital_history(epic, tf)
-            if capital_df is not None and not capital_df.empty:
-                return capital_df
-        ticker = symbol
+    if CAPITAL_STRICT_ALL_ASSETS:
+        print(f"[data] {ticker} ({interval}) skipped: Capital.com strict mode is enabled and no Capital mapping was available.")
+        return None
 
-# Yahoo fallback path. Used only when strict Capital mode is disabled or for
-    # truly non-Capital tickers supplied outside MASTER_WATCHLIST.
     last_error = None
+    safe_ticker = safe_yfinance_ticker(symbol, ticker)
     for attempt in range(1, int(retries) + 1):
         try:
-            df = yf.download(safe_yfinance_ticker(symbol if 'symbol' in locals() else asset if 'asset' in locals() else '', ticker), interval=interval, period=period, auto_adjust=True, progress=False, threads=False)
+            df = yf.download(safe_ticker, interval=interval, period=period, auto_adjust=True, progress=False, threads=False)
             if df is None or df.empty:
                 last_error = "empty response"
             else:
@@ -2337,9 +2396,8 @@ def download(ticker: str, interval: str, period: str, retries: int = 3, pause_se
             last_error = e
         if attempt < int(retries):
             time.sleep(float(pause_seconds))
-    print(f"[data] {ticker} ({interval}) skipped after {retries} attempt(s): {last_error}")
+    print(f"[data] {safe_ticker} ({interval}) skipped after {retries} attempt(s): {last_error}")
     return None
-
 
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame | None:
     """Resample Date/Open/High/Low/Close/Volume data into a higher timeframe."""
@@ -2370,9 +2428,19 @@ def get_timeframe_df(ticker: str, timeframe: str) -> pd.DataFrame | None:
         cached = _TF_CACHE[key]
         return cached.copy() if cached is not None else None
     cfg = TIMEFRAME_CONFIGS[timeframe]
-    base = download(ticker, cfg["interval"], cfg["period"])
-    if base is not None and cfg.get("resample"):
-        base = resample_ohlcv(base, cfg["resample"])
+    # Use Capital.com's native 4H candles when available instead of building
+    # 4H from Yahoo/1H data. This keeps every scanner timeframe on Capital.com.
+    if capital_configured() and CAPITAL_PRIMARY_ALL_ASSETS and timeframe == "4h":
+        symbol = asset_symbol_from_any_ticker(ticker)
+        base = capital_download(symbol, "4h", max_rows=1000)
+        if base is None and not CAPITAL_STRICT_ALL_ASSETS:
+            base = download(ticker, cfg["interval"], cfg["period"])
+            if base is not None and cfg.get("resample"):
+                base = resample_ohlcv(base, cfg["resample"])
+    else:
+        base = download(ticker, cfg["interval"], cfg["period"])
+        if base is not None and cfg.get("resample"):
+            base = resample_ohlcv(base, cfg["resample"])
     _TF_CACHE[key] = base.copy() if base is not None else None
     return base.copy() if base is not None else None
 
@@ -2411,19 +2479,30 @@ def get_minute_replay_df(ticker: str) -> pd.DataFrame | None:
             df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
             _MINUTE_REPLAY_CACHE[ticker] = df.copy()
             return df.copy()
+        if CAPITAL_STRICT_ALL_ASSETS:
+            print(f"[Replay1m] {symbol}: Capital.com minute data unavailable; strict Capital.com pricing active — no Yahoo fallback.")
+            _MINUTE_REPLAY_CACHE[ticker] = None
+            return None
         fallback = yahoo_fallback_for_symbol(symbol, ticker)
         if fallback:
-            print(f"[Replay1m] {symbol}: Capital.com minute data unavailable; falling back to Yahoo {fallback}.")
+            print(f"[Replay1m] {symbol}: Capital.com minute data unavailable; fallback allowed, using Yahoo {fallback}.")
             ticker_yahoo = fallback
         else:
-            print(f"[Replay1m] {symbol}: Capital.com minute data unavailable; strict Capital mode active — no Yahoo fallback.")
             _MINUTE_REPLAY_CACHE[ticker] = None
             return None
     else:
+        if CAPITAL_STRICT_ALL_ASSETS:
+            symbol = asset_symbol_from_any_ticker(ticker)
+            if capital_configured() and symbol in MASTER_WATCHLIST:
+                capital_ticker = f"CAPITAL:{symbol}"
+                _MINUTE_REPLAY_CACHE[ticker] = get_minute_replay_df(capital_ticker)
+                return _MINUTE_REPLAY_CACHE[ticker].copy() if _MINUTE_REPLAY_CACHE[ticker] is not None else None
+            print(f"[Replay1m] {ticker}: skipped because strict Capital.com pricing is enabled.")
+            _MINUTE_REPLAY_CACHE[ticker] = None
+            return None
         ticker_yahoo = ticker
 
-    # Yahoo fallback path. Used only when strict Capital mode is disabled or for
-    # non-Capital tickers.
+    # Yahoo fallback path. Used only when strict Capital mode is disabled.
     try:
         df = yf.download(ticker_yahoo, interval="1m", period="7d", auto_adjust=True, progress=False, threads=False)
         if df is None or df.empty:
@@ -3453,31 +3532,34 @@ def telegram_configured() -> bool:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def evaluate_open_trades(assets: set[str] | None = None, timeframes: set[str] | None = None) -> None:
-    open_trades = fetch_open_trades(assets=assets, timeframes=timeframes)
+    open_trades = fetch_open_trades(assets=assets, timeframes=timeframes, due_only=True)
     if not open_trades:
         print("[Evaluate] No open trades.")
         return
 
-    print(f"[Evaluate] Checking {len(open_trades)} open trade(s) with 1-minute replay where available...")
+    print(f"[Evaluate] Checking {len(open_trades)} due open trade(s) with 1-minute replay where available...")
     for t in open_trades:
         asset = t.get("asset")
         signal_id = t.get("signal_id")
         grade = t.get("grade")
         result = replay_trade_outcome(t, use_minute=True)
         if not result:
+            # Capital.com 1-minute data may be temporarily unavailable. Mark this
+            # row as checked so it is retried on its timeframe cadence instead of
+            # hammering the replay endpoint every scanner run.
+            mark_replay_checked(signal_id)
             continue
 
         reason = result.get("reason")
         bars_open = int(result.get("bars_open") or 0)
         method = result.get("method", "unknown")
         if reason == "OPEN":
-            if bars_open:
-                bump_bars_open(signal_id, bars_open)
+            mark_replay_checked(signal_id, bars_open if bars_open else None)
             continue
 
         exit_price = float(result.get("price") or 0.0)
         r_mult = float(result.get("r") or 0.0)
-        close_trade(signal_id, exit_price, reason, r_mult)
+        close_trade(signal_id, exit_price, reason, r_mult, result.get("exit_time"))
         update_prop_firm(signal_id, asset, grade, r_mult)
 
         if "ambiguous" in str(method):
@@ -3611,6 +3693,10 @@ def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] 
         signal_id = t.get("signal_id")
         result = replay_trade_outcome(t, use_minute=True)
         if not result:
+            # Capital.com 1-minute data may be temporarily unavailable. Mark this
+            # row as checked so it is retried on its timeframe cadence instead of
+            # hammering the replay endpoint every scanner run.
+            mark_replay_checked(signal_id)
             continue
         reason = result.get("reason")
         bars_open = int(result.get("bars_open") or 0)
@@ -5103,7 +5189,6 @@ def run_scan() -> None:
             asset_seconds.append(time.perf_counter() - asset_start)
 
     force_open_graded_setups()
-    state = load_prop_firm_state()
     finished = datetime.now(timezone.utc)
     elapsed = (finished - started).total_seconds()
     print(f"\n{'='*70}")
@@ -5111,9 +5196,13 @@ def run_scan() -> None:
     open_count = len(fetch_open_trades(assets=set(scan_assets.keys()), timeframes=set(active_tfs)))
     print(f"  Journaled (A+/A/B/C): {journaled} | Open trades: {open_count} | Alerted: {alerted} | Shadowed (NO TRADE): {shadowed}")
     print(f"  Runtime: fastest asset {min(asset_seconds) if asset_seconds else 0:.1f}s | slowest {max(asset_seconds) if asset_seconds else 0:.1f}s | avg {float(np.mean(asset_seconds)) if asset_seconds else 0:.1f}s")
-    print(f"  Prop firm: equity ${float(state['current_equity']):,.2f} "
-          f"({(float(state['current_equity'])/float(state['starting_balance'])-1)*100:+.2f}%) "
-          f"| status {state['status']} | trading days {state['trading_days']}")
+    if ENABLE_LEGACY_GLOBAL_PROP_LEDGER:
+        state = load_prop_firm_state()
+        print(f"  Legacy global prop ledger: equity ${float(state['current_equity']):,.2f} "
+              f"({(float(state['current_equity'])/float(state['starting_balance'])-1)*100:+.2f}%) "
+              f"| status {state['status']} | trading days {state['trading_days']}")
+    else:
+        print("  User prop analytics: handled per logged-in user in app.py; legacy global prop ledger disabled.")
     print(f"{'='*70}\n")
 
     log_runtime(

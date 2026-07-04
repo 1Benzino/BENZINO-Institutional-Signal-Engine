@@ -267,6 +267,25 @@ def init_tables() -> None:
         settings_json TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS user_journal_tracking_history (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        username TEXT NOT NULL,
+        previous_tracking_started_at TIMESTAMPTZ,
+        reset_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        starting_balance NUMERIC,
+        ending_balance NUMERIC,
+        realised_pnl NUMERIC,
+        win_rate NUMERIC,
+        total_trades INTEGER,
+        closed_trades INTEGER,
+        grade_summary JSONB,
+        curve_points JSONB,
+        trade_details JSONB,
+        settings_snapshot JSONB,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_journal_tracking_history_user_reset
+        ON user_journal_tracking_history(username, reset_at DESC);
     CREATE TABLE IF NOT EXISTS user_watchlists (
         scan_owner TEXT NOT NULL,
         asset TEXT NOT NULL,
@@ -2485,7 +2504,14 @@ def add_balance_extreme_labels(
     group_col: str | None = None,
     currency_prefix: str = "$",
 ) -> None:
-    """Label lowest, highest, and current balance for each balance-curve line."""
+    """Add clear low/high/current labels without stacking labels on top of the curve.
+
+    Instead of placing every text box directly over the line, this pins the
+    labels in a right-side callout rail and staggers their y positions. The
+    actual low/high/current points are still marked on the curve, while the
+    readable amounts sit outside the plot area where they do not hide one
+    another.
+    """
     if data is None or data.empty or x_col not in data.columns or y_col not in data.columns:
         return
 
@@ -2500,47 +2526,101 @@ def add_balance_extreme_labels(
     if group_col and group_col in work.columns:
         groups = [(str(name), grp.copy()) for name, grp in work.groupby(group_col, sort=False) if grp is not None and not grp.empty]
 
-    seen_points: set[tuple[str, int, str]] = set()
+    label_rows: list[dict] = []
+    seen_points: set[tuple[str, str, str]] = set()
+
     for group_name, grp in groups:
         grp = grp.sort_values(x_col).reset_index(drop=True)
         if grp.empty:
             continue
 
-        label_prefix = f"{group_name} · " if group_name else ""
         picks = [
-            ("Low", int(grp[y_col].idxmin()), -34, -10),
-            ("High", int(grp[y_col].idxmax()), 34, 10),
-            ("Current", int(grp.index[-1]), 0, 44),
+            ("Low", int(grp[y_col].idxmin())),
+            ("High", int(grp[y_col].idxmax())),
+            ("Current", int(grp.index[-1])),
         ]
-        for label, idx, yshift, xshift in picks:
+        for role, idx in picks:
             try:
                 row = grp.loc[idx]
                 y_val = float(row[y_col])
                 x_val = row[x_col]
             except Exception:
                 continue
-            # Avoid stacking duplicate low/high/current labels when a short curve
-            # has the same point for more than one role. Keep Current preferred.
-            key = (group_name, idx, "point")
-            if key in seen_points and label != "Current":
+
+            # A short line can have low/high/current on the same candle. Show the
+            # current label and avoid duplicate low/high callouts for the same point.
+            point_key = (group_name, str(x_val), f"{y_val:.8f}")
+            if point_key in seen_points and role != "Current":
                 continue
-            seen_points.add(key)
-            fig.add_annotation(
-                x=x_val,
-                y=y_val,
-                text=f"{label_prefix}{label}: {currency_prefix}{y_val:,.2f}",
-                showarrow=True,
-                arrowhead=2,
-                arrowsize=0.8,
-                arrowwidth=1,
-                ax=xshift,
-                ay=yshift,
-                bgcolor="rgba(15,34,53,0.92)",
-                bordercolor="rgba(232,237,242,0.28)",
-                borderwidth=1,
-                borderpad=4,
-                font=dict(size=11, color="#E8EDF2"),
+            seen_points.add(point_key)
+
+            # Mark the exact point on the curve, but keep the text outside the plot.
+            fig.add_trace(
+                go.Scatter(
+                    x=[x_val],
+                    y=[y_val],
+                    mode="markers",
+                    marker=dict(size=7, symbol="circle-open"),
+                    hovertemplate=f"{group_name + ' · ' if group_name else ''}{role}: {currency_prefix}{y_val:,.2f}<extra></extra>",
+                    showlegend=False,
+                )
             )
+            label_rows.append({
+                "group": group_name,
+                "role": role,
+                "x": x_val,
+                "y": y_val,
+                "label_y": y_val,
+                "text": f"{group_name + ' · ' if group_name else ''}{role}: {currency_prefix}{y_val:,.2f}",
+            })
+
+    if not label_rows:
+        return
+
+    y_values = [float(v) for v in work[y_col].dropna().tolist()]
+    y_min, y_max = min(y_values), max(y_values)
+    y_span = max(y_max - y_min, 1.0)
+    pad = y_span * 0.08
+    lower, upper = y_min - pad, y_max + pad
+    min_gap = y_span * 0.055
+
+    # Stagger the right-side label rail so labels never sit on top of each other.
+    label_rows.sort(key=lambda r: (r["label_y"], r["group"], r["role"]))
+    prev_y = None
+    for row in label_rows:
+        y = float(row["label_y"])
+        if prev_y is not None and y - prev_y < min_gap:
+            y = prev_y + min_gap
+        row["label_y"] = min(y, upper)
+        prev_y = row["label_y"]
+
+    # If the upward pass pushed the top labels out of range, compress downwards.
+    next_y = None
+    for row in reversed(label_rows):
+        y = float(row["label_y"])
+        if next_y is not None and next_y - y < min_gap:
+            y = next_y - min_gap
+        row["label_y"] = max(y, lower)
+        next_y = row["label_y"]
+
+    for row in label_rows:
+        fig.add_annotation(
+            x=1.012,
+            y=row["label_y"],
+            xref="paper",
+            yref="y",
+            text=row["text"],
+            showarrow=False,
+            xanchor="left",
+            align="left",
+            bgcolor="rgba(15,34,53,0.94)",
+            bordercolor="rgba(232,237,242,0.28)",
+            borderwidth=1,
+            borderpad=4,
+            font=dict(size=10, color="#E8EDF2"),
+        )
+
+    fig.update_yaxes(range=[lower, upper])
 
 
 def render_balance_curve(df: pd.DataFrame, settings: dict, title: str = "Balance curve", split_by_grade: bool = False, include_overall: bool = False) -> None:
@@ -2627,7 +2707,7 @@ def render_balance_curve(df: pd.DataFrame, settings: dict, title: str = "Balance
             yaxis_title=f"Balance after ({account:,.0f} start, {risk_pct:.2f}% risk)",
             xaxis_title="Resolved at",
             height=430,
-            margin=dict(l=20, r=90, t=25, b=40),
+            margin=dict(l=20, r=230, t=25, b=40),
             hovermode="x unified",
         )
     else:
@@ -2636,7 +2716,7 @@ def render_balance_curve(df: pd.DataFrame, settings: dict, title: str = "Balance
         color_col = "timeframe" if "timeframe" in closed.columns else None
         fig = px.line(closed, x="curve_time", y="balance_after", color=color_col, title=title)
         add_balance_extreme_labels(fig, closed, "curve_time", "balance_after", color_col)
-        fig.update_layout(yaxis_title="Balance after", xaxis_title="Resolved at", height=430, margin=dict(l=20, r=90, t=25, b=40), hovermode="x unified")
+        fig.update_layout(yaxis_title="Balance after", xaxis_title="Resolved at", height=430, margin=dict(l=20, r=230, t=25, b=40), hovermode="x unified")
 
     st.plotly_chart(fig, use_container_width=True)
 
@@ -7204,10 +7284,174 @@ def prop_firm_win_rate_for_admin(username: str, timeframe: str = "1h") -> str:
         return "0.00%"
 
 
-def render_settings(username: str, settings: dict) -> None:
-    page_header("Settings", "Profile, watchlist, Telegram routing, activation date, and reset tools.")
 
-    tab_profile, tab_watchlist, tab_telegram, tab_capital, tab_health, tab_reset = st.tabs(["Profile", "Watchlist", "Telegram", "Capital", "System Health", "Reset"])
+def settings_commentary(body: str) -> None:
+    """Settings commentary card, matching Workflow commentary treatment."""
+    body = str(body or "").strip()
+    if body:
+        st.markdown(f"<div class='page-commentary'>{html.escape(body)}</div>", unsafe_allow_html=True)
+
+
+def save_user_journal_tracking_snapshot(username: str, settings: dict) -> tuple[bool, str]:
+    """Archive the current user-journal tracking period before resetting the start date."""
+    username = normalize_username(username)
+    if not username:
+        return False, "No active user found."
+
+    previous_started = settings.get("tracking_started_at") or None
+    reset_at = datetime.now(timezone.utc)
+    start_balance = float(settings.get("account_size", 10000) or 10000)
+
+    try:
+        df = load_signals_for_user(username, settings)
+        df = apply_timeframe_view(df, settings)
+    except Exception:
+        df = pd.DataFrame()
+
+    if df is None or df.empty:
+        grade_summary = []
+        curve_points = []
+        trade_details = []
+        ending_balance = start_balance
+        realised_pnl = 0.0
+        win_rate = 0.0
+        total_trades = 0
+        closed_trades = 0
+    else:
+        work = add_trade_pnl_columns(df.copy(), settings)
+        work["outcome"] = work.apply(outcome_label, axis=1) if "outcome" not in work.columns else work["outcome"]
+        status = work.get("status", pd.Series(dtype=str)).astype(str).str.upper()
+        closed = work[status.str.contains("CLOSED|EXPIRED|TP|SL", na=False)].copy()
+        closed = closed[closed.get("grade", pd.Series(dtype=str)).astype(str).isin(VALID_GRADES)].copy()
+        total_trades = int(len(work[work.get("grade", pd.Series(dtype=str)).astype(str).isin(VALID_GRADES)]))
+        closed_trades = int(len(closed))
+
+        if not closed.empty:
+            if "exit_at" in closed.columns:
+                closed["curve_time"] = pd.to_datetime(closed["exit_at"], errors="coerce", utc=True)
+            else:
+                closed["curve_time"] = pd.NaT
+            closed["curve_time"] = closed["curve_time"].fillna(pd.to_datetime(closed.get("created_at"), errors="coerce", utc=True))
+            closed = closed.dropna(subset=["curve_time"]).sort_values("curve_time")
+            closed["balance_after"] = start_balance + pd.to_numeric(closed.get("pnl_cash", 0), errors="coerce").fillna(0.0).cumsum()
+            ending_balance = float(closed["balance_after"].iloc[-1]) if len(closed) else start_balance
+            realised_pnl = float(ending_balance - start_balance)
+            win_rate = float(win_rate_from_resolved(closed))
+
+            # Same balance-curve breakdown: all trades plus A+/A, B and C grade buckets.
+            curve_points = []
+            def _safe_float(value, default: float = 0.0) -> float:
+                try:
+                    out = float(pd.to_numeric(value, errors="coerce"))
+                    return out if math.isfinite(out) else default
+                except Exception:
+                    return default
+
+            def _append_curve_points(source: pd.DataFrame, group_name: str) -> None:
+                if source.empty:
+                    return
+                source = source.sort_values("curve_time").copy()
+                balances = start_balance + pd.to_numeric(source.get("pnl_cash", 0), errors="coerce").fillna(0.0).cumsum()
+                first_time = source["curve_time"].min()
+                curve_points.append({"group": group_name, "resolved_at": (first_time - pd.Timedelta(seconds=1)).isoformat(), "balance": start_balance, "pnl_cash": 0.0, "trade_id": "START"})
+                for (_, row), bal in zip(source.iterrows(), balances.tolist()):
+                    curve_points.append({
+                        "group": group_name,
+                        "resolved_at": row.get("curve_time").isoformat() if pd.notna(row.get("curve_time")) else "",
+                        "balance": float(bal),
+                        "pnl_cash": _safe_float(row.get("pnl_cash", 0)),
+                        "trade_id": str(row.get("signal_id", "")),
+                        "asset": str(row.get("asset", "")),
+                        "grade": str(row.get("grade", "")),
+                        "outcome": str(row.get("outcome", "")),
+                    })
+
+            _append_curve_points(closed, "All trades")
+            grade_norm = closed["grade"].astype(str).str.upper().str.strip()
+            for label, mask in [
+                ("A+/A only", grade_norm.isin(["A+", "A"])),
+                ("B only", grade_norm.eq("B")),
+                ("C only", grade_norm.eq("C")),
+            ]:
+                _append_curve_points(closed[mask].copy(), label)
+
+            grade_summary = []
+            for label, mask in [
+                ("A+/A only", grade_norm.isin(["A+", "A"])),
+                ("B only", grade_norm.eq("B")),
+                ("C only", grade_norm.eq("C")),
+            ]:
+                g = closed[mask].copy()
+                if g.empty:
+                    grade_summary.append({"grade_group": label, "trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "starting_balance": start_balance, "ending_balance": start_balance, "realised_pnl": 0.0})
+                    continue
+                wins, losses, breakevens, resolved = resolved_outcome_masks(g)
+                pnl = float(pd.to_numeric(g.get("pnl_cash", 0), errors="coerce").fillna(0.0).sum())
+                grade_summary.append({
+                    "grade_group": label,
+                    "trades": int(len(g)),
+                    "wins": int(wins.sum()),
+                    "losses": int(losses.sum()),
+                    "breakevens": int(breakevens.sum()),
+                    "win_rate": float(win_rate_from_resolved(g)),
+                    "starting_balance": start_balance,
+                    "ending_balance": float(start_balance + pnl),
+                    "realised_pnl": pnl,
+                    "best_balance": float(start_balance + pd.to_numeric(g.get("pnl_cash", 0), errors="coerce").fillna(0.0).cumsum().max()),
+                    "lowest_balance": float(start_balance + pd.to_numeric(g.get("pnl_cash", 0), errors="coerce").fillna(0.0).cumsum().min()),
+                })
+
+            keep_cols = ["signal_id", "display_id", "asset", "timeframe", "signal", "grade", "created_at", "exit_at", "status", "outcome", "entry", "sl", "tp", "rr", "r_multiple", "pnl_cash", "balance_after", "reason"]
+            existing_cols = [c for c in keep_cols if c in closed.columns]
+            trade_details = closed[existing_cols].copy()
+            for col in trade_details.columns:
+                if pd.api.types.is_datetime64_any_dtype(trade_details[col]):
+                    trade_details[col] = trade_details[col].astype(str)
+            trade_details = trade_details.replace({np.nan: None}).to_dict("records")
+        else:
+            grade_summary = []
+            curve_points = []
+            trade_details = []
+            ending_balance = start_balance
+            realised_pnl = 0.0
+            win_rate = 0.0
+
+    try:
+        execute(
+            """
+            INSERT INTO user_journal_tracking_history(
+                username, previous_tracking_started_at, reset_at, starting_balance, ending_balance,
+                realised_pnl, win_rate, total_trades, closed_trades, grade_summary,
+                curve_points, trade_details, settings_snapshot
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb)
+            """,
+            (
+                username,
+                previous_started,
+                reset_at.isoformat(),
+                start_balance,
+                ending_balance,
+                realised_pnl,
+                win_rate,
+                total_trades,
+                closed_trades,
+                json.dumps(grade_summary, default=str),
+                json.dumps(curve_points, default=str),
+                json.dumps(trade_details, default=str),
+                json.dumps(settings, default=str),
+            ),
+        )
+        settings["tracking_started_at"] = reset_at.isoformat()
+        save_settings(username, settings)
+        return True, f"Tracking reset saved. Archived {closed_trades:,} closed trade(s), {total_trades:,} total trade(s), and ${realised_pnl:+,.2f} realised P/L."
+    except Exception as exc:
+        return False, f"Tracking reset failed: {exc}"
+
+def render_settings(username: str, settings: dict) -> None:
+    page_header("Settings", "Profile, watchlist, Telegram routing, Capital.com connection, system health, and journal reset tools.")
+
+    tab_profile, tab_watchlist, tab_telegram, tab_capital, tab_health, tab_reset = st.tabs(["Profile", "Watchlist", "Telegram", "Capital.com", "System Health", "Reset"])
     with tab_profile:
         users = read_df("SELECT username, email, created_at, role FROM users WHERE username = %s", (username,))
         created = users.iloc[0]["created_at"] if not users.empty else "Unknown"
@@ -7286,11 +7530,6 @@ def render_settings(username: str, settings: dict) -> None:
                 if ok: st.success(msg)
                 else: st.error(msg)
 
-        if st.button("Reset my tracking start to now", type="secondary"):
-            settings["tracking_started_at"] = datetime.now(timezone.utc).isoformat()
-            save_settings(username, settings)
-            st.success("Tracking start reset. Future dashboard metrics will start from now.")
-            st.rerun()
 
     with tab_watchlist:
         current = list(load_user_watchlist(username).keys())
@@ -7305,11 +7544,7 @@ def render_settings(username: str, settings: dict) -> None:
         for key, meta in ASSET_UNIVERSE.items():
             grouped.setdefault(meta["group"], []).append(key)
 
-        st.markdown("<div class='benzino-panel-title'>Edit Watchlist</div>", unsafe_allow_html=True)
-        st.caption(
-            "Choose the assets this user wants to track. Saving updates Supabase immediately, "
-            "refreshes the dashboard filter, and is picked up by Telegram watchlist routing on the next scanner run."
-        )
+        workflow_commentary_header("Edit Watchlist", "Choose the assets this user wants to track. Saving updates Supabase immediately, refreshes the dashboard filter, and is picked up by Telegram watchlist routing on the next scanner run.")
 
         all_assets_ordered = []
         for group in sorted(grouped.keys()):
@@ -7351,7 +7586,7 @@ def render_settings(username: str, settings: dict) -> None:
 
         current = list(load_user_watchlist(username).keys())
         current_set = set(current or DEFAULT_ASSETS)
-        st.caption("Current active watchlist: " + ", ".join(current or DEFAULT_ASSETS))
+        settings_commentary("Current active watchlist: " + ", ".join(current or DEFAULT_ASSETS))
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         wl_system_df = load_all_system_signals(settings)
@@ -7433,10 +7668,7 @@ def render_settings(username: str, settings: dict) -> None:
         )
 
     with tab_telegram:
-        st.caption(
-            "Activating here registers your chat ID with the scanner directly. 'Watchlist only' sends alerts solely for assets in your saved Watchlist tab; "
-            "'All signals' sends every A+/A/B/C alert the scanner generates, regardless of your watchlist."
-        )
+        workflow_commentary_header("Telegram Alerts", "Activating here registers your chat ID with the scanner directly. Watchlist alerts send only the assets in your saved Watchlist tab; global alerts send every eligible scanner alert regardless of your watchlist.")
         with st.expander("How to get your Telegram chat ID", expanded=False):
             st.markdown(
                 """
@@ -7451,7 +7683,12 @@ def render_settings(username: str, settings: dict) -> None:
             tg = read_df("SELECT * FROM user_telegram_settings WHERE scan_owner = %s", (username,))
             row = tg.iloc[0].to_dict() if not tg.empty else {}
             active = bool(row.get("alerts_enabled", False))
-            st.markdown(f"**Telegram alerts:** {'Active' if active else 'Inactive'}")
+            watchlist_status = bool(row.get("watchlist_alerts", True)) and active
+            global_status = bool(row.get("all_signals_alerts", False)) and active
+            tg1, tg2, tg3 = st.columns(3)
+            with tg1: metric_card("Telegram", "Activated" if active else "Not activated", "Chat ID saved" if str(row.get("telegram_chat_id") or "").strip() else "No chat ID saved")
+            with tg2: metric_card("Watchlist alerts", "ON" if watchlist_status else "OFF", "Only saved Watchlist assets")
+            with tg3: metric_card("Global alerts", "ON" if global_status else "OFF", "All eligible scanner signals")
 
             # Show the confirmation from the PREVIOUS run here, before anything else.
             # st.success() called right before st.rerun() never has a chance to paint
@@ -7506,13 +7743,13 @@ def render_settings(username: str, settings: dict) -> None:
                     "Telegram settings activated." if new_active else "Telegram alerts deactivated."
                 )
                 st.rerun()
-            st.caption("Activate Settings saves the chat ID and alert route in one step. Only one route can be active at a time.")
+            settings_commentary("Activate Settings saves the chat ID and alert route in one step. Only one route can be active at a time.")
         except Exception as exc:
             st.error(f"Telegram settings error: {exc}")
 
 
     with tab_capital:
-        st.caption("Connect your own Capital.com demo account. Auto-trading uses your BENZINO watchlist, selected timeframe, selected demo grades, best session only, and max 4 demo trades per day. API credentials are stored in Supabase for the scanner to use.")
+        workflow_commentary_header("Capital.com", "Connect your own Capital.com demo account. Auto-trading uses your BENZINO watchlist, selected timeframe, selected demo grades, best session only, and max 4 demo trades per day. API credentials are stored in Supabase for the scanner to use.")
         with st.expander("How to get your Capital.com API details", expanded=False):
             st.markdown(
                 """
@@ -7530,9 +7767,9 @@ def render_settings(username: str, settings: dict) -> None:
             cap = read_df("SELECT username, account_type, enabled, auto_trade_enabled, auto_trade_grades, use_benzino_settings, updated_at FROM user_capital_connections WHERE username = %s", (username,))
             cap_row = cap.iloc[0].to_dict() if not cap.empty else {}
             cc1, cc2, cc3, cc4 = st.columns(4)
-            with cc1: metric_card("Capital connection", "Active" if bool(cap_row.get("enabled", False)) else "Inactive", str(cap_row.get("account_type") or "DEMO"))
+            with cc1: metric_card("Capital.com connection", "Active" if bool(cap_row.get("enabled", False)) else "Inactive", str(cap_row.get("account_type") or "DEMO"))
             with cc2: metric_card("Auto-trading", "ON" if bool(cap_row.get("auto_trade_enabled", False)) else "OFF", str(cap_row.get("auto_trade_grades") or "A+,A") + " · best session · max 4/day")
-            with cc3: metric_card("Sizing source", "BENZINO" if bool(cap_row.get("use_benzino_settings", True)) else "Capital", "Default keeps FTMO simulation aligned")
+            with cc3: metric_card("Sizing source", "BENZINO" if bool(cap_row.get("use_benzino_settings", True)) else "Capital.com", "Default keeps FTMO simulation aligned")
             with cc4: metric_card("Last updated", fmt_nairobi(cap_row.get("updated_at", "")) if cap_row else "Never")
 
             with st.form("capital_connection_form", clear_on_submit=False):
@@ -7551,7 +7788,7 @@ def render_settings(username: str, settings: dict) -> None:
                     help="Simulation still records A+/A/B/C. This only controls which grades are executed on your Capital demo account."
                 )
                 use_benzino = st.checkbox("Use BENZINO account size, leverage and risk settings", value=bool(cap_row.get("use_benzino_settings", True)))
-                submitted = st.form_submit_button("Save Capital settings", type="primary")
+                submitted = st.form_submit_button("Save Capital.com settings", type="primary")
             if submitted:
                 if auto_enabled and account_type.upper() != "DEMO":
                     st.error("Live auto-trading is blocked from the app. Use DEMO while testing.")
@@ -7580,21 +7817,44 @@ def render_settings(username: str, settings: dict) -> None:
                         """,
                         (username, api_key.strip() or old.get("api_key", ""), identifier.strip() or old.get("identifier", ""), password.strip() or old.get("password", ""), account_type, enabled, auto_enabled, ",".join(selected_grades), use_benzino),
                     )
-                    st.success("Capital settings saved.")
+                    st.success("Capital.com settings saved.")
                     st.rerun()
 
-            st.markdown("<div class='grey-note' style='margin-top:14px;'>Execution details, simulated-vs-actual comparison rows, and match-quality explanations now live under Workflow → Capital.</div>", unsafe_allow_html=True)
+            settings_commentary("Execution details, simulated-vs-actual comparison rows, and match-quality explanations now live under Workflow → Capital.com.")
         except Exception as exc:
-            st.error(f"Capital settings error: {exc}")
+            st.error(f"Capital.com settings error: {exc}")
 
     with tab_health:
         render_system_health_panel()
 
     with tab_reset:
-        st.warning("Reset tools do not delete your login. They only clear personal settings/watchlist, or admin global scanner data if explicitly selected.")
-        if st.button("Clear my watchlist", type="secondary"):
-            execute("UPDATE user_watchlists SET enabled = FALSE WHERE scan_owner = %s", (username,))
-            st.success("Watchlist cleared.")
+        workflow_commentary_header("Journal Tracking Reset", "Resetting starts a fresh User Journal tracking period from now. Before the reset, BENZINO archives the current period with starting balance, ending balance, realised P/L, win rate, grade-level growth, balance-curve points, trade details, dates, and the settings snapshot used for that period.")
+        hist = read_df("SELECT reset_at, previous_tracking_started_at, starting_balance, ending_balance, realised_pnl, win_rate, total_trades, closed_trades FROM user_journal_tracking_history WHERE username = %s ORDER BY reset_at DESC LIMIT 20", (username,))
+        r1, r2, r3 = st.columns(3)
+        with r1: metric_card("Current tracking since", fmt_nairobi(settings.get("tracking_started_at", "")) or "Not set")
+        with r2: metric_card("Account start", f"${float(settings.get('account_size', 10000) or 10000):,.2f}")
+        with r3: metric_card("Archived periods", f"{len(hist):,}", "Latest 20 shown below")
+        confirm_reset = st.text_input("Type RESET MY JOURNAL TRACKING to archive this period and start fresh", key="journal_tracking_reset_confirm")
+        if st.button("Reset User Journal tracking", type="secondary"):
+            if confirm_reset == "RESET MY JOURNAL TRACKING":
+                ok, msg = save_user_journal_tracking_snapshot(username, settings)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+            else:
+                st.error("Confirmation text did not match.")
+        if not hist.empty:
+            hist_view = hist.copy()
+            hist_view["reset_at"] = hist_view["reset_at"].apply(fmt_nairobi)
+            hist_view["previous_tracking_started_at"] = hist_view["previous_tracking_started_at"].apply(fmt_nairobi)
+            for col in ["starting_balance", "ending_balance", "realised_pnl"]:
+                if col in hist_view.columns:
+                    hist_view[col] = pd.to_numeric(hist_view[col], errors="coerce").apply(lambda v: f"${v:,.2f}" if pd.notna(v) else "")
+            if "win_rate" in hist_view.columns:
+                hist_view["win_rate"] = pd.to_numeric(hist_view["win_rate"], errors="coerce").apply(lambda v: f"{v:.2f}%" if pd.notna(v) else "")
+            render_benzino_aggrid(hist_view, key="journal_tracking_history", title="Journal Tracking History", height=320, page_size=10, pinned=["reset_at"], numeric_cols_right=["total_trades", "closed_trades"])
         if is_admin():
             st.divider()
             st.subheader("Admin tools")
@@ -7611,7 +7871,7 @@ def render_settings(username: str, settings: dict) -> None:
                     st.error("Confirmation text did not match.")
 
             st.markdown("**Prop replay tools**")
-            st.caption("Use this after prop-firm rules change. It clears the old legacy prop ledgers, then rebuilds every user's challenge history from scanner_signals using the current rules.")
+            settings_commentary("Use this after prop-firm rules change. It clears the old legacy prop ledgers, then rebuilds every user's challenge history from scanner_signals using the current rules.")
             rebuild_confirm = st.text_input("Type REBUILD PROP HISTORY to replay all user prop histories")
             if st.button("Admin rebuild all prop firm history", type="secondary"):
                 if rebuild_confirm == "REBUILD PROP HISTORY":
