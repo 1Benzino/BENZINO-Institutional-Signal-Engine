@@ -578,7 +578,10 @@ GRADE_RANK = {"A+": 4, "A": 3, "B": 2, "C": 1, "NO TRADE": 0}
 # rows are resolved one-by-one in a single scanner run, so backlog resolution is
 # intentionally chunked and committed in batches. Increase carefully only if the
 # database comfortably handles the load.
-SHADOW_EVAL_LIMIT = int(os.environ.get("SHADOW_EVAL_LIMIT", "400"))
+# Shadow research is intentionally lightweight. It must never slow down the live scanner.
+# These are NO TRADE research rows, so the real journal/prop/alerts are unaffected.
+SHADOW_EVAL_LIMIT = int(os.environ.get("SHADOW_EVAL_LIMIT", "25"))
+SHADOW_MAX_AGE_DAYS = int(os.environ.get("SHADOW_MAX_AGE_DAYS", "7"))
 SHADOW_DB_UPDATE_BATCH_SIZE = int(os.environ.get("SHADOW_DB_UPDATE_BATCH_SIZE", "100"))
 SHADOW_BACKFILL_LIMIT = int(os.environ.get("SHADOW_BACKFILL_LIMIT", "800"))
 
@@ -640,6 +643,7 @@ SCANNER_RUN_SCHEMA_MIGRATIONS = os.environ.get("SCANNER_RUN_SCHEMA_MIGRATIONS", 
 # auto-trade matching. The history endpoints reject some lastPeriod values on
 # some Capital accounts, so they are disabled unless explicitly enabled.
 CAPITAL_FETCH_ACTIVITY_HISTORY = os.environ.get("CAPITAL_FETCH_ACTIVITY_HISTORY", "false").strip().lower() in {"1", "true", "yes", "y"}
+CAPITAL_CONSTRAINT_REFRESH_HOURS = int(os.environ.get("CAPITAL_CONSTRAINT_REFRESH_HOURS", "24"))
 
 # Audit guard: historical replay must never rewrite the original trade plan.
 # Existing rows keep their original entry/sl/tp/rr. Replay is allowed to update
@@ -3971,6 +3975,7 @@ def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] 
     shadow_trades = fetch_unresolved_shadow_trades(
         assets=assets,
         timeframes=timeframes,
+        max_age_days=SHADOW_MAX_AGE_DAYS,
         limit=SHADOW_EVAL_LIMIT,
         due_only=True,
     )
@@ -3979,8 +3984,8 @@ def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] 
         return 0
 
     print(
-        f"[Shadow] Checking {len(shadow_trades)} unresolved NO TRADE row(s) "
-        f"with 1-minute replay where available. Batch limit: {SHADOW_EVAL_LIMIT}."
+        f"[Shadow] Checking {len(shadow_trades)} recent unresolved NO TRADE row(s) "
+        f"with 1-minute replay where available. Limit: {SHADOW_EVAL_LIMIT}; age cap: {SHADOW_MAX_AGE_DAYS}d."
     )
     if backfilled:
         print(f"[Shadow] Backfill was capped at {SHADOW_BACKFILL_LIMIT} row(s) this run.")
@@ -3998,32 +4003,51 @@ def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] 
         pending_updates = []
         return saved
 
+    grouped_shadow: dict[str, list[dict]] = {}
     for t in shadow_trades:
-        signal_id = t.get("signal_id")
-        result = replay_trade_outcome(t, use_minute=True)
-        if not result:
-            # Capital.com 1-minute data may be temporarily unavailable. Mark this
-            # row as checked so it is retried on its timeframe cadence instead of
-            # hammering the replay endpoint every scanner run.
-            pending_capital_data += 1
-            mark_replay_checked(signal_id)
-            continue
-        reason = result.get("reason")
-        bars_open = int(result.get("bars_open") or 0)
-        if reason == "OPEN":
-            if bars_open:
-                bars_updates.append((signal_id, bars_open))
+        asset = str(t.get("asset") or asset_symbol_from_any_ticker(str(t.get("ticker") or ""))).strip().upper()
+        grouped_shadow.setdefault(asset, []).append(t)
+
+    for asset, rows in grouped_shadow.items():
+        # Prime the per-run minute cache once per asset. If Capital minute data is
+        # unavailable for that asset, cadence-stamp the whole group and move on.
+        ticker = preferred_data_ticker(asset, f"CAPITAL:{asset}")
+        mdf = get_minute_replay_df(ticker)
+        if mdf is None or mdf.empty:
+            pending_capital_data += len(rows)
+            for t in rows:
+                signal_id = t.get("signal_id")
+                if signal_id:
+                    mark_replay_checked(signal_id)
             continue
 
-        outcome = {"TP": "SHADOW_TP", "SL": "SHADOW_SL", "EXPIRY": "SHADOW_EXPIRY"}.get(str(reason), "SHADOW_EXPIRY")
-        pending_updates.append((
-            signal_id,
-            float(result.get("price") or 0.0),
-            outcome,
-            float(result.get("r") or 0.0),
-        ))
-        if len(pending_updates) >= max(1, SHADOW_DB_UPDATE_BATCH_SIZE):
-            resolved += _flush_pending()
+        for t in rows:
+            signal_id = t.get("signal_id")
+            result = replay_trade_outcome(t, use_minute=True)
+            if not result:
+                # Capital.com 1-minute data may be temporarily unavailable. Mark this
+                # row as checked so it is retried on its timeframe cadence instead of
+                # hammering the replay endpoint every scanner run.
+                pending_capital_data += 1
+                if signal_id:
+                    mark_replay_checked(signal_id)
+                continue
+            reason = result.get("reason")
+            bars_open = int(result.get("bars_open") or 0)
+            if reason == "OPEN":
+                if bars_open:
+                    bars_updates.append((signal_id, bars_open))
+                continue
+
+            outcome = {"TP": "SHADOW_TP", "SL": "SHADOW_SL", "EXPIRY": "SHADOW_EXPIRY"}.get(str(reason), "SHADOW_EXPIRY")
+            pending_updates.append((
+                signal_id,
+                float(result.get("price") or 0.0),
+                outcome,
+                float(result.get("r") or 0.0),
+            ))
+            if len(pending_updates) >= max(1, SHADOW_DB_UPDATE_BATCH_SIZE):
+                resolved += _flush_pending()
 
     resolved += _flush_pending()
 
@@ -5408,13 +5432,19 @@ def refresh_missing_capital_constraints(limit: int = 40) -> None:
                 """
                 SELECT asset, epic
                 FROM capital_epic_map
-                WHERE COALESCE(min_size,0) = 0
-                   OR COALESCE(step_size,0) = 0
-                   OR COALESCE(min_stop_distance,0) = 0
+                WHERE (
+                        COALESCE(min_size,0) = 0
+                     OR COALESCE(step_size,0) = 0
+                     OR COALESCE(min_stop_distance,0) = 0
+                )
+                  AND (
+                        last_refreshed_at IS NULL
+                     OR last_refreshed_at <= NOW() - (%s::int * INTERVAL '1 hour')
+                  )
                 ORDER BY asset
                 LIMIT %s
                 """,
-                (int(limit),),
+                (int(CAPITAL_CONSTRAINT_REFRESH_HOURS), int(limit),),
             )
             rows = [dict(r) for r in cur.fetchall()]
         conn.close()
