@@ -1742,23 +1742,19 @@ _CAPITAL_EPIC_VALIDATION_CACHE: dict[str, bool] = {}
 _CAPITAL_MAPPING_REFRESHED_THIS_RUN: set[str] = set()
 
 def capital_saved_epic_needs_refresh(symbol: str, epic: str | None) -> bool:
-    """True when a saved capital_epic_map value is probably not a broker price epic.
+    """Return True when a saved mapping does not pass a live /prices probe.
 
-    capital_epic_map must store real Capital.com price epics, not BENZINO labels.
-    Plain labels such as EURUSD, GBPUSD, US500, NVDA, or OIL_BRENT cause
-    repeated /prices 404/invalid.daterange calls on replay. Treat every plain
-    non-dotted value as unvalidated and refresh it once per scanner run.
+    Capital.com epics differ by account/market. Some environments expose dotted
+    epics, while others expose shorter epics. The only safe test is not whether
+    the value contains a dot; it is whether `/prices/{epic}` returns candles.
+    This keeps capital_epic_map useful as the persistent broker-epic resolver
+    while rejecting placeholder labels that do not price.
     """
     symbol = str(symbol or "").strip().upper()
     epic = str(epic or "").strip()
     if not symbol or not epic:
         return True
-    # Capital broker epics are usually dotted, e.g. CS.D.EURUSD.MINI.IP.
-    # If an account genuinely returns a plain epic, it will be accepted only
-    # after live price validation inside capital_find_epic().
-    if "." not in epic:
-        return True
-    return False
+    return not capital_price_epic_works(epic, "15m")
 
 
 def capital_price_epic_works(epic: str, timeframe: str = "15m") -> bool:
@@ -1997,19 +1993,22 @@ def _capital_market_score(symbol: str, market: dict) -> int:
     name = str(market.get("instrumentName") or market.get("name") or market.get("symbol") or "").upper()
     compact_name = name.replace("/", "").replace(" ", "").replace("-", "")
     score = 0
-    # Prefer real broker epics over label-like search terms.
+    # Dotted epics are often broker-specific, but not every Capital account uses
+    # the same format. Score them slightly higher, but never reject plain epics
+    # purely because they lack dots; live /prices validation decides validity.
     if "." in epic:
-        score += 200
-    else:
-        score -= 200
-    if symbol in epic:
+        score += 25
+    if symbol == epic:
+        score += 35
+    elif symbol in epic:
         score += 60
     if symbol in compact_name:
         score += 55
     # FX pair names are often displayed as EUR/USD rather than EURUSD.
     if len(symbol) == 6 and f"{symbol[:3]}/{symbol[3:]}" in name:
         score += 80
-    if "CFD" in str(market.get("instrumentType") or market.get("type") or "").upper():
+    itype = str(market.get("instrumentType") or market.get("type") or "").upper()
+    if "CFD" in itype:
         score += 5
     if market.get("streamingPricesAvailable") is True:
         score += 3
@@ -2354,6 +2353,14 @@ def capital_refresh_market_constraints(symbol: str, epic: str | None = None) -> 
 
 
 def capital_find_epic(symbol: str) -> str | None:
+    """Resolve a BENZINO asset key to a validated Capital.com price epic.
+
+    capital_epic_map is the persistent resolver. A saved value is trusted only
+    after a small `/prices/{epic}?max=5` probe succeeds. If the saved row is a
+    placeholder such as EURUSD/US500/GOLD, the scanner searches `/markets`, tests
+    each candidate with `/prices`, saves the first working epic, and caches the
+    result for the rest of the run.
+    """
     symbol = str(symbol or "").strip().upper()
     if not symbol or not capital_configured():
         return None
@@ -2364,29 +2371,25 @@ def capital_find_epic(symbol: str) -> str | None:
 
     saved_epic = capital_load_saved_epic(symbol)
     if saved_epic and not capital_saved_epic_needs_refresh(symbol, saved_epic):
-        # Trust persisted dotted broker epics without probing every run. If a
-        # later /prices call fails, the row can be manually refreshed.
         _CAPITAL_EPIC_CACHE[symbol] = saved_epic
         return saved_epic
 
     if saved_epic and symbol not in _CAPITAL_MAPPING_REFRESHED_THIS_RUN:
-        print(f"[CapitalMapping] {symbol}: saved epic {saved_epic} is not a validated broker epic; refreshing via /markets.")
+        print(f"[CapitalMapping] {symbol}: saved epic {saved_epic} did not pass /prices validation; refreshing via /markets.")
         _CAPITAL_MAPPING_REFRESHED_THIS_RUN.add(symbol)
 
-    candidates = []
-    # Search terms: human-friendly labels first, then known hints.
+    candidates: list[str] = []
     if len(symbol) == 6 and symbol.isalpha():
         candidates.extend([f"{symbol[:3]}/{symbol[3:]}", symbol])
+    candidates.extend(CAPITAL_EPIC_HINTS.get(symbol, []))
     if saved_epic:
         candidates.append(saved_epic)
-    candidates.extend(CAPITAL_EPIC_HINTS.get(symbol, []))
     candidates.append(symbol)
-    seen = set()
-    candidates = [c for c in candidates if c and not (str(c).upper() in seen or seen.add(str(c).upper()))]
 
-    best_market = None
-    best_epic = ""
-    best_score = -10**9
+    seen_terms = set()
+    candidates = [c for c in candidates if c and not (str(c).upper() in seen_terms or seen_terms.add(str(c).upper()))]
+
+    markets_by_epic: dict[str, dict] = {}
     for candidate in candidates:
         data = capital_request("GET", "/markets", params={"searchTerm": candidate}, retries=1)
         markets = []
@@ -2395,26 +2398,27 @@ def capital_find_epic(symbol: str) -> str | None:
         if isinstance(markets, dict):
             markets = [markets]
         for market in markets or []:
-            epic = str((market or {}).get("epic") or "").strip()
-            if not epic:
+            if not isinstance(market, dict):
                 continue
-            score = _capital_market_score(symbol, market or {})
-            if score > best_score:
-                best_score, best_market, best_epic = score, market or {}, epic
+            epic = str(market.get("epic") or "").strip()
+            if epic:
+                # Keep the highest-scoring version if duplicates appear.
+                if epic not in markets_by_epic or _capital_market_score(symbol, market) > _capital_market_score(symbol, markets_by_epic[epic]):
+                    markets_by_epic[epic] = market
 
-    # Accept only real-looking broker epics. Plain labels are what caused the
-    # replay storm, so leave the asset unresolved rather than saving bad data.
-    if best_epic and "." in best_epic:
-        _CAPITAL_EPIC_CACHE[symbol] = best_epic
-        _CAPITAL_MARKET_CACHE[symbol] = best_market or {}
-        capital_save_epic(symbol, best_epic, best_market or {})
-        if best_epic != saved_epic:
-            print(f"[CapitalMapping] {symbol}: mapped to broker epic {best_epic} and saved.")
-        return best_epic
+    ranked = sorted(markets_by_epic.items(), key=lambda kv: _capital_market_score(symbol, kv[1]), reverse=True)
+    for epic, market in ranked:
+        if capital_price_epic_works(epic, "15m"):
+            _CAPITAL_EPIC_CACHE[symbol] = epic
+            _CAPITAL_MARKET_CACHE[symbol] = market or {}
+            capital_save_epic(symbol, epic, market or {})
+            if epic != saved_epic:
+                print(f"[CapitalMapping] {symbol}: mapped to broker epic {epic} and saved.")
+            return epic
 
     _CAPITAL_UNRESOLVED_EPIC_CACHE.add(symbol)
     _CAPITAL_EPIC_CACHE[symbol] = None
-    print(f"[CapitalMapping] {symbol}: no valid dotted Capital.com broker epic found; skipped until capital_epic_map is corrected.")
+    print(f"[CapitalMapping] {symbol}: no Capital.com /prices-valid epic found; skipped until capital_epic_map is corrected.")
     return None
 
 # Backward-compatible alias used by the auto-trade layer.
@@ -3919,6 +3923,44 @@ def evaluate_open_trades(assets: set[str] | None = None, timeframes: set[str] | 
     _runtime_stop("open_trade_replay", _t_eval)
 
 
+
+
+def backfill_shadow_trade_plans(assets: set[str] | None = None, timeframes: set[str] | None = None, due_only: bool = True) -> int:
+    """Compatibility no-op for older shadow replay flow.
+
+    Earlier builds used a separate helper to repair missing entry/SL/TP on
+    shadow rows. Current scanner rows are saved with their trade plan at signal
+    creation, and historical plan rewriting is locked. Keep this no-op so the
+    shadow evaluator does not crash when called by older code paths.
+    """
+    return 0
+
+
+def validate_capital_epic_map_for_assets(assets: set[str] | list[str] | tuple[str, ...]) -> tuple[int, int]:
+    """Resolve and validate broker epics once at startup.
+
+    Returns (valid_count, total_count). This makes mapping health explicit in
+    logs and prevents every replay loop from trying to rediscover the same bad
+    placeholder values repeatedly.
+    """
+    asset_list = sorted({str(a or "").strip().upper() for a in assets if str(a or "").strip()})
+    if not asset_list or not capital_configured():
+        return (0, len(asset_list))
+    valid = 0
+    unresolved: list[str] = []
+    for asset in asset_list:
+        epic = capital_find_epic(asset)
+        if epic:
+            valid += 1
+        else:
+            unresolved.append(asset)
+    if unresolved:
+        preview = ", ".join(unresolved[:12]) + ("..." if len(unresolved) > 12 else "")
+        print(f"[CapitalMapping] {valid}/{len(asset_list)} broker epics validated. Unresolved: {preview}")
+    else:
+        print(f"[CapitalMapping] {valid}/{len(asset_list)} broker epics validated.")
+    return valid, len(asset_list)
+
 def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] | None = None) -> int:
     """
     Hypothetically resolve NO TRADE (shadow) signals using 1-minute replay where
@@ -5421,6 +5463,7 @@ def run_scan() -> None:
     _runtime_stop("db_init", _t)
     _t = _runtime_start()
     refresh_missing_capital_constraints(limit=40)
+    validate_capital_epic_map_for_assets(set(scan_assets.keys()))
     _runtime_stop("capital_constraints", _t)
     if LOCK_HISTORICAL_SIGNAL_PLANS:
         print("[Replay1mBackfill] Historical signal plans locked: entry/sl/tp are preserved; only outcomes are updated.")
@@ -5433,9 +5476,7 @@ def run_scan() -> None:
     # trade can hit TP/SL while the scheduled run is only generating 15m signals.
     # Therefore every run checks every open timeframe using Capital.com replay.
     all_replay_tfs = set(TIMEFRAME_CONFIGS.keys())
-    _t = _runtime_start()
     evaluate_open_trades(assets=set(scan_assets.keys()), timeframes=all_replay_tfs)
-    _runtime_stop("open_trade_replay", _t)
     _t = _runtime_start()
     evaluate_shadow_trades(assets=set(scan_assets.keys()), timeframes=all_replay_tfs)
     _runtime_stop("shadow_replay", _t)
