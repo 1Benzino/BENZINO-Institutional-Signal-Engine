@@ -1793,7 +1793,7 @@ def prop_best_session_profile(df: pd.DataFrame, min_trades: int = PROP_MIN_SESSI
 
     This intentionally mirrors the User Journal "By session" table:
       • same session buckets via session_name()/prop_session_from_timestamp()
-      • closed/resolved A+ and A trades only
+      • closed/resolved A+ and A trades only, grouped by entry session
       • current tracking period only, because simulate_prop_challenge_cycles()
         applies tracking_started_at before calling this helper
       • minimum sample threshold before the session is allowed to filter prop picks
@@ -1810,7 +1810,7 @@ def prop_best_session_profile(df: pd.DataFrame, min_trades: int = PROP_MIN_SESSI
         "sample_ready": False,
         "all_sessions": [],
         "source": "User Journal closed A+/A trades in current tracking period",
-        "selection_rule": f"Highest win rate among sessions with at least {int(min_trades)} closed A+/A trades; profit factor and net R break ties.",
+        "selection_rule": f"Highest win rate by User Journal entry session among sessions with at least {int(min_trades)} closed A+/A trades; profit factor and net R break ties.",
     }
     if df is None or df.empty:
         return base
@@ -1819,13 +1819,15 @@ def prop_best_session_profile(df: pd.DataFrame, min_trades: int = PROP_MIN_SESSI
         work = work[work["grade"].astype(str).str.upper().isin(["A+", "A"])].copy()
     if work.empty:
         return base
-    if "prop_event_time" not in work.columns:
-        event_time = pd.to_datetime(work.get("exit_at", pd.Series(pd.NaT, index=work.index)), errors="coerce", utc=True)
+    # User Journal "By session" is based on the trade creation/entry time,
+    # not the close time. Prop Firm must use the same source, otherwise the
+    # best-session card can disagree with User Journal and pick the wrong trades.
+    if "prop_entry_time" not in work.columns:
         created_time = pd.to_datetime(work.get("created_at", pd.Series(pd.NaT, index=work.index)), errors="coerce", utc=True)
-        work["prop_event_time"] = event_time.fillna(created_time)
-    work = work.dropna(subset=["prop_event_time"]).copy()
+        work["prop_entry_time"] = created_time
+    work = work.dropna(subset=["prop_entry_time"]).copy()
     work["r_multiple"] = pd.to_numeric(work.get("r_multiple", 0), errors="coerce").fillna(0.0)
-    work["prop_session"] = work["prop_event_time"].apply(prop_session_from_timestamp)
+    work["prop_session"] = work["prop_entry_time"].apply(prop_session_from_timestamp)
     rows = []
     for session, g in work.groupby("prop_session"):
         if session == "Unknown":
@@ -1871,9 +1873,12 @@ def apply_prop_best_session_trade_filter(df: pd.DataFrame, profile: dict) -> tup
     """
     if df is None or df.empty:
         return pd.DataFrame(), pd.DataFrame()
-    work = df.copy().sort_values("prop_event_time").reset_index(drop=True)
-    work["prop_session"] = work["prop_event_time"].apply(prop_session_from_timestamp)
-    work["prop_day_all"] = work["prop_event_time"].apply(lambda ts: pd.Timestamp(ts).tz_convert(NAIROBI_TZ).date())
+    work = df.copy()
+    if "prop_entry_time" not in work.columns:
+        work["prop_entry_time"] = pd.to_datetime(work.get("created_at", pd.Series(pd.NaT, index=work.index)), errors="coerce", utc=True)
+    work = work.dropna(subset=["prop_entry_time"]).sort_values("prop_entry_time").reset_index(drop=True)
+    work["prop_session"] = work["prop_entry_time"].apply(prop_session_from_timestamp)
+    work["prop_day_all"] = work["prop_entry_time"].apply(lambda ts: pd.Timestamp(ts).tz_convert(NAIROBI_TZ).date())
     best = str(profile.get("best_session") or "All sessions")
     sample_ready = bool(profile.get("sample_ready"))
     skipped_parts = []
@@ -1888,7 +1893,7 @@ def apply_prop_best_session_trade_filter(df: pd.DataFrame, profile: dict) -> tup
         # Do not take the first trades immediately at session open.
         # The prop model waits until the best session has been open for one hour,
         # then takes the first eligible A+/A trades up to the daily cap.
-        first_hour_mask = ~eligible["prop_event_time"].apply(lambda ts: prop_is_one_hour_after_session_open(ts, best))
+        first_hour_mask = ~eligible["prop_entry_time"].apply(lambda ts: prop_is_one_hour_after_session_open(ts, best))
         first_hour = eligible[first_hour_mask].copy()
         if not first_hour.empty:
             first_hour["prop_skip_reason"] = "Skipped — first hour after best-session open"
@@ -1957,12 +1962,16 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
     df = numeric_cols(df, ["r_multiple", "entry", "sl", "tp", "rr"])
     event_time = pd.to_datetime(df.get("exit_at", pd.Series(pd.NaT, index=df.index)), errors="coerce", utc=True)
     created_time = pd.to_datetime(df.get("created_at", pd.Series(pd.NaT, index=df.index)), errors="coerce", utc=True)
+    # prop_entry_time controls best-session selection, first-hour delay, and
+    # the "first 4 trades generated" cap. prop_event_time controls when P/L is
+    # realised on the challenge curve.
+    df["prop_entry_time"] = created_time
     df["prop_event_time"] = event_time.fillna(created_time)
-    df = df.dropna(subset=["prop_event_time"]).sort_values("prop_event_time").reset_index(drop=True)
+    df = df.dropna(subset=["prop_entry_time", "prop_event_time"]).sort_values("prop_entry_time").reset_index(drop=True)
 
     act_ts = pd.to_datetime(activated_at, errors="coerce", utc=True)
     if pd.notna(act_ts):
-        df = df[df["prop_event_time"] >= act_ts].copy().reset_index(drop=True)
+        df = df[df["prop_entry_time"] >= act_ts].copy().reset_index(drop=True)
     if df.empty:
         return {"history": [], "active": empty_active, "active_curve": pd.DataFrame(), "active_daily": pd.DataFrame(), "all_daily": pd.DataFrame(), "all_trades": pd.DataFrame(), "skipped_trades": pd.DataFrame(), "best_session": {"best_session":"All sessions","profit_factor":0.0,"win_rate":0.0,"trade_count":0,"sample_ready":False}}
 
@@ -6123,14 +6132,14 @@ def render_workflow(username: str, settings: dict) -> None:
                     ["Entry", "SL", "TP", "RR", "risk_cash", "potential_tp_cash", "potential_sl_cash"],
                 )
                 closed_view = add_trade_pnl_columns(closed_trades, settings)
-                closed_cols = ["created_at", "created_at_eat", "asset", "timeframe", "signal", "grade", "status", "outcome", "r_multiple", "pnl_cash", "balance_after", "exit_reason", "session"]
+                closed_cols = ["created_at", "created_at_eat", "asset", "timeframe", "signal", "grade", "status", "outcome", "r_multiple", "pnl_cash", "balance_after", "exit_reason", "session", "entry", "sl", "tp"]
                 _render_journal_signal_grid(
                     closed_view,
                     "Closed trades",
                     "journal_closed_trades",
                     closed_cols,
                     {"Signal":"signal", "Grade":"grade", "Status":"status", "Outcome":"outcome"},
-                    ["RR", "R Multiple", "pnl_cash", "balance_after"],
+                    ["RR", "R Multiple", "pnl_cash", "balance_after", "Entry", "SL", "TP"],
                 )
 
                 st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
@@ -6188,7 +6197,7 @@ def render_workflow(username: str, settings: dict) -> None:
             prop_start_map = {}
         prop_started_at_raw = str(settings.get("tracking_started_at", "") or "")
 
-        workflow_commentary(f"This view recalculates the FTMO-style challenge from your current watchlist and selected timeframe <b>({html.escape(str(challenge_tf))})</b>. It uses only <b>A+/A closed trades</b>, a fixed <b>&#36;10,000</b> account, <b>1% risk per trade</b>, a <b>&#36;1,000 Phase 1 target</b>, a <b>&#36;500 Phase 2 target</b>, a <b>5% max daily loss</b>, and a <b>10% max total loss</b>. Completed cycles are rebuilt from Supabase on every load.")
+        workflow_commentary(f"This view recalculates the FTMO-style challenge from your current watchlist and selected timeframe <b>({html.escape(str(challenge_tf))})</b>. It uses only <b>A+/A closed trades</b>, a fixed <b>&#36;10,000</b> account, <b>1% risk per trade</b>, a <b>&#36;1,000 Phase 1 target</b>, a <b>&#36;500 Phase 2 target</b>, a <b>5% max daily loss</b>, and a <b>10% max total loss</b>. Completed cycles are rebuilt from Supabase on every load. Best-session selection is calculated from your User Journal entry session using closed A+/A trades in the current tracking period.")
 
         prop_source = trades[
             trades.get("grade", pd.Series(dtype=str)).astype(str).isin(["A+", "A"])
@@ -7387,7 +7396,7 @@ def render_workflow(username: str, settings: dict) -> None:
                 review_display["Raw Signal ID"] = review_display["Signal ID"].astype(str).values
             else:
                 review_display["Raw Signal ID"] = ""
-            preferred_cols = ["Asset", "Timeframe", "Signal", "Grade", "Status", "Outcome", "R Multiple", "Entry", "SL", "TP", "Session", "Created At", "Raw Signal ID"]
+            preferred_cols = ["Asset", "Timeframe", "Signal", "Grade", "Status", "Outcome", "R Multiple", "Session", "Created At", "Entry", "SL", "TP", "Raw Signal ID"]
             review_display = review_display[[c for c in preferred_cols if c in review_display.columns] + [c for c in review_display.columns if c not in preferred_cols and c != "Review Case"]]
 
             title_col, sig_col, grade_col, status_col, search_col = st.columns([4.0, 1.1, 1.1, 1.25, 2.2], vertical_alignment="center")

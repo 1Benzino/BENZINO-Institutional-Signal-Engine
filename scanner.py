@@ -487,6 +487,7 @@ SLOW_TIMEFRAME_WINDOW_MINUTES = int(os.environ.get("SLOW_TIMEFRAME_WINDOW_MINUTE
 MTF_CONFIRMATION_TIMEFRAMES = ["15m", "1h", "4h"]
 _TF_CACHE: dict[tuple[str, str], pd.DataFrame | None] = {}
 _CAPITAL_PRICE_CACHE: dict[tuple[str, str, int], pd.DataFrame | None] = {}
+_CAPITAL_RANGE_PRICE_CACHE: dict[tuple[str, str, str, str], pd.DataFrame | None] = {}
 _RUNTIME_BREAKDOWN: dict[str, float] = {}
 
 
@@ -1878,38 +1879,60 @@ def capital_start_session() -> bool:
 
 
 def capital_request(method: str, path: str, *, params: dict | None = None, json_body: dict | None = None, retries: int = 2) -> dict | None:
-    if not capital_configured():
-        _runtime_stop("capital_api", _t0)
-    return None
+    """Authenticated Capital.com API request with runtime accounting.
+
+    A previous edit accidentally returned None before the HTTP request ran.
+    That broke Capital 1H/1m candles and made the scanner skip valid signals.
+    """
     _t0 = _runtime_start()
     try:
         _RUNTIME_BREAKDOWN["capital_api_calls"] = float(_RUNTIME_BREAKDOWN.get("capital_api_calls", 0.0)) + 1.0
     except Exception:
         pass
-    for attempt in range(1, retries + 1):
+
+    if not capital_configured():
+        _runtime_stop("capital_api", _t0)
+        return None
+
+    for attempt in range(1, int(retries) + 1):
         try:
             url = f"{CAPITAL_BASE_URL}{path}"
-            resp = requests.request(method.upper(), url, headers=capital_headers(authenticated=True), params=params or {}, json=json_body, timeout=30)
+            resp = requests.request(
+                method.upper(),
+                url,
+                headers=capital_headers(authenticated=True),
+                params=params or {},
+                json=json_body,
+                timeout=20,
+            )
             if resp.status_code in (401, 403):
                 _CAPITAL_SESSION["cst"] = ""
                 _CAPITAL_SESSION["security_token"] = ""
-                resp = requests.request(method.upper(), url, headers=capital_headers(authenticated=True), params=params or {}, json=json_body, timeout=30)
+                resp = requests.request(
+                    method.upper(),
+                    url,
+                    headers=capital_headers(authenticated=True),
+                    params=params or {},
+                    json=json_body,
+                    timeout=20,
+                )
             if resp.status_code == 429:
-                time.sleep(1.0 + attempt)
+                time.sleep(0.75 + attempt)
                 continue
             if resp.status_code >= 400:
                 _CAPITAL_LAST_ERROR["text"] = resp.text[:500]
-                if attempt == retries:
+                if attempt == int(retries):
                     print(f"[Capital] {method} {path} failed: HTTP {resp.status_code} {resp.text[:160]}")
-                time.sleep(0.5)
+                time.sleep(0.25)
                 continue
             _runtime_stop("capital_api", _t0)
             return resp.json()
         except Exception as exc:
             _CAPITAL_LAST_ERROR["text"] = str(exc)
-            if attempt == retries:
+            if attempt == int(retries):
                 print(f"[Capital] {method} {path} failed: {exc}")
-            time.sleep(0.5)
+            time.sleep(0.25)
+
     _runtime_stop("capital_api", _t0)
     return None
 
@@ -2402,7 +2425,7 @@ def capital_download(symbol: str, timeframe: str, max_rows: int = 1000) -> pd.Da
         _runtime_stop("capital_candle_fetch", _t0)
         return None
     params = {"resolution": resolution, "max": max_rows_i}
-    data = capital_request("GET", f"/prices/{epic}", params=params, retries=2)
+    data = capital_request("GET", f"/prices/{epic}", params=params, retries=1)
     df = capital_prices_to_df(data or {})
     ok = False
     if df is not None and len(df) >= 50:
@@ -2413,6 +2436,129 @@ def capital_download(symbol: str, timeframe: str, max_rows: int = 1000) -> pd.Da
     _runtime_stop("capital_candle_fetch", _t0)
     return df.copy() if ok else None
 
+
+
+
+def _capital_time_param(ts) -> str:
+    """Format a UTC timestamp for Capital.com's /prices from/to parameters."""
+    try:
+        t = pd.to_datetime(ts, utc=True, errors="coerce")
+        if pd.isna(t):
+            return ""
+        # Capital API examples use ISO timestamps without timezone suffix.
+        return t.strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return ""
+
+
+def capital_download_range(symbol: str, timeframe: str, start_ts, end_ts, max_rows: int = 1000) -> pd.DataFrame | None:
+    """Download/cache a bounded Capital.com candle window.
+
+    This is critical for TP/SL replay. A plain `max=1000` 1-minute request only
+    returns the latest ~16 hours, so older open trades were being marked as
+    pending even when Capital.com could provide the historical minute range via
+    from/to parameters.
+    """
+    if not capital_configured():
+        return None
+
+    symbol = str(symbol or "").strip().upper()
+    timeframe = str(timeframe or "1m").strip().lower()
+    start = pd.to_datetime(start_ts, utc=True, errors="coerce")
+    end = pd.to_datetime(end_ts, utc=True, errors="coerce")
+    if pd.isna(start) or pd.isna(end) or end <= start:
+        return None
+
+    # Small safety padding around the replay window.
+    start = start.floor("min") - pd.Timedelta(minutes=2)
+    end = end.ceil("min") + pd.Timedelta(minutes=2)
+
+    # Cache by rounded bounds to make multiple trades in the same asset/window reuse data.
+    cache_key = (
+        symbol,
+        timeframe,
+        start.strftime("%Y-%m-%dT%H:%M"),
+        end.strftime("%Y-%m-%dT%H:%M"),
+    )
+    if cache_key in _CAPITAL_RANGE_PRICE_CACHE:
+        cached = _CAPITAL_RANGE_PRICE_CACHE[cache_key]
+        return cached.copy() if cached is not None else None
+
+    _t0 = _runtime_start()
+    resolution = CAPITAL_RESOLUTION_MAP.get(timeframe, "MINUTE")
+    epic = capital_find_epic(symbol)
+    if not epic:
+        _CAPITAL_RANGE_PRICE_CACHE[cache_key] = None
+        _runtime_stop("capital_candle_fetch", _t0)
+        return None
+
+    # Capital.com caps response size. Chunk long replay windows so a multi-day
+    # 1m replay can still be reconstructed without Yahoo fallback.
+    step_minutes = 900 if timeframe == "1m" else 900 * 15
+    frames: list[pd.DataFrame] = []
+    cur = start
+    while cur < end:
+        chunk_end = min(cur + pd.Timedelta(minutes=step_minutes), end)
+        params = {
+            "resolution": resolution,
+            "from": _capital_time_param(cur),
+            "to": _capital_time_param(chunk_end),
+            "max": int(min(max_rows, 1000)),
+        }
+        data = capital_request("GET", f"/prices/{epic}", params=params, retries=1)
+        df = capital_prices_to_df(data or {})
+        if df is not None and not df.empty:
+            frames.append(df)
+        cur = chunk_end
+
+    if frames:
+        out = pd.concat(frames, ignore_index=True)
+        out["Date"] = pd.to_datetime(out["Date"], utc=True, errors="coerce")
+        out = out.dropna(subset=["Date"]).sort_values("Date").drop_duplicates("Date").reset_index(drop=True)
+        # Keep only the requested padded window.
+        out = out[(out["Date"] >= start) & (out["Date"] <= end)].copy()
+        if not out.empty:
+            _CAPITAL_RANGE_PRICE_CACHE[cache_key] = out.copy()
+            _runtime_stop("capital_candle_fetch", _t0)
+            return out.copy()
+
+    _CAPITAL_RANGE_PRICE_CACHE[cache_key] = None
+    _runtime_stop("capital_candle_fetch", _t0)
+    return None
+
+
+def get_minute_replay_df_for_window(ticker: str, entry_ts, expiry_ts) -> pd.DataFrame | None:
+    """Return Capital.com 1-minute candles covering one trade's exact replay window."""
+    ticker = str(ticker or "").strip()
+    if not ticker:
+        return None
+
+    start = pd.to_datetime(entry_ts, utc=True, errors="coerce")
+    end = pd.to_datetime(expiry_ts, utc=True, errors="coerce")
+    if pd.isna(start) or pd.isna(end):
+        return None
+
+    if should_use_capital_for_ticker(ticker):
+        symbol = capital_symbol_from_ticker(ticker)
+        df = capital_download_range(symbol, "1m", start, end, max_rows=1000)
+        if df is not None and not df.empty:
+            return df.copy()
+
+        # Recent-data fallback inside Capital only: useful when from/to is not
+        # supported for a particular market but the trade is inside the latest
+        # 1000 one-minute candles.
+        recent = get_minute_replay_df(ticker)
+        if recent is not None and not recent.empty:
+            recent = recent.copy()
+            recent["Date"] = pd.to_datetime(recent["Date"], utc=True, errors="coerce")
+            recent = recent.dropna(subset=["Date"]).sort_values("Date")
+            covered = recent[(recent["Date"] > start) & (recent["Date"] <= end)]
+            if not covered.empty:
+                return recent
+
+        return None
+
+    return get_minute_replay_df(ticker)
 
 def should_use_capital_for_ticker(ticker: str) -> bool:
     return capital_configured() and (is_capital_ticker(ticker) or CAPITAL_PRIMARY_ALL_ASSETS)
@@ -2450,6 +2596,17 @@ def download(ticker: str, interval: str, period: str, retries: int = 3, pause_se
 
     if capital_configured() and CAPITAL_PRIMARY_ALL_ASSETS and symbol in MASTER_WATCHLIST:
         df = capital_download(symbol, tf, max_rows=1000)
+
+        # Capital.com sometimes rejects/omits native HOUR/HOUR_4 candles for an
+        # epic even when 15-minute candles are available. In strict Capital mode
+        # we still must not use Yahoo, so build higher timeframes from Capital
+        # 15-minute candles instead. This restores 1H regime + MTF confirmation
+        # while keeping Capital.com as the only pricing source.
+        if (df is None or df.empty) and tf in {"1h", "4h"}:
+            base15 = capital_download(symbol, "15m", max_rows=1000)
+            if base15 is not None and not base15.empty:
+                df = resample_ohlcv(base15, "1h" if tf == "1h" else "4h")
+
         if df is not None and not df.empty:
             return df
         if CAPITAL_STRICT_ALL_ASSETS:
@@ -2525,6 +2682,9 @@ def get_timeframe_df(ticker: str, timeframe: str) -> pd.DataFrame | None:
     if capital_configured() and CAPITAL_PRIMARY_ALL_ASSETS and timeframe == "4h":
         symbol = asset_symbol_from_any_ticker(ticker)
         base = capital_download(symbol, "4h", max_rows=1000)
+        if base is None:
+            base15 = capital_download(symbol, "15m", max_rows=1000)
+            base = resample_ohlcv(base15, "4h") if base15 is not None else None
         if base is None and not CAPITAL_STRICT_ALL_ASSETS:
             base = download(ticker, cfg["interval"], cfg["period"])
             if base is not None and cfg.get("resample"):
@@ -2681,7 +2841,9 @@ def replay_trade_outcome(row: dict, *, use_minute: bool = True) -> dict | None:
 
     # Preferred path: replay each 1-minute candle after entry until expiry.
     if use_minute:
-        mdf = get_minute_replay_df(ticker)
+        # Use a bounded Capital.com 1m window, not only the latest 1000 minutes.
+        # This keeps historical TP/SL detection accurate for older open trades.
+        mdf = get_minute_replay_df_for_window(ticker, entry_ts, expiry_ts)
         if mdf is not None and not mdf.empty:
             mdf = mdf.copy()
             mdf["Date"] = pd.to_datetime(mdf["Date"], utc=True, errors="coerce")
@@ -3630,15 +3792,18 @@ def evaluate_open_trades(assets: set[str] | None = None, timeframes: set[str] | 
         return
 
     print(f"[Evaluate] Checking {len(open_trades)} due open trade(s) with 1-minute replay where available...")
+    pending_capital_data = 0
+    closed_count = 0
     for t in open_trades:
         asset = t.get("asset")
         signal_id = t.get("signal_id")
         grade = t.get("grade")
         result = replay_trade_outcome(t, use_minute=True)
         if not result:
-            # Capital.com 1-minute data may be temporarily unavailable. Mark this
-            # row as checked so it is retried on its timeframe cadence instead of
-            # hammering the replay endpoint every scanner run.
+            # Capital.com 1-minute data may be temporarily unavailable or too
+            # recent/old for the price endpoint. Do not fake the outcome with
+            # Yahoo or wider candles; mark checked and retry on TF cadence.
+            pending_capital_data += 1
             mark_replay_checked(signal_id)
             continue
 
@@ -3651,15 +3816,20 @@ def evaluate_open_trades(assets: set[str] | None = None, timeframes: set[str] | 
 
         exit_price = float(result.get("price") or 0.0)
         r_mult = float(result.get("r") or 0.0)
-        close_trade(signal_id, exit_price, reason, r_mult, result.get("exit_time"))
+        if close_trade(signal_id, exit_price, reason, r_mult, result.get("exit_time")):
+            closed_count += 1
         update_prop_firm(signal_id, asset, grade, r_mult)
 
         if "ambiguous" in str(method):
             print(f"  [{asset}] AMBIGUOUS same-candle TP+SL on {method} → conservatively marked SL.")
         else:
             print(f"  [{asset}] Closed: {reason} via {method} replay after {bars_open} bar(s) ({r_mult:+.2f}R)")
+    if pending_capital_data:
+        print(f"[Evaluate] Pending Capital.com 1-minute data: {pending_capital_data} trade(s); they will be retried on timeframe cadence.")
+    if closed_count:
+        print(f"[Evaluate] Closed {closed_count} trade(s) this run.")
 
-def backfill_shadow_trade_plans(assets: set[str] | None = None, timeframes: set[str] | None = None, max_age_days: int = 3650) -> int:
+def backfill_shadow_trade_plans(assets: set[str] | None = None, timeframes: set[str] | None = None, max_age_days: int = 3650, due_only: bool = True) -> int:
     """Repair every legacy SHADOW / NO TRADE row that lacks a usable plan.
 
     Older builds stored split/HOLD rows as Entry = SL = TP, which meant there
@@ -3765,7 +3935,7 @@ def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] 
     available, writing only to shadow_* columns. The historical backlog is
     chunked per run so Supabase is not hit with thousands of individual updates.
     """
-    backfilled = backfill_shadow_trade_plans(assets=assets, timeframes=timeframes)
+    backfilled = backfill_shadow_trade_plans(assets=assets, timeframes=timeframes, due_only=True)
     shadow_trades = fetch_unresolved_shadow_trades(
         assets=assets,
         timeframes=timeframes,
@@ -3784,6 +3954,7 @@ def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] 
         print(f"[Shadow] Backfill was capped at {SHADOW_BACKFILL_LIMIT} row(s) this run.")
 
     resolved = 0
+    pending_capital_data = 0
     pending_updates: list[tuple[str, float, str, float]] = []
     bars_updates: list[tuple[str, int]] = []
 
@@ -3802,6 +3973,7 @@ def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] 
             # Capital.com 1-minute data may be temporarily unavailable. Mark this
             # row as checked so it is retried on its timeframe cadence instead of
             # hammering the replay endpoint every scanner run.
+            pending_capital_data += 1
             mark_replay_checked(signal_id)
             continue
         reason = result.get("reason")
@@ -3829,7 +4001,8 @@ def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] 
     remaining_note = ""
     if len(shadow_trades) >= SHADOW_EVAL_LIMIT:
         remaining_note = " More unresolved rows likely remain and will be processed on later runs."
-    print(f"[Shadow] Resolved {resolved} NO TRADE hypothetical outcome(s) this run.{remaining_note}")
+    pending_note = f" Pending Capital.com 1-minute data: {pending_capital_data}." if pending_capital_data else ""
+    print(f"[Shadow] Resolved {resolved} NO TRADE hypothetical outcome(s) this run.{pending_note}{remaining_note}")
     return resolved
 
 
