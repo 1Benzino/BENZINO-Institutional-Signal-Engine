@@ -1738,28 +1738,42 @@ _CAPITAL_EPIC_CACHE: dict[str, str | None] = {}
 _CAPITAL_MARKET_CACHE: dict[str, dict] = {}
 
 _CAPITAL_UNRESOLVED_EPIC_CACHE: set[str] = set()
+_CAPITAL_EPIC_VALIDATION_CACHE: dict[str, bool] = {}
+_CAPITAL_MAPPING_REFRESHED_THIS_RUN: set[str] = set()
 
 def capital_saved_epic_needs_refresh(symbol: str, epic: str | None) -> bool:
-    """True when a saved capital_epic_map value is probably an asset label, not a broker epic.
+    """True when a saved capital_epic_map value is probably not a broker price epic.
 
-    The capital_epic_map table is useful as BENZINO's persistent asset -> broker
-    epic resolver, but earlier rows were seeded as AUDUSD -> AUDUSD etc. Those
-    direct labels cause /prices/AUDUSD 404s on many Capital.com accounts. If a
-    saved value is just the asset name (or another plain label without Capital's
-    dotted epic format), refresh it through /markets and overwrite the table.
+    capital_epic_map must store real Capital.com price epics, not BENZINO labels.
+    Plain labels such as EURUSD, GBPUSD, US500, NVDA, or OIL_BRENT cause
+    repeated /prices 404/invalid.daterange calls on replay. Treat every plain
+    non-dotted value as unvalidated and refresh it once per scanner run.
     """
     symbol = str(symbol or "").strip().upper()
     epic = str(epic or "").strip()
     if not symbol or not epic:
         return True
-    upper_epic = epic.upper()
-    if upper_epic == symbol:
-        return True
-    # Most Capital CFD epics look like CS.D.EURUSD.MINI.IP. Plain values such
-    # as US500, US30, NVDA, GBPUSD are search terms, not reliable price epics.
-    if "." not in epic and upper_epic in {symbol, "US500", "US30", "NASDAQ100", "OIL_BRENT"}:
+    # Capital broker epics are usually dotted, e.g. CS.D.EURUSD.MINI.IP.
+    # If an account genuinely returns a plain epic, it will be accepted only
+    # after live price validation inside capital_find_epic().
+    if "." not in epic:
         return True
     return False
+
+
+def capital_price_epic_works(epic: str, timeframe: str = "15m") -> bool:
+    """Validate an epic with a tiny latest-candle /prices probe."""
+    epic = str(epic or "").strip()
+    if not epic:
+        return False
+    key = (epic, timeframe)
+    if key in _CAPITAL_EPIC_VALIDATION_CACHE:
+        return bool(_CAPITAL_EPIC_VALIDATION_CACHE[key])
+    resolution = CAPITAL_RESOLUTION_MAP.get(str(timeframe).lower(), "MINUTE_15")
+    data = capital_request("GET", f"/prices/{epic}", params={"resolution": resolution, "max": 5}, retries=1)
+    ok = bool(isinstance(data, dict) and isinstance(data.get("prices"), list) and len(data.get("prices") or []) > 0)
+    _CAPITAL_EPIC_VALIDATION_CACHE[key] = ok
+    return ok
 
 # If platform env credentials are missing, hydrate them from the latest enabled user connection.
 try:
@@ -1981,13 +1995,20 @@ def _capital_market_score(symbol: str, market: dict) -> int:
     symbol = str(symbol or "").upper()
     epic = str(market.get("epic") or "").upper()
     name = str(market.get("instrumentName") or market.get("name") or market.get("symbol") or "").upper()
+    compact_name = name.replace("/", "").replace(" ", "").replace("-", "")
     score = 0
-    if epic == symbol:
-        score += 100
+    # Prefer real broker epics over label-like search terms.
+    if "." in epic:
+        score += 200
+    else:
+        score -= 200
     if symbol in epic:
-        score += 50
-    if symbol in name.replace("/", "").replace(" ", ""):
-        score += 45
+        score += 60
+    if symbol in compact_name:
+        score += 55
+    # FX pair names are often displayed as EUR/USD rather than EURUSD.
+    if len(symbol) == 6 and f"{symbol[:3]}/{symbol[3:]}" in name:
+        score += 80
     if "CFD" in str(market.get("instrumentType") or market.get("type") or "").upper():
         score += 5
     if market.get("streamingPricesAvailable") is True:
@@ -2343,21 +2364,29 @@ def capital_find_epic(symbol: str) -> str | None:
 
     saved_epic = capital_load_saved_epic(symbol)
     if saved_epic and not capital_saved_epic_needs_refresh(symbol, saved_epic):
+        # Trust persisted dotted broker epics without probing every run. If a
+        # later /prices call fails, the row can be manually refreshed.
         _CAPITAL_EPIC_CACHE[symbol] = saved_epic
         return saved_epic
 
-    if saved_epic:
-        print(f"[CapitalMapping] {symbol}: saved epic {saved_epic} looks like a label/search term; refreshing via /markets.")
+    if saved_epic and symbol not in _CAPITAL_MAPPING_REFRESHED_THIS_RUN:
+        print(f"[CapitalMapping] {symbol}: saved epic {saved_epic} is not a validated broker epic; refreshing via /markets.")
+        _CAPITAL_MAPPING_REFRESHED_THIS_RUN.add(symbol)
 
     candidates = []
+    # Search terms: human-friendly labels first, then known hints.
+    if len(symbol) == 6 and symbol.isalpha():
+        candidates.extend([f"{symbol[:3]}/{symbol[3:]}", symbol])
     if saved_epic:
         candidates.append(saved_epic)
     candidates.extend(CAPITAL_EPIC_HINTS.get(symbol, []))
     candidates.append(symbol)
-    # De-duplicate while preserving order.
     seen = set()
     candidates = [c for c in candidates if c and not (str(c).upper() in seen or seen.add(str(c).upper()))]
 
+    best_market = None
+    best_epic = ""
+    best_score = -10**9
     for candidate in candidates:
         data = capital_request("GET", "/markets", params={"searchTerm": candidate}, retries=1)
         markets = []
@@ -2365,22 +2394,27 @@ def capital_find_epic(symbol: str) -> str | None:
             markets = data.get("markets") or data.get("items") or data.get("market") or []
         if isinstance(markets, dict):
             markets = [markets]
-        if not markets:
-            continue
-        ranked = sorted(markets, key=lambda m: _capital_market_score(symbol, m), reverse=True)
-        best = ranked[0] if ranked else None
-        epic = str((best or {}).get("epic") or "").strip()
-        if epic:
-            _CAPITAL_EPIC_CACHE[symbol] = epic
-            _CAPITAL_MARKET_CACHE[symbol] = best or {}
-            capital_save_epic(symbol, epic, best or {})
-            if epic != saved_epic:
-                print(f"[CapitalMapping] {symbol}: mapped to broker epic {epic} and saved.")
-            return epic
+        for market in markets or []:
+            epic = str((market or {}).get("epic") or "").strip()
+            if not epic:
+                continue
+            score = _capital_market_score(symbol, market or {})
+            if score > best_score:
+                best_score, best_market, best_epic = score, market or {}, epic
+
+    # Accept only real-looking broker epics. Plain labels are what caused the
+    # replay storm, so leave the asset unresolved rather than saving bad data.
+    if best_epic and "." in best_epic:
+        _CAPITAL_EPIC_CACHE[symbol] = best_epic
+        _CAPITAL_MARKET_CACHE[symbol] = best_market or {}
+        capital_save_epic(symbol, best_epic, best_market or {})
+        if best_epic != saved_epic:
+            print(f"[CapitalMapping] {symbol}: mapped to broker epic {best_epic} and saved.")
+        return best_epic
 
     _CAPITAL_UNRESOLVED_EPIC_CACHE.add(symbol)
     _CAPITAL_EPIC_CACHE[symbol] = None
-    print(f"[CapitalMapping] {symbol}: no valid Capital.com epic found; replay/signal candle fetch skipped.")
+    print(f"[CapitalMapping] {symbol}: no valid dotted Capital.com broker epic found; skipped until capital_epic_map is corrected.")
     return None
 
 # Backward-compatible alias used by the auto-trade layer.
@@ -2737,6 +2771,7 @@ def get_timeframe_df(ticker: str, timeframe: str) -> pd.DataFrame | None:
 
 _TIMEFRAME_MINUTES = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440}
 _MINUTE_REPLAY_CACHE: dict[str, pd.DataFrame | None] = {}
+_REPLAY_UNAVAILABLE_ASSETS: set[str] = set()
 
 
 def get_minute_replay_df(ticker: str) -> pd.DataFrame | None:
@@ -2757,6 +2792,9 @@ def get_minute_replay_df(ticker: str) -> pd.DataFrame | None:
     # Capital.com 1-minute path.
     if should_use_capital_for_ticker(ticker):
         symbol = capital_symbol_from_ticker(ticker)
+        if symbol in _REPLAY_UNAVAILABLE_ASSETS:
+            _MINUTE_REPLAY_CACHE[cache_key] = None
+            return None
         df = capital_download(symbol, "1m", max_rows=1000)
         if df is not None and not df.empty:
             df = df.copy()
@@ -2765,7 +2803,8 @@ def get_minute_replay_df(ticker: str) -> pd.DataFrame | None:
             _MINUTE_REPLAY_CACHE[cache_key] = df.copy()
             return df.copy()
         if CAPITAL_STRICT_ALL_ASSETS:
-            print(f"[Replay1m] {symbol}: Capital.com minute data unavailable; strict Capital.com pricing active — no Yahoo fallback.")
+            print(f"[Replay1m] {symbol}: Capital.com minute data unavailable or epic unresolved — no Yahoo fallback.")
+            _REPLAY_UNAVAILABLE_ASSETS.add(symbol)
             _MINUTE_REPLAY_CACHE[cache_key] = None
             return None
         fallback = yahoo_fallback_for_symbol(symbol, ticker)
@@ -3819,147 +3858,65 @@ def telegram_configured() -> bool:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def evaluate_open_trades(assets: set[str] | None = None, timeframes: set[str] | None = None) -> None:
-    open_trades = fetch_open_trades(assets=assets, timeframes=timeframes, due_only=True)
-    if not open_trades:
-        print("[Evaluate] No open trades.")
+    """Resolve due OPEN trades with Capital 1-minute replay, grouped by asset.
+
+    Grouping is important: the scanner should fetch at most one recent 1-minute
+    dataframe per asset per run, then replay all due trades for that asset from
+    the same cached dataframe. This keeps TP/SL timing accurate without turning
+    one scanner run into hundreds of duplicate Capital API calls.
+    """
+    _t_eval = _runtime_start()
+    force_open_graded_setups()
+    trades = fetch_open_trades(assets=assets, timeframes=timeframes, due_only=True)
+    if not trades:
+        print("[Evaluate] No due open trades to check.")
+        _runtime_stop("open_trade_replay", _t_eval)
         return
 
-    print(f"[Evaluate] Checking {len(open_trades)} due open trade(s) with 1-minute replay where available...")
-    pending_capital_data = 0
-    closed_count = 0
-    for t in open_trades:
-        asset = t.get("asset")
-        signal_id = t.get("signal_id")
-        grade = t.get("grade")
-        result = replay_trade_outcome(t, use_minute=True)
-        if not result:
-            # Capital.com 1-minute data may be temporarily unavailable or too
-            # recent/old for the price endpoint. Do not fake the outcome with
-            # Yahoo or wider candles; mark checked and retry on TF cadence.
-            pending_capital_data += 1
-            mark_replay_checked(signal_id)
+    print(f"[Evaluate] Checking {len(trades)} due open trade(s) with cached Capital.com 1-minute replay...")
+    closed = 0
+    pending = 0
+
+    grouped: dict[str, list[dict]] = {}
+    for t in trades:
+        asset = str(t.get("asset") or asset_symbol_from_any_ticker(str(t.get("ticker") or ""))).strip().upper()
+        grouped.setdefault(asset, []).append(t)
+
+    for asset, rows in grouped.items():
+        # Prime cache once. If there is no valid epic or no minute data, mark all
+        # rows as checked for their cadence and move on. They remain OPEN.
+        ticker = preferred_data_ticker(asset, f"CAPITAL:{asset}")
+        mdf = get_minute_replay_df(ticker)
+        if mdf is None or mdf.empty:
+            pending += len(rows)
+            for t in rows:
+                mark_replay_checked(str(t.get("signal_id")), int(t.get("bars_open") or 0))
             continue
 
-        reason = result.get("reason")
-        bars_open = int(result.get("bars_open") or 0)
-        method = result.get("method", "unknown")
-        if reason == "OPEN":
-            mark_replay_checked(signal_id, bars_open if bars_open else None)
-            continue
-
-        exit_price = float(result.get("price") or 0.0)
-        r_mult = float(result.get("r") or 0.0)
-        if close_trade(signal_id, exit_price, reason, r_mult, result.get("exit_time")):
-            closed_count += 1
-        update_prop_firm(signal_id, asset, grade, r_mult)
-
-        if "ambiguous" in str(method):
-            print(f"  [{asset}] AMBIGUOUS same-candle TP+SL on {method} → conservatively marked SL.")
-        else:
-            print(f"  [{asset}] Closed: {reason} via {method} replay after {bars_open} bar(s) ({r_mult:+.2f}R)")
-    if pending_capital_data:
-        print(f"[Evaluate] Pending Capital.com 1-minute data: {pending_capital_data} trade(s); they will be retried on timeframe cadence.")
-    if closed_count:
-        print(f"[Evaluate] Closed {closed_count} trade(s) this run.")
-
-def backfill_shadow_trade_plans(assets: set[str] | None = None, timeframes: set[str] | None = None, max_age_days: int = 3650, due_only: bool = True) -> int:
-    """Repair every legacy SHADOW / NO TRADE row that lacks a usable plan.
-
-    Older builds stored split/HOLD rows as Entry = SL = TP, which meant there
-    was no hypothetical trade to resolve. For research, every shadow row is now
-    given a deterministic BUY/SELL test direction and the same ATR 1:2 plan as
-    the real scanner. The row remains SHADOW forever and is excluded from real
-    journal, alerts, and prop-firm metrics.
-    """
-    try:
-        conn = db_connect()
-        with conn.cursor() as cur:
-            sql = """
-                SELECT signal_id, asset, timeframe, signal, entry, sl, tp, atr, ml_prob, strategy_votes
-                FROM scanner_signals
-                WHERE status = 'SHADOW'
-                  AND shadow_outcome IS NULL
-                  AND created_at >= NOW() - (%s::int * INTERVAL '1 day')
-                  AND (
-                        UPPER(TRIM(COALESCE(signal,''))) = 'HOLD'
-                     OR ABS(COALESCE(entry,0) - COALESCE(sl,0)) <= 0.00000001
-                     OR ABS(COALESCE(sl,0) - COALESCE(tp,0)) <= 0.00000001
-                  )
-            """
-            params: list = [max_age_days]
-            if assets:
-                sql += " AND asset = ANY(%s)"
-                params.append(list(assets))
-            if timeframes:
-                sql += " AND timeframe = ANY(%s)"
-                params.append(list(timeframes))
-            if due_only:
-                sql += """
-                  AND (
-                        replay_checked_at IS NULL
-                        OR replay_checked_at <= NOW() - CASE LOWER(COALESCE(timeframe, '15m'))
-                            WHEN '15m' THEN INTERVAL '15 minutes'
-                            WHEN '1h' THEN INTERVAL '1 hour'
-                            WHEN '4h' THEN INTERVAL '4 hours'
-                            WHEN '1d' THEN INTERVAL '1 day'
-                            ELSE INTERVAL '15 minutes'
-                        END
-                  )
-                """
-            sql += " ORDER BY created_at ASC LIMIT %s"
-            params.append(int(SHADOW_BACKFILL_LIMIT))
-            cur.execute(sql, tuple(params))
-            rows = [dict(r) for r in cur.fetchall()]
-        conn.close()
-    except Exception as exc:
-        print(f"[Shadow] Backfill fetch failed: {exc}")
-        return 0
-
-    updated = 0
-    for row in rows:
-        try:
-            entry = safe_number(row.get("entry"), 0.0)
-            atr = safe_number(row.get("atr"), 0.0)
-            if entry <= 0:
+        for t in rows:
+            result = replay_trade_outcome(t, use_minute=True)
+            if result is None:
+                pending += 1
+                mark_replay_checked(str(t.get("signal_id")), int(t.get("bars_open") or 0))
                 continue
-            # Prefer stored ATR, which is how live scanner plans are built.
-            # For very old rows where ATR was not saved, use a small deterministic
-            # fallback so the legacy shadow research stream can still be tested
-            # instead of being permanently invisible in the No Trade Tracker.
-            if atr <= 0:
-                atr = max(abs(entry) * 0.0025, 1e-8)
-            votes = row.get("strategy_votes") or {}
-            if isinstance(votes, str):
-                try:
-                    votes = json.loads(votes)
-                except Exception:
-                    votes = {}
-            confluence = {"dominant": "SPLIT", "votes": votes, "ml_prob": safe_number(row.get("ml_prob"), 0.5)}
-            direction = choose_shadow_research_direction(confluence)
-            plan = build_trade_plan(entry, atr, direction)
-            if abs(plan["sl"] - entry) <= 0 or abs(plan["tp"] - plan["sl"]) <= 0:
-                continue
-            conn = db_connect()
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        UPDATE scanner_signals
-                        SET signal = %s, sl = %s, tp = %s, rr = %s,
-                            reason = COALESCE(reason, '') || ' | Shadow research plan backfilled: hypothetical ' || %s || ' using ATR 1:2 RR.'
-                        WHERE signal_id = %s
-                          AND status = 'SHADOW'
-                          AND shadow_outcome IS NULL
-                        """,
-                        (direction, round(plan["sl"], 8), round(plan["tp"], 8), round(plan["rr"], 2), direction, row["signal_id"]),
-                    )
-                    updated += cur.rowcount
-            conn.close()
-        except Exception as exc:
-            print(f"[Shadow] Backfill skipped row {row.get('signal_id')}: {exc}")
-    if updated:
-        print(f"[Shadow] Backfilled {updated} legacy NO TRADE hypothetical plan(s).")
-    return updated
+            reason = str(result.get("reason") or "").upper()
+            price = float(result.get("price") or 0.0)
+            r = float(result.get("r") or 0.0)
+            bars = int(result.get("bars_open") or 0)
+            exit_time = result.get("exit_time")
+            if reason in {"TP", "SL", "EXPIRY"}:
+                if close_trade(str(t.get("signal_id")), price, reason, r, exit_time=exit_time):
+                    closed += 1
+                    print(f"  [{asset}] Closed: {reason} via {result.get('method','1m')} replay after {bars} bar(s) ({r:+.2f}R)")
+                    update_prop_firm(str(t.get("signal_id")), asset, str(t.get("grade") or ""), r)
+            else:
+                mark_replay_checked(str(t.get("signal_id")), bars)
+
+    if pending:
+        print(f"[Evaluate] Pending Capital.com 1-minute data: {pending} trade(s); rows were cadence-stamped and will not be hammered this run.")
+    if closed:
+        print(f"[Evaluate] Closed {closed} trade(s) this run.")
+    _runtime_stop("open_trade_replay", _t_eval)
 
 
 def evaluate_shadow_trades(assets: set[str] | None = None, timeframes: set[str] | None = None) -> int:
