@@ -3952,15 +3952,9 @@ def render_adaptive_grade_audit_panel() -> None:
         st.info("Adaptive grade audit table is not available yet. Run the adaptive_grade_audit SQL migration once in Supabase.")
         return
 
-    try:
-        if not st.session_state.get("adaptive_grade_audit_synced_once", False):
-            sync_result = sync_adaptive_grade_audit(limit=75)
-            st.session_state.adaptive_grade_audit_synced_once = True
-            if sync_result.get("upserts", 0):
-                st.caption(f"Adaptive grade audit synced {sync_result.get('upserts', 0)} signal row(s).")
-    except Exception as exc:
-        st.caption(f"Adaptive grade audit sync skipped: {exc}")
-
+    # Read-only page: adaptive audit generation happens only through the sidebar
+    # Refresh Data action. Opening this page must never rescore signals, rebuild
+    # lessons, or upsert audit rows.
     audit = load_adaptive_grade_audit()
     if audit.empty:
         st.info("No adaptive grade audit rows yet. They will appear as generated signals are processed.")
@@ -6322,12 +6316,21 @@ def sidebar_controls(username: str, settings: dict) -> str:
         )
         st.markdown("<div class='benzino-refresh-wrap'>", unsafe_allow_html=True)
         if st.button("⟳  Refresh Data", width="stretch", key="sidebar_refresh_data"):
-            with st.spinner("Refreshing dashboard and adaptive learning from Supabase…"):
+            with st.spinner("Refreshing dashboard and rebuilding adaptive learning from saved closed trades…"):
                 st.cache_data.clear()
                 reset_adaptive_learning_sync_flags()
                 st.session_state.pop("adaptive_learning_refresh_error", None)
                 try:
-                    sync_result = run_adaptive_learning_sync(username, settings, reason="refresh", lesson_batch_size=25, audit_limit=75)
+                    # Refresh Data is the only place where the adaptive learning layer is rebuilt.
+                    # Use the full app row limit so historical closed trades generate lessons and
+                    # stale audit rows such as "No reliable 20+ trade lesson sample yet" are updated.
+                    sync_result = run_adaptive_learning_sync(
+                        username,
+                        settings,
+                        reason="refresh",
+                        lesson_batch_size=APP_TABLE_MAX_ROWS,
+                        audit_limit=APP_TABLE_MAX_ROWS,
+                    )
                     st.session_state["adaptive_learning_last_refresh"] = sync_result
                 except Exception as exc:
                     st.session_state["adaptive_learning_refresh_error"] = str(exc)
