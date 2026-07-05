@@ -244,6 +244,46 @@ def read_df(sql: str, params: tuple = ()) -> pd.DataFrame:
 
 
 def init_tables() -> None:
+    """Initialise database schema only when explicitly requested.
+
+    Normal Streamlit app startup must not run CREATE INDEX / ALTER TABLE work,
+    because that can deadlock with the background scanner or another app session.
+    Apply migrations manually in Supabase, or temporarily set
+    APP_RUN_SCHEMA_MIGRATIONS=true for one controlled maintenance run.
+    """
+    run_migrations = str(os.getenv("APP_RUN_SCHEMA_MIGRATIONS", "false")).strip().lower() in {"1", "true", "yes", "y"}
+    if not run_migrations:
+        # Lightweight readiness check only: no DDL, no indexes, no ALTER TABLE.
+        # to_regclass checks existence without taking AccessExclusiveLock.
+        required_tables = [
+            "users", "user_settings", "user_watchlists", "scanner_signals",
+            "user_telegram_settings", "user_journal_history",
+            "capital_execution_audit", "capital_executed_trades",
+            "prop_challenge_history",
+        ]
+        try:
+            conn = db_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT t, to_regclass(t) IS NOT NULL AS exists FROM unnest(%s::text[]) AS t",
+                        (required_tables,),
+                    )
+                    rows = cur.fetchall()
+                missing = [str(r.get("t")) for r in rows if not bool(r.get("exists"))]
+                if missing:
+                    st.error(
+                        "Database not ready: missing table(s): " + ", ".join(missing) +
+                        ". Run the Supabase migration once, then restart the app."
+                    )
+                    st.stop()
+            finally:
+                conn.close()
+        except Exception as exc:
+            st.error(f"Database not ready: {exc}")
+            st.stop()
+        return
+
     ddl = """
     CREATE TABLE IF NOT EXISTS users (
         username TEXT PRIMARY KEY,
@@ -499,6 +539,26 @@ def init_tables() -> None:
         failure_reason TEXT,
         created_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS prop_challenge_daily_ledger (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        scan_owner TEXT NOT NULL,
+        challenge_number INTEGER,
+        phase TEXT,
+        day DATE,
+        daily_pnl NUMERIC,
+        day_result TEXT,
+        target_hit TEXT,
+        trades INTEGER,
+        opening_balance NUMERIC,
+        closing_balance NUMERIC,
+        intraday_low NUMERIC,
+        daily_loss_floor NUMERIC,
+        phase_target NUMERIC,
+        daily_breach TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(scan_owner, challenge_number, phase, day)
+    );
     CREATE TABLE IF NOT EXISTS explain_ai_lessons (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         signal_id TEXT REFERENCES scanner_signals(signal_id),
@@ -609,6 +669,28 @@ def init_tables() -> None:
                 cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS capital_leverage NUMERIC")
                 cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS ftmo_normalization_factor NUMERIC DEFAULT 1")
                 cur.execute("ALTER TABLE prop_challenge_history ADD COLUMN IF NOT EXISTS failure_reason TEXT")
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS prop_challenge_daily_ledger (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        scan_owner TEXT NOT NULL,
+                        challenge_number INTEGER,
+                        phase TEXT,
+                        day DATE,
+                        daily_pnl NUMERIC,
+                        day_result TEXT,
+                        target_hit TEXT,
+                        trades INTEGER,
+                        opening_balance NUMERIC,
+                        closing_balance NUMERIC,
+                        intraday_low NUMERIC,
+                        daily_loss_floor NUMERIC,
+                        phase_target NUMERIC,
+                        daily_breach TEXT,
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ DEFAULT NOW(),
+                        UNIQUE(scan_owner, challenge_number, phase, day)
+                    )
+                """)
                 # Migration/fix: Telegram delivery must never control journal status.
                 # A+/A/B/C BUY/SELL setups are active journal trades; NO TRADE/HOLD stays SHADOW.
                 cur.execute(
@@ -1527,6 +1609,116 @@ def load_prop_challenge_history(username: str, timeframe: str, limit: int = APP_
     return df
 
 
+def load_prop_challenge_daily_ledger(username: str, timeframe: str, limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFrame:
+    """Read the persisted daily prop-firm ledger for this user/timeframe.
+
+    These rows are intentionally stored in Supabase so the Daily Challenge Ledger
+    does not shift on every app reload. It is replaced only by an explicit replay
+    rebuild or when no saved ledger exists yet.
+    """
+    scope = prop_challenge_scan_owner(username, timeframe)
+    try:
+        df = read_df(
+            """
+            SELECT
+                challenge_number AS "Challenge",
+                phase AS "Phase",
+                day AS "Day",
+                daily_pnl AS "Daily P/L",
+                day_result AS "Day Result",
+                target_hit AS "Target Hit",
+                trades AS "Trades",
+                opening_balance AS "Opening Balance",
+                closing_balance AS "Closing Balance",
+                intraday_low AS "Intraday Low",
+                daily_loss_floor AS "Daily Loss Floor",
+                phase_target AS "Phase Target",
+                daily_breach AS "Daily Breach"
+            FROM prop_challenge_daily_ledger
+            WHERE scan_owner = %s
+            ORDER BY challenge_number DESC, day DESC, phase DESC
+            LIMIT %s
+            """,
+            (scope, limit),
+        )
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    if "Challenge" in df.columns:
+        df["Challenge"] = df["Challenge"].apply(lambda x: f"#{int(x)}" if pd.notna(x) else "—")
+    return numeric_cols(df, ["Daily P/L", "Trades", "Opening Balance", "Closing Balance", "Intraday Low", "Daily Loss Floor", "Phase Target"])
+
+
+def save_prop_challenge_daily_ledger(username: str, timeframe: str, daily_df: pd.DataFrame) -> int:
+    """Replace the persisted daily ledger for this user's prop replay scope."""
+    scope = prop_challenge_scan_owner(username, timeframe)
+    if daily_df is None or daily_df.empty:
+        return 0
+    df = daily_df.copy()
+    # Normalise display labels (#1) back to integers for storage.
+    if "Challenge" not in df.columns:
+        return 0
+    df["challenge_number"] = df["Challenge"].astype(str).str.replace("#", "", regex=False)
+    df["challenge_number"] = pd.to_numeric(df["challenge_number"], errors="coerce").fillna(0).astype(int)
+    rows = []
+    for _, r in df.iterrows():
+        try:
+            day = pd.to_datetime(r.get("Day"), errors="coerce").date()
+            if pd.isna(pd.to_datetime(r.get("Day"), errors="coerce")):
+                continue
+        except Exception:
+            continue
+        rows.append((
+            scope,
+            int(r.get("challenge_number") or 0),
+            str(r.get("Phase", "") or ""),
+            day,
+            float(pd.to_numeric(r.get("Daily P/L"), errors="coerce") or 0.0),
+            str(r.get("Day Result", "") or ""),
+            str(r.get("Target Hit", "") or ""),
+            int(pd.to_numeric(r.get("Trades"), errors="coerce") or 0),
+            float(pd.to_numeric(r.get("Opening Balance"), errors="coerce") or 0.0),
+            float(pd.to_numeric(r.get("Closing Balance"), errors="coerce") or 0.0),
+            float(pd.to_numeric(r.get("Intraday Low"), errors="coerce") or 0.0),
+            float(pd.to_numeric(r.get("Daily Loss Floor"), errors="coerce") or 0.0),
+            float(pd.to_numeric(r.get("Phase Target"), errors="coerce") or 0.0),
+            str(r.get("Daily Breach", "") or ""),
+        ))
+    if not rows:
+        return 0
+    sql = """
+        INSERT INTO prop_challenge_daily_ledger(
+            scan_owner, challenge_number, phase, day, daily_pnl, day_result, target_hit,
+            trades, opening_balance, closing_balance, intraday_low, daily_loss_floor,
+            phase_target, daily_breach, updated_at
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        ON CONFLICT (scan_owner, challenge_number, phase, day) DO UPDATE SET
+            daily_pnl = EXCLUDED.daily_pnl,
+            day_result = EXCLUDED.day_result,
+            target_hit = EXCLUDED.target_hit,
+            trades = EXCLUDED.trades,
+            opening_balance = EXCLUDED.opening_balance,
+            closing_balance = EXCLUDED.closing_balance,
+            intraday_low = EXCLUDED.intraday_low,
+            daily_loss_floor = EXCLUDED.daily_loss_floor,
+            phase_target = EXCLUDED.phase_target,
+            daily_breach = EXCLUDED.daily_breach,
+            updated_at = NOW()
+    """
+    conn = db_connect()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM prop_challenge_daily_ledger WHERE scan_owner = %s", (scope,))
+                cur.executemany(sql, rows)
+        return len(rows)
+    except Exception:
+        return 0
+    finally:
+        conn.close()
+
+
 def archive_prop_challenge_attempt(
     username: str,
     timeframe: str,
@@ -1606,13 +1798,15 @@ def archive_prop_challenge_attempt(
     return True
 
 
-def rebuild_prop_challenge_history_from_trades(username: str, timeframe: str, histories: list[dict]) -> None:
+def rebuild_prop_challenge_history_from_trades(username: str, timeframe: str, histories: list[dict], daily_ledger: pd.DataFrame | None = None) -> None:
     """Replace this user's simulated prop-firm history for the timeframe with a clean replay."""
     scope = prop_challenge_scan_owner(username, timeframe)
     try:
         execute("DELETE FROM prop_challenge_history WHERE scan_owner = %s", (scope,))
     except Exception:
         return
+    if daily_ledger is not None and not daily_ledger.empty:
+        save_prop_challenge_daily_ledger(username, timeframe, daily_ledger)
     for idx, h in enumerate(histories, start=1):
         try:
             execute(
@@ -1657,6 +1851,7 @@ def rebuild_all_user_prop_histories_from_scanner(reset_legacy_ledgers: bool = Tr
             execute("DELETE FROM prop_firm_trades")
             execute("DELETE FROM prop_firm_state")
         execute("DELETE FROM prop_challenge_history")
+        execute("DELETE FROM prop_challenge_daily_ledger")
     except Exception as exc:
         result["errors"].append(f"Could not clear old prop ledgers: {exc}")
         return result
@@ -1712,7 +1907,7 @@ def rebuild_all_user_prop_histories_from_scanner(reset_legacy_ledgers: bool = Tr
 
             sim = simulate_prop_challenge_cycles(scoped, started_i, 10000.0)
             histories = sim.get("history", []) or []
-            rebuild_prop_challenge_history_from_trades(username_i, timeframe_i, histories)
+            rebuild_prop_challenge_history_from_trades(username_i, timeframe_i, histories, sim.get("all_daily", pd.DataFrame()))
             result["users"] += 1
             result["histories"] += len(histories)
         except Exception as exc:
@@ -2683,13 +2878,11 @@ def add_balance_extreme_labels(
     group_col: str | None = None,
     currency_prefix: str = "$",
 ) -> None:
-    """Add clear low/high/current labels without stacking labels on top of the curve.
+    """Mark each curve's Low, High, and Current points with hover-only labels.
 
-    Instead of placing every text box directly over the line, this pins the
-    labels in a right-side callout rail and staggers their y positions. The
-    actual low/high/current points are still marked on the curve, while the
-    readable amounts sit outside the plot area where they do not hide one
-    another.
+    The chart keeps the useful marker points but removes permanent annotation
+    boxes so the balance curve uses the full width and never gets squeezed by
+    callouts. Users can hover the marker to see the exact amount and timestamp.
     """
     if data is None or data.empty or x_col not in data.columns or y_col not in data.columns:
         return
@@ -2705,9 +2898,9 @@ def add_balance_extreme_labels(
     if group_col and group_col in work.columns:
         groups = [(str(name), grp.copy()) for name, grp in work.groupby(group_col, sort=False) if grp is not None and not grp.empty]
 
-    label_rows: list[dict] = []
-    seen_points: set[tuple[str, str, str]] = set()
-
+    # Use a light marker-only overlay. No annotations are added, so the chart
+    # remains spacious and all details are available through Plotly hover.
+    seen_points: set[tuple[str, str, str, str]] = set()
     for group_name, grp in groups:
         grp = grp.sort_values(x_col).reset_index(drop=True)
         if grp.empty:
@@ -2726,80 +2919,34 @@ def add_balance_extreme_labels(
             except Exception:
                 continue
 
-            # A short line can have low/high/current on the same candle. Show the
-            # current label and avoid duplicate low/high callouts for the same point.
-            point_key = (group_name, str(x_val), f"{y_val:.8f}")
-            if point_key in seen_points and role != "Current":
+            # Avoid duplicate markers for the same role/point, but allow Current
+            # to appear even if it is also the low/high point.
+            point_key = (group_name, role, str(x_val), f"{y_val:.8f}")
+            if point_key in seen_points:
                 continue
             seen_points.add(point_key)
 
-            # Mark the exact point on the curve, but keep the text outside the plot.
+            group_text = group_name if group_name else "Balance"
+            try:
+                time_text = pd.to_datetime(x_val, utc=True).strftime("%d %b %Y %H:%M UTC")
+            except Exception:
+                time_text = str(x_val)
+
             fig.add_trace(
                 go.Scatter(
                     x=[x_val],
                     y=[y_val],
                     mode="markers",
-                    marker=dict(size=7, symbol="circle-open"),
-                    hovertemplate=f"{group_name + ' · ' if group_name else ''}{role}: {currency_prefix}{y_val:,.2f}<extra></extra>",
+                    marker=dict(size=9, symbol="circle-open", line=dict(width=2)),
+                    hovertemplate=(
+                        f"<b>{html.escape(group_text)}</b><br>"
+                        f"{role}: {currency_prefix}{y_val:,.2f}<br>"
+                        f"{html.escape(time_text)}"
+                        "<extra></extra>"
+                    ),
                     showlegend=False,
                 )
             )
-            label_rows.append({
-                "group": group_name,
-                "role": role,
-                "x": x_val,
-                "y": y_val,
-                "label_y": y_val,
-                "text": f"{group_name + ' · ' if group_name else ''}{role}: {currency_prefix}{y_val:,.2f}",
-            })
-
-    if not label_rows:
-        return
-
-    y_values = [float(v) for v in work[y_col].dropna().tolist()]
-    y_min, y_max = min(y_values), max(y_values)
-    y_span = max(y_max - y_min, 1.0)
-    pad = y_span * 0.08
-    lower, upper = y_min - pad, y_max + pad
-    min_gap = y_span * 0.055
-
-    # Stagger the right-side label rail so labels never sit on top of each other.
-    label_rows.sort(key=lambda r: (r["label_y"], r["group"], r["role"]))
-    prev_y = None
-    for row in label_rows:
-        y = float(row["label_y"])
-        if prev_y is not None and y - prev_y < min_gap:
-            y = prev_y + min_gap
-        row["label_y"] = min(y, upper)
-        prev_y = row["label_y"]
-
-    # If the upward pass pushed the top labels out of range, compress downwards.
-    next_y = None
-    for row in reversed(label_rows):
-        y = float(row["label_y"])
-        if next_y is not None and next_y - y < min_gap:
-            y = next_y - min_gap
-        row["label_y"] = max(y, lower)
-        next_y = row["label_y"]
-
-    for row in label_rows:
-        fig.add_annotation(
-            x=1.012,
-            y=row["label_y"],
-            xref="paper",
-            yref="y",
-            text=row["text"],
-            showarrow=False,
-            xanchor="left",
-            align="left",
-            bgcolor="rgba(15,34,53,0.94)",
-            bordercolor="rgba(232,237,242,0.28)",
-            borderwidth=1,
-            borderpad=4,
-            font=dict(size=10, color="#E8EDF2"),
-        )
-
-    fig.update_yaxes(range=[lower, upper])
 
 
 def render_balance_curve(df: pd.DataFrame, settings: dict, title: str = "Balance curve", split_by_grade: bool = False, include_overall: bool = False) -> None:
@@ -2886,8 +3033,8 @@ def render_balance_curve(df: pd.DataFrame, settings: dict, title: str = "Balance
             yaxis_title=f"Balance after ({account:,.0f} start, {risk_pct:.2f}% risk)",
             xaxis_title="Resolved at",
             height=430,
-            margin=dict(l=20, r=230, t=25, b=40),
-            hovermode="x unified",
+            margin=dict(l=20, r=40, t=25, b=40),
+            hovermode="closest",
         )
     else:
         closed = closed.sort_values("curve_time").copy()
@@ -2895,7 +3042,7 @@ def render_balance_curve(df: pd.DataFrame, settings: dict, title: str = "Balance
         color_col = "timeframe" if "timeframe" in closed.columns else None
         fig = px.line(closed, x="curve_time", y="balance_after", color=color_col, title=title)
         add_balance_extreme_labels(fig, closed, "curve_time", "balance_after", color_col)
-        fig.update_layout(yaxis_title="Balance after", xaxis_title="Resolved at", height=430, margin=dict(l=20, r=230, t=25, b=40), hovermode="x unified")
+        fig.update_layout(yaxis_title="Balance after", xaxis_title="Resolved at", height=430, margin=dict(l=20, r=40, t=25, b=40), hovermode="closest")
 
     st.plotly_chart(fig, use_container_width=True)
 
@@ -3285,20 +3432,14 @@ def load_explain_ai_lesson(signal_id: str, lesson_type: str = "CLOSED_TRADE") ->
 
 
 def sync_missing_explain_ai_lessons(closed_trades: pd.DataFrame, limit: int = 1000) -> dict:
-    """Create CLOSED_TRADE Explain AI lessons for closed trades that do not have one yet.
-
-    This is the adaptive-learning memory feed. It does not change scanner logic;
-    it only makes sure every closed outcome has a stored lesson in Supabase so
-    Coach/Explain AI can review the full historical lesson base later.
-    """
+    """Persist one CLOSED_TRADE lesson for every closed trade that does not have one yet."""
     out = {"checked": 0, "created": 0, "skipped": 0, "errors": 0}
     if closed_trades is None or closed_trades.empty or "signal_id" not in closed_trades.columns:
         return out
 
     lessons_df = closed_trades.copy()
     lessons_df["signal_id"] = lessons_df["signal_id"].astype(str)
-    lessons_df = lessons_df[lessons_df["signal_id"].str.strip().ne("")].copy()
-    lessons_df = lessons_df.drop_duplicates(subset=["signal_id"], keep="last")
+    lessons_df = lessons_df[lessons_df["signal_id"].str.strip().ne("")].drop_duplicates(subset=["signal_id"], keep="last")
     if lessons_df.empty:
         return out
 
@@ -3330,12 +3471,7 @@ def sync_missing_explain_ai_lessons(closed_trades: pd.DataFrame, limit: int = 10
             if not str(lesson_text or "").strip():
                 out["skipped"] += 1
                 continue
-            rows_to_insert.append((
-                sid,
-                str(row.get("scan_owner") or active_username() or ""),
-                "CLOSED_TRADE",
-                lesson_text,
-            ))
+            rows_to_insert.append((sid, str(row.get("scan_owner") or active_username() or ""), "CLOSED_TRADE", lesson_text))
         except Exception:
             out["errors"] += 1
 
@@ -3361,6 +3497,254 @@ def sync_missing_explain_ai_lessons(closed_trades: pd.DataFrame, limit: int = 10
     except Exception:
         out["errors"] += len(rows_to_insert)
     return out
+
+
+
+def load_all_closed_trades_for_explain_ai(limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFrame:
+    """Load every resolved closed trade in scanner_signals for historical lesson backfill.
+
+    This is intentionally system-wide: it is not limited to the logged-in user's
+    watchlist or tracking period because adaptive learning should be able to
+    learn from all closed outcomes already stored in Supabase.
+    """
+    df = read_df(
+        """
+        SELECT *
+        FROM scanner_signals
+        WHERE (
+            UPPER(COALESCE(status, '')) IN ('CLOSED_TP', 'CLOSED_SL', 'EXPIRED', 'CLOSED')
+            OR exit_at IS NOT NULL
+            OR r_multiple IS NOT NULL
+        )
+          AND UPPER(COALESCE(grade, '')) IN ('A+', 'A', 'B', 'C')
+          AND UPPER(COALESCE(signal, '')) IN ('BUY', 'SELL')
+        ORDER BY COALESCE(exit_at, created_at) ASC
+        LIMIT %s
+        """,
+        (int(limit or APP_TABLE_MAX_ROWS),),
+    )
+    if df.empty:
+        return df
+    df = numeric_cols(df, [
+        "confidence", "edge_score", "ml_prob", "entry", "sl", "tp", "rr",
+        "rsi", "atr", "exit_price", "r_multiple", "bars_open", "mtf_score",
+        "shadow_r_multiple",
+    ])
+    for col in ["created_at", "exit_at", "shadow_closed_at", "candle_close"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce", utc=True)
+    if "created_at" in df.columns:
+        df["created_at_eat"] = df["created_at"].apply(fmt_nairobi)
+        df["session"] = df["created_at"].apply(session_name)
+    return closed_resolved_trades(df)
+
+
+def backfill_all_historical_explain_ai_lessons(limit: int = APP_TABLE_MAX_ROWS, batch_size: int = 1500) -> dict:
+    """Generate missing CLOSED_TRADE lessons from all historical closed trades.
+
+    Existing lessons are skipped, so this can be safely run more than once.
+    The function also rebuilds a system-wide adaptive profile from the full
+    closed-trade set after the backfill completes.
+    """
+    out = {"closed_trades": 0, "checked": 0, "created": 0, "skipped": 0, "errors": 0, "profile_saved": False}
+    all_closed = load_all_closed_trades_for_explain_ai(limit=limit)
+    if all_closed.empty:
+        return out
+
+    all_closed = all_closed.sort_values("created_at", ascending=True).drop_duplicates(subset=["signal_id"], keep="last")
+    out["closed_trades"] = int(len(all_closed))
+
+    batch_size = max(100, int(batch_size or 1500))
+    for start in range(0, len(all_closed), batch_size):
+        batch = all_closed.iloc[start:start + batch_size].copy()
+        res = sync_missing_explain_ai_lessons(batch, limit=len(batch))
+        for key in ("checked", "created", "skipped", "errors"):
+            out[key] += int(res.get(key, 0) or 0)
+
+    try:
+        system_profile = build_adaptive_learning_profile(all_closed, "system_all_closed_trades", {})
+        system_profile["scope_key"] = "ALL_CLOSED_TRADES"
+        system_profile["recommendation_text"] = (
+            str(system_profile.get("recommendation_text") or "")
+            + " This profile was rebuilt from all historical closed trades in scanner_signals."
+        ).strip()
+        out["profile_saved"] = bool(save_adaptive_learning_profile(system_profile))
+    except Exception:
+        out["errors"] += 1
+
+    return out
+
+
+def _learning_bucket_summary(df: pd.DataFrame, column: str, min_trades: int = 3, top_n: int = 5) -> list[dict]:
+    if df is None or df.empty or column not in df.columns or "r_multiple" not in df.columns:
+        return []
+    work = df.copy()
+    work[column] = work[column].fillna("Unknown").astype(str).str.strip().replace({"": "Unknown"})
+    work["r_multiple"] = pd.to_numeric(work["r_multiple"], errors="coerce").fillna(0.0)
+    grouped = []
+    for name, g in work.groupby(column):
+        trades = len(g)
+        if trades < int(min_trades or 1):
+            continue
+        wins = int((g["r_multiple"] > 0).sum())
+        losses = int((g["r_multiple"] < 0).sum())
+        avg_r = float(g["r_multiple"].mean()) if trades else 0.0
+        win_rate = (wins / trades * 100.0) if trades else 0.0
+        grouped.append({
+            "name": str(name),
+            "trades": int(trades),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(win_rate, 2),
+            "avg_r": round(avg_r, 3),
+            "score": round(avg_r * max(1, min(trades, 20)) + (win_rate - 50.0) / 25.0, 3),
+        })
+    return sorted(grouped, key=lambda x: (x["score"], x["avg_r"], x["trades"]), reverse=True)[:top_n]
+
+
+def build_adaptive_learning_profile(closed_trades: pd.DataFrame, username: str, settings: dict | None = None) -> dict:
+    """Convert saved closed-trade outcomes into a reusable adaptive learning profile.
+
+    This does not change the scanner. It creates a playbook for Explain AI/Coach AI:
+    what to favour, what to be cautious with, and which patterns need more data.
+    """
+    username = normalize_username(username or active_username())
+    settings = settings or {}
+    out = {
+        "scan_owner": username,
+        "scope_key": f"{username}:current",
+        "closed_trade_count": 0,
+        "win_rate": 0.0,
+        "avg_r": 0.0,
+        "best_patterns": [],
+        "risk_patterns": [],
+        "asset_profile": [],
+        "session_profile": [],
+        "grade_profile": [],
+        "timeframe_profile": [],
+        "recommendation_text": "Not enough closed trades yet for adaptive learning.",
+    }
+    if closed_trades is None or closed_trades.empty:
+        return out
+
+    df = closed_trades.copy()
+    if "r_multiple" not in df.columns:
+        return out
+    df["r_multiple"] = pd.to_numeric(df["r_multiple"], errors="coerce")
+    df = df[df["r_multiple"].notna()].copy()
+    if df.empty:
+        return out
+
+    out["closed_trade_count"] = int(len(df))
+    out["win_rate"] = round(float((df["r_multiple"] > 0).mean() * 100.0), 2)
+    out["avg_r"] = round(float(df["r_multiple"].mean()), 3)
+
+    # Build consistent user-facing profile buckets. Session should already be present in prepared data;
+    # if not, derive it from created_at using the same app helper used elsewhere.
+    if "session" not in df.columns and "created_at" in df.columns:
+        try:
+            df["session"] = pd.to_datetime(df["created_at"], errors="coerce", utc=True).apply(session_label)
+        except Exception:
+            pass
+
+    out["asset_profile"] = _learning_bucket_summary(df, "asset", min_trades=3, top_n=8)
+    out["session_profile"] = _learning_bucket_summary(df, "session", min_trades=5, top_n=8)
+    out["grade_profile"] = _learning_bucket_summary(df, "grade", min_trades=3, top_n=8)
+    out["timeframe_profile"] = _learning_bucket_summary(df, "timeframe", min_trades=3, top_n=8)
+
+    all_patterns = []
+    for label, rows in [("Asset", out["asset_profile"]), ("Session", out["session_profile"]), ("Grade", out["grade_profile"]), ("Timeframe", out["timeframe_profile"])]:
+        for row in rows:
+            item = dict(row)
+            item["dimension"] = label
+            all_patterns.append(item)
+    out["best_patterns"] = sorted(all_patterns, key=lambda x: (x["score"], x["avg_r"], x["trades"]), reverse=True)[:6]
+    out["risk_patterns"] = sorted(all_patterns, key=lambda x: (x["score"], x["avg_r"], -x["trades"]))[:6]
+
+    best = out["best_patterns"][0] if out["best_patterns"] else None
+    risk = out["risk_patterns"][0] if out["risk_patterns"] else None
+    if best and risk:
+        out["recommendation_text"] = (
+            f"Adaptive learning currently favours {best['dimension']} **{best['name']}** "
+            f"({best['trades']} trades, {best['win_rate']:.2f}% win rate, {best['avg_r']:+.2f}R avg) and is most cautious around "
+            f"{risk['dimension']} **{risk['name']}** ({risk['trades']} trades, {risk['win_rate']:.2f}% win rate, {risk['avg_r']:+.2f}R avg). "
+            "This should influence Coach/Explain AI recommendations, but it should not rewrite scanner entries automatically."
+        )
+    elif best:
+        out["recommendation_text"] = (
+            f"Adaptive learning currently favours {best['dimension']} **{best['name']}** "
+            f"({best['trades']} trades, {best['win_rate']:.2f}% win rate, {best['avg_r']:+.2f}R avg). "
+            "More closed trades are needed before strong caution patterns are reliable."
+        )
+    return out
+
+
+def save_adaptive_learning_profile(profile: dict) -> bool:
+    """Persist the latest adaptive profile. Requires the SQL migration table."""
+    if not isinstance(profile, dict) or not profile.get("scan_owner"):
+        return False
+    try:
+        execute(
+            """
+            INSERT INTO explain_ai_adaptive_profile(
+                scan_owner, scope_key, generated_at, closed_trade_count, win_rate, avg_r,
+                best_patterns, risk_patterns, asset_profile, session_profile, grade_profile,
+                timeframe_profile, recommendation_text
+            ) VALUES (%s,%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (scan_owner, scope_key) DO UPDATE SET
+                generated_at = EXCLUDED.generated_at,
+                closed_trade_count = EXCLUDED.closed_trade_count,
+                win_rate = EXCLUDED.win_rate,
+                avg_r = EXCLUDED.avg_r,
+                best_patterns = EXCLUDED.best_patterns,
+                risk_patterns = EXCLUDED.risk_patterns,
+                asset_profile = EXCLUDED.asset_profile,
+                session_profile = EXCLUDED.session_profile,
+                grade_profile = EXCLUDED.grade_profile,
+                timeframe_profile = EXCLUDED.timeframe_profile,
+                recommendation_text = EXCLUDED.recommendation_text
+            """,
+            (
+                profile.get("scan_owner"), profile.get("scope_key"), int(profile.get("closed_trade_count") or 0),
+                float(profile.get("win_rate") or 0), float(profile.get("avg_r") or 0),
+                json.dumps(profile.get("best_patterns") or []), json.dumps(profile.get("risk_patterns") or []),
+                json.dumps(profile.get("asset_profile") or []), json.dumps(profile.get("session_profile") or []),
+                json.dumps(profile.get("grade_profile") or []), json.dumps(profile.get("timeframe_profile") or []),
+                str(profile.get("recommendation_text") or ""),
+            ),
+        )
+        return True
+    except Exception:
+        return False
+
+
+def render_adaptive_learning_panel(profile: dict) -> None:
+    st.markdown("<div class='benzino-panel-title'>Adaptive Learning Profile</div>", unsafe_allow_html=True)
+    metric_cols = st.columns(3)
+    with metric_cols[0]:
+        metric_card("Lessons learned from", f"{int(profile.get('closed_trade_count') or 0)} trades", "Closed User Journal outcomes")
+    with metric_cols[1]:
+        metric_card("Learning win rate", f"{float(profile.get('win_rate') or 0):.2f}%", "Closed outcomes only")
+    with metric_cols[2]:
+        metric_card("Average result", f"{float(profile.get('avg_r') or 0):+.2f}R", "Across learned trades")
+
+    render_ai_card("Current Adaptive Read", str(profile.get("recommendation_text") or "Not enough closed trades yet."))
+
+    best = pd.DataFrame(profile.get("best_patterns") or [])
+    risk = pd.DataFrame(profile.get("risk_patterns") or [])
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("<div class='benzino-panel-title'>Patterns to favour</div>", unsafe_allow_html=True)
+        if best.empty:
+            st.caption("More closed trades are needed.")
+        else:
+            st.dataframe(best[[c for c in ["dimension", "name", "trades", "win_rate", "avg_r"] if c in best.columns]], width="stretch", hide_index=True)
+    with c2:
+        st.markdown("<div class='benzino-panel-title'>Patterns to be stricter with</div>", unsafe_allow_html=True)
+        if risk.empty:
+            st.caption("More closed trades are needed.")
+        else:
+            st.dataframe(risk[[c for c in ["dimension", "name", "trades", "win_rate", "avg_r"] if c in risk.columns]], width="stretch", hide_index=True)
 
 
 def render_ai_card(title: str, body: str) -> None:
@@ -6583,11 +6967,22 @@ def render_workflow(username: str, settings: dict) -> None:
         # the currently active Phase 1/Phase 2 account, so balances never keep
         # compounding past the $1,000 / $500 targets.
         prop_sim = simulate_prop_challenge_cycles(prop_closed, prop_started_at_raw, starting, trades)
-        rebuild_prop_challenge_history_from_trades(username, challenge_tf, prop_sim.get("history", []))
+        # Persist challenge summaries and the daily ledger only when the saved
+        # ledger is empty or when a replay produces more completed challenges.
+        # This keeps the displayed Daily Challenge Ledger stable across logins.
+        stored_history_for_tf = load_prop_challenge_history(username, challenge_tf, limit=APP_TABLE_MAX_ROWS)
+        saved_count = int(len(stored_history_for_tf)) if stored_history_for_tf is not None and not stored_history_for_tf.empty else 0
+        replay_history = prop_sim.get("history", []) or []
+        stored_daily_for_tf = load_prop_challenge_daily_ledger(username, challenge_tf, limit=APP_TABLE_MAX_ROWS)
+        if (not replay_history and (stored_daily_for_tf is None or stored_daily_for_tf.empty)):
+            pass
+        elif (stored_daily_for_tf is None or stored_daily_for_tf.empty) or len(replay_history) > saved_count:
+            rebuild_prop_challenge_history_from_trades(username, challenge_tf, replay_history, prop_sim.get("all_daily", pd.DataFrame()))
+            stored_daily_for_tf = load_prop_challenge_daily_ledger(username, challenge_tf, limit=APP_TABLE_MAX_ROWS)
         active_prop = prop_sim.get("active", {})
         prop_curve = prop_sim.get("active_curve", pd.DataFrame())
         prop_all_replay = prop_sim.get("all_trades", pd.DataFrame())
-        day_summary = prop_sim.get("all_daily", pd.DataFrame())
+        day_summary = stored_daily_for_tf if stored_daily_for_tf is not None and not stored_daily_for_tf.empty else prop_sim.get("all_daily", pd.DataFrame())
         if day_summary is None or day_summary.empty:
             day_summary = prop_sim.get("active_daily", pd.DataFrame())
         current = float(active_prop.get("equity", starting) or starting)
@@ -7491,14 +7886,40 @@ def render_workflow(username: str, settings: dict) -> None:
         render_ai_card("User Journal Coaching", "\n\n".join(journal_parts))
 
     with t6:
-        workflow_commentary("Closed outcomes are the main lesson source. BENZINO now auto-saves a CLOSED_TRADE lesson for every closed trade, then lets you open or regenerate any individual lesson from the table.")
+        workflow_commentary("Closed outcomes are now the adaptive-learning source. BENZINO auto-saves missing CLOSED_TRADE lessons, builds an adaptive profile from closed outcomes, and uses that profile to guide Coach/Explain AI recommendations without changing scanner entries automatically.")
+
+        backfill_col, backfill_status_col = st.columns([1.25, 3.75], vertical_alignment="center")
+        with backfill_col:
+            run_full_lesson_backfill = st.button("Build lessons from all closed trades", key="explain_ai_full_history_backfill")
+        with backfill_status_col:
+            st.caption("Safe to rerun: existing lessons are skipped, missing CLOSED_TRADE lessons are generated from every resolved trade in Supabase.")
+        if run_full_lesson_backfill:
+            with st.spinner("Building Explain AI lessons from all historical closed trades…"):
+                full_backfill_result = backfill_all_historical_explain_ai_lessons(limit=APP_TABLE_MAX_ROWS, batch_size=1500)
+            st.success(
+                f"Historical lesson backfill complete: {full_backfill_result.get('created', 0)} new lesson(s) created, "
+                f"{full_backfill_result.get('skipped', 0)} already existed/skipped, "
+                f"{full_backfill_result.get('closed_trades', 0)} closed trade(s) reviewed."
+            )
+            if full_backfill_result.get("errors", 0):
+                st.warning(f"{full_backfill_result.get('errors')} lesson/profile item(s) could not be generated. The rest were saved.")
+            if not full_backfill_result.get("profile_saved"):
+                st.caption("Lessons were saved, but the system-wide adaptive profile was not saved. Confirm the explain_ai_adaptive_profile SQL migration has been run.")
+            st.session_state[f"explain_ai_lesson_sync_{active_username()}"] = True
 
         lesson_sync_key = f"explain_ai_lesson_sync_{active_username()}"
         if not closed_trades.empty and not st.session_state.get(lesson_sync_key):
-            sync_result = sync_missing_explain_ai_lessons(closed_trades, limit=1000)
+            sync_result = sync_missing_explain_ai_lessons(closed_trades, limit=2000)
             st.session_state[lesson_sync_key] = True
             if sync_result.get("created", 0):
                 st.caption(f"Explain AI saved {sync_result['created']} missing closed-trade lesson(s) to Supabase.")
+
+        if not closed_trades.empty:
+            adaptive_profile = build_adaptive_learning_profile(closed_trades, active_username(), settings)
+            profile_saved = save_adaptive_learning_profile(adaptive_profile)
+            render_adaptive_learning_panel(adaptive_profile)
+            if not profile_saved:
+                st.caption("Adaptive profile is visible here but was not saved. Run the explain_ai_adaptive_profile SQL migration once in Supabase.")
 
         if closed_trades.empty:
             st.info("No closed trades yet. Explain AI will populate once TP, SL, or expiry outcomes are recorded.")
