@@ -3971,6 +3971,7 @@ def render_adaptive_grade_audit_panel() -> None:
     changed = int((audit.get("original_grade", "").astype(str) != audit.get("revised_grade", "").astype(str)).sum()) if not audit.empty else 0
 
     st.markdown("<div class='benzino-panel-title'>Adaptive Grade Audit</div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         metric_card("Original Win Rate", fmt_pct(orig["win_rate"]), f"{fmt_count(orig['trades'])} closed trades")
@@ -5892,16 +5893,16 @@ def apply_theme() -> None:
     }
     [data-testid="stSidebar"] { min-width: 285px !important; width: 285px !important; }
     [data-testid="stSidebar"] .block-container { padding: 24px 18px 18px !important; }
-    .benzino-sidebar-logo-img { width: 210px !important; height:auto !important; border-radius: 0 !important; image-rendering:auto !important; }
+    .benzino-sidebar-logo-img { width: 185px !important; height:auto !important; border-radius: 0 !important; image-rendering:auto !important; }
     .benzino-sidebar-logo-only { padding: 6px 0 20px !important; }
     .side-divider { margin: 18px 0 18px !important; }
-    .benzino-refresh-wrap { margin: 4px 0 26px; }
+    .benzino-refresh-wrap { margin: 2px 0 14px; }
     .benzino-side-title { color:#8BAAB8; font-size:12px; font-weight:950; letter-spacing:1.4px; margin:10px 0 10px; text-transform:uppercase; }
-    [data-testid="stSidebar"] div[role="radiogroup"] { gap: 9px; }
+    [data-testid="stSidebar"] div[role="radiogroup"] { gap: 6px; }
     [data-testid="stSidebar"] label[data-baseweb="radio"] {
         width: 100%;
-        padding: 12px 12px;
-        margin: 0 0 8px 0;
+        padding: 9px 10px;
+        margin: 0 0 5px 0;
         border-radius: 9px;
         color: #C9D5E3 !important;
         font-weight: 850;
@@ -5913,7 +5914,7 @@ def apply_theme() -> None:
         color: #E8EDF2 !important;
     }
     [data-testid="stSidebar"] label[data-baseweb="radio"] > div:first-child { display:none !important; }
-    [data-testid="stSidebar"] [data-testid="stVerticalBlock"] > div:has(.benzino-version-pill) { margin-top: 36px !important; }
+    [data-testid="stSidebar"] [data-testid="stVerticalBlock"] > div:has(.benzino-version-pill) { margin-top: 18px !important; }
     .benzino-version-pill { border:1px solid #244363; border-radius:9px; padding:9px 12px; color:#C9D5E3; font-size:12px; text-align:center; background:#0B1A2B; }
     .benzino-page-topbar { margin-bottom: 22px; }
     .benzino-account-menu details, .benzino-control-menu details {
@@ -6146,7 +6147,7 @@ def apply_theme() -> None:
         object-fit: contain !important;
     }
     .benzino-version-pill {
-        margin-top: 64px !important;
+        margin-top: 22px !important;
     }
     [data-testid="stAppViewContainer"] > .main .block-container {
         padding-top: 0 !important;
@@ -6331,7 +6332,7 @@ def sidebar_controls(username: str, settings: dict) -> str:
         st.markdown("<div class='benzino-side-title'>Main Menu</div>", unsafe_allow_html=True)
         page = st.radio(
             "Main Menu",
-            ["Dashboard", "Asset Deep Dive", "Market News", "Workflow", "Settings"],
+            ["Dashboard", "Asset Deep Dive", "Market News", "Workflow", "Research", "Settings"],
             label_visibility="collapsed",
             key="main_navigation",
         )
@@ -6575,10 +6576,13 @@ def render_opportunity_board(username: str, settings: dict) -> None:
                 "entry", "sl", "tp", "status", "confidence", "decayed_confidence", "rr",
             ]
             tail = ["ticker", "timeframe", "created_at", "signal_id", "scan_owner"]
+            research_tail = ["revised_grade", "adaptive_grade_reason"]
             front = [c for c in priority if c in display_df.columns]
             tail_cols = [c for c in tail if c in display_df.columns]
-            rest = [c for c in display_df.columns if c not in front and c not in tail_cols]
-            display_df = display_df[front + rest + tail_cols]
+            research_cols = [c for c in research_tail if c in display_df.columns]
+            rest = [c for c in display_df.columns if c not in front and c not in tail_cols and c not in research_cols]
+            # Keep adaptive/research fields at the far end so the production scanner grade remains primary.
+            display_df = display_df[front + rest + tail_cols + research_cols]
 
             rename_map = {
                 "asset": "Asset",
@@ -7561,7 +7565,7 @@ def render_workflow(username: str, settings: dict) -> None:
     open_trades = trades[trades["status"].astype(str).str.upper().eq("OPEN")]
     closed_trades = trades[trades["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])]
 
-    workflow_tabs = st.tabs(["User Journal", "System Performance", "Prop Firm", "Capital.com", "No Trade Tracker", "Coach AI", "Adaptive Learning"])
+    workflow_tabs = st.tabs(["User Journal", "System Performance", "Prop Firm", "Capital.com"])
 
     with workflow_tabs[0]:
         uj_entries_tab, uj_history_tab = st.tabs(["Entries", "History"])
@@ -8642,7 +8646,31 @@ def render_workflow(username: str, settings: dict) -> None:
                 st.warning("Capital.com executions were imported, but BENZINO auto-traded audit rows are not available yet.")
 
 
-    with workflow_tabs[4]:
+
+
+
+
+def render_research(username: str, settings: dict) -> None:
+    page_header("Research", "Rejected setups, coaching insights, adaptive learning, and original-vs-adaptive grade research")
+    raw_df = enrich_position_sizing(load_signals_for_user(username, settings), settings)
+    df = apply_timeframe_view(raw_df, settings)
+    if df is None or df.empty:
+        st.info("No research data available yet for this timeframe. Try View performance timeframe = All, or wait for more scanner outcomes.")
+        return
+
+    df["outcome"] = df.apply(outcome_label, axis=1)
+    trades = df[df["grade"].astype(str).isin(VALID_GRADES)].copy()
+    open_trades = trades[trades["status"].astype(str).str.upper().eq("OPEN")]
+    closed_trades = trades[trades["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])]
+
+    _nt_source = df.copy()
+    if "outcome" not in _nt_source.columns:
+        _nt_source["outcome"] = _nt_source.apply(outcome_label, axis=1)
+    no_trades = _nt_source[_nt_source["status"].astype(str).str.upper().eq("SHADOW")].copy() if "status" in _nt_source.columns else pd.DataFrame()
+
+    research_tabs = st.tabs(["Rejected Setups", "Coaching Insights", "Adaptive Learning", "Original vs Adaptive"])
+
+    with research_tabs[0]:
         workflow_commentary("All signals the scanner blocked from being journaled as real trades. Includes two types: (1) directional ideas (BUY/SELL) where the grade was too weak or R:R too thin — these are hypothetically tracked against TP/SL/expiry to see if they'd have worked. (2) HOLD rows where the systems genuinely split with no directional consensus — these have no hypothetical outcome since there's no entry thesis, but they're recorded so you can see how often the scanner truly sees no edge.")
         no_trades_directional = no_trades[no_trades["signal"].astype(str).str.upper().isin(["BUY", "SELL"])].copy() if not no_trades.empty else pd.DataFrame()
         no_trades_hold = no_trades[no_trades["signal"].astype(str).str.upper().eq("HOLD")].copy() if not no_trades.empty else pd.DataFrame()
@@ -8797,7 +8825,7 @@ def render_workflow(username: str, settings: dict) -> None:
             show_status_filter=False,
         )
 
-    with workflow_tabs[5]:
+    with research_tabs[1]:
         workflow_commentary("Coach AI reviews your journal patterns and turns trade history into practical behaviour, risk, and execution guidance. The guidance is split between prop-firm discipline and broader user-journal improvement.")
 
         resolved = closed_resolved_trades(closed_trades) if not closed_trades.empty else pd.DataFrame()
@@ -8909,8 +8937,8 @@ def render_workflow(username: str, settings: dict) -> None:
         render_ai_card("Prop Firm Coaching", "\n\n".join(prop_parts))
         render_ai_card("User Journal Coaching", "\n\n".join(journal_parts))
 
-    with workflow_tabs[6]:
-        workflow_commentary("Adaptive Learning shows the latest saved lessons, adaptive profile, and original-vs-revised grade audit. It refreshes only when you click Refresh Data, so switching Workflow pages stays instant.")
+    with research_tabs[2]:
+        workflow_commentary("Adaptive Learning summarises what BENZINO has learned from closed trades. It reads saved lessons and profiles only; rebuilds happen when you click Refresh Data.")
 
         if st.session_state.get("adaptive_learning_refresh_error"):
             st.caption("Last adaptive refresh warning: " + str(st.session_state.get("adaptive_learning_refresh_error")))
@@ -8923,12 +8951,10 @@ def render_workflow(username: str, settings: dict) -> None:
                 render_adaptive_learning_panel(adaptive_profile)
             else:
                 st.info("No saved adaptive profile yet. Click Refresh Data once to build lessons and the adaptive profile from closed trades.")
-            render_adaptive_grade_audit_panel()
 
-            # Historical per-trade lessons are intentionally kept in Supabase.
-            # The user-facing Adaptive Learning page shows the holistic profile and audit, not raw lesson rows.
-
-
+    with research_tabs[3]:
+        workflow_commentary("Original vs Adaptive compares the production scanner grade against the research-only revised grade. This does not change the signal engine or live trade selection.")
+        render_adaptive_grade_audit_panel()
 
 
 def user_performance_for_admin(username: str, user_settings: dict | None = None) -> dict:
@@ -9659,6 +9685,8 @@ def main() -> None:
         render_market_news(username, settings)
     elif page == "Workflow":
         render_workflow(username, settings)
+    elif page == "Research":
+        render_research(username, settings)
     else:
         render_settings(username, settings)
 
