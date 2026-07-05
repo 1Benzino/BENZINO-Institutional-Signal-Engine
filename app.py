@@ -3564,6 +3564,475 @@ def lesson_json_to_flat_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+GRADE_ORDER_ADAPTIVE = ["NO TRADE", "C", "B", "A", "A+"]
+GRADE_TO_SCORE_ADAPTIVE = {g: i for i, g in enumerate(GRADE_ORDER_ADAPTIVE)}
+
+
+def _adaptive_grade_shift_from_stats(trades: int, win_rate: float, avg_r: float) -> int:
+    """Translate historical lesson performance into a conservative grade adjustment."""
+    try:
+        trades = int(trades or 0)
+        win_rate = float(win_rate or 0.0)
+        avg_r = float(avg_r or 0.0)
+    except Exception:
+        return 0
+    if trades < 20:
+        return 0
+    # Strong evidence: allow a two-step downgrade only when the learned pattern is clearly poor.
+    if trades >= 30 and win_rate < 38 and avg_r < -0.25:
+        return -2
+    if win_rate < 45 or avg_r < -0.10:
+        return -1
+    if trades >= 30 and win_rate >= 62 and avg_r >= 0.45:
+        return 1
+    if trades >= 50 and win_rate >= 68 and avg_r >= 0.70:
+        return 1
+    return 0
+
+
+def _apply_adaptive_grade_shift(original_grade: str, shift: int) -> str:
+    grade = str(original_grade or "").strip().upper()
+    if grade not in GRADE_TO_SCORE_ADAPTIVE:
+        return grade or "—"
+    if grade == "NO TRADE":
+        return grade
+    new_idx = max(0, min(len(GRADE_ORDER_ADAPTIVE) - 1, GRADE_TO_SCORE_ADAPTIVE[grade] + int(shift or 0)))
+    return GRADE_ORDER_ADAPTIVE[new_idx]
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_adaptive_lesson_pattern_stats() -> pd.DataFrame:
+    """Load structured closed-trade lessons and aggregate them into reusable pattern statistics.
+
+    This is intentionally an overlay. It does not change scanner_signals.grade or the scanner engine.
+    """
+    if not explain_ai_lessons_supports_json():
+        return pd.DataFrame()
+    lessons = read_df(
+        """
+        SELECT lesson_json
+        FROM explain_ai_lessons
+        WHERE lesson_type = 'CLOSED_TRADE'
+          AND lesson_json IS NOT NULL
+        """
+    )
+    if lessons.empty or "lesson_json" not in lessons.columns:
+        return pd.DataFrame()
+
+    rows = []
+    for val in lessons["lesson_json"].tolist():
+        obj = parse_jsonish(val) or {}
+        if not isinstance(obj, dict):
+            continue
+        features = obj.get("features") or obj.get("fingerprint") or {}
+        outcome = obj.get("outcome") or {}
+        learning = obj.get("learning_signal") or {}
+        r = pd.to_numeric(outcome.get("r_multiple"), errors="coerce")
+        if pd.isna(r):
+            continue
+        rows.append({
+            "asset": str(features.get("asset") or "").upper(),
+            "timeframe": str(features.get("timeframe") or "").lower(),
+            "session": str(features.get("session") or ""),
+            "grade": str(features.get("grade") or "").upper(),
+            "signal": str(features.get("signal") or "").upper(),
+            "regime": str(features.get("regime") or ""),
+            "setup_type": str(features.get("setup_type") or "General confluence"),
+            "r_multiple": float(r),
+            "learning_direction": str(learning.get("direction") or ""),
+        })
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    dimensions = [
+        ["asset", "timeframe", "session", "grade", "setup_type"],
+        ["asset", "timeframe", "grade", "setup_type"],
+        ["asset", "session", "grade"],
+        ["session", "grade", "setup_type"],
+        ["asset", "grade"],
+        ["timeframe", "grade"],
+        ["grade"],
+    ]
+    out = []
+    for dims in dimensions:
+        usable = [d for d in dims if d in df.columns]
+        if not usable:
+            continue
+        grouped = df.groupby(usable, dropna=False)
+        for key, g in grouped:
+            if not isinstance(key, tuple):
+                key = (key,)
+            record = {"dimension_key": "|".join(usable), "sample_size": int(len(g))}
+            record.update({d: str(v) for d, v in zip(usable, key)})
+            wins = int((g["r_multiple"] > 0).sum())
+            record["win_rate"] = round((wins / max(1, len(g))) * 100.0, 2)
+            record["avg_r"] = round(float(g["r_multiple"].mean()), 4)
+            record["shift"] = _adaptive_grade_shift_from_stats(record["sample_size"], record["win_rate"], record["avg_r"])
+            out.append(record)
+    return pd.DataFrame(out)
+
+
+def _adaptive_signal_fingerprint(row: pd.Series) -> dict:
+    try:
+        session = session_name(row.get("created_at"))
+    except Exception:
+        session = "Unknown"
+    try:
+        setup_type = classify_setup_type(row)
+    except Exception:
+        setup_type = "General confluence"
+    return {
+        "asset": str(row.get("asset", "") or "").upper(),
+        "timeframe": str(row.get("timeframe", "") or "").lower(),
+        "session": str(session or ""),
+        "grade": str(row.get("grade", "") or "").upper(),
+        "signal": str(row.get("signal", "") or "").upper(),
+        "regime": str(row.get("regime", "") or ""),
+        "setup_type": str(setup_type or "General confluence"),
+    }
+
+
+def _match_adaptive_stats(stats: pd.DataFrame, fp: dict) -> dict | None:
+    if stats is None or stats.empty or not isinstance(fp, dict):
+        return None
+    priority = [
+        ["asset", "timeframe", "session", "grade", "setup_type"],
+        ["asset", "timeframe", "grade", "setup_type"],
+        ["asset", "session", "grade"],
+        ["session", "grade", "setup_type"],
+        ["asset", "grade"],
+        ["timeframe", "grade"],
+        ["grade"],
+    ]
+    for dims in priority:
+        dimension_key = "|".join(dims)
+        sub = stats[stats.get("dimension_key", "").astype(str).eq(dimension_key)].copy()
+        if sub.empty:
+            continue
+        mask = pd.Series(True, index=sub.index)
+        for d in dims:
+            if d not in sub.columns:
+                mask &= False
+            else:
+                mask &= sub[d].astype(str).str.upper().eq(str(fp.get(d, "")).upper())
+        sub = sub[mask].copy()
+        if sub.empty:
+            continue
+        sub["_abs_shift"] = pd.to_numeric(sub.get("shift", 0), errors="coerce").fillna(0).abs()
+        sub["sample_size"] = pd.to_numeric(sub.get("sample_size", 0), errors="coerce").fillna(0)
+        sub = sub.sort_values(["_abs_shift", "sample_size"], ascending=[False, False])
+        row = sub.iloc[0].to_dict()
+        if int(row.get("sample_size") or 0) >= 20:
+            return row
+    return None
+
+
+def revised_grade_for_signal(row: pd.Series, stats: pd.DataFrame | None = None) -> tuple[str, str]:
+    """Return a separate adaptive grade and reason without altering the scanner grade."""
+    original = str(row.get("grade", "") or "").strip().upper()
+    signal = str(row.get("signal", "") or "").strip().upper()
+    if original not in {"A+", "A", "B", "C", "NO TRADE"}:
+        return original or "—", "No scanner grade available."
+    if signal not in {"BUY", "SELL"}:
+        return original, "Adaptive overlay only applies to BUY/SELL setups."
+    stats = stats if stats is not None else load_adaptive_lesson_pattern_stats()
+    match = _match_adaptive_stats(stats, _adaptive_signal_fingerprint(row))
+    if not match:
+        return original, "No reliable 20+ trade lesson sample yet."
+    shift = int(pd.to_numeric(match.get("shift"), errors="coerce") or 0)
+    revised = _apply_adaptive_grade_shift(original, shift)
+    sample = int(pd.to_numeric(match.get("sample_size"), errors="coerce") or 0)
+    wr = float(pd.to_numeric(match.get("win_rate"), errors="coerce") or 0.0)
+    avg_r = float(pd.to_numeric(match.get("avg_r"), errors="coerce") or 0.0)
+    dim = str(match.get("dimension_key") or "pattern").replace("|", " + ")
+    if shift > 0:
+        action = "upgraded"
+    elif shift < 0:
+        action = "downgraded"
+    else:
+        action = "kept"
+    reason = f"{action.title()} by adaptive lessons: {dim}, {sample} closed trades, {wr:.2f}% WR, {avg_r:+.2f}R avg."
+    return revised, reason
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def adaptive_grade_audit_ready() -> bool:
+    """Return True when the adaptive_grade_audit research table exists."""
+    try:
+        df = read_df(
+            """
+            SELECT 1 AS ok
+            FROM information_schema.tables
+            WHERE table_name = 'adaptive_grade_audit'
+            LIMIT 1
+            """
+        )
+        return not df.empty
+    except Exception:
+        return False
+
+
+def _adaptive_trade_allowed(grade: str) -> bool:
+    return str(grade or "").strip().upper() in {"A+", "A", "B", "C"}
+
+
+def _adaptive_outcome_label(row: pd.Series) -> str:
+    status = str(row.get("status", "") or "").upper()
+    exit_reason = str(row.get("exit_reason", "") or "").upper()
+    r = pd.to_numeric(row.get("r_multiple"), errors="coerce")
+    if "TP" in status or exit_reason == "TP" or (pd.notna(r) and float(r) > 0):
+        return "WIN"
+    if "SL" in status or exit_reason == "SL" or (pd.notna(r) and float(r) < 0):
+        return "LOSS"
+    if "EXPIRED" in status or exit_reason == "EXPIRY":
+        return "EXPIRED"
+    return "OPEN"
+
+
+def sync_adaptive_grade_audit(limit: int = APP_TABLE_MAX_ROWS) -> dict:
+    """Persist the original-vs-adaptive grade decision for signal research.
+
+    This is a research ledger only. It never updates scanner_signals.grade and
+    never changes the scanner's entry logic. The row is updated when the trade
+    later closes so the Lessons page can compare original vs adaptive outcomes.
+    """
+    result = {"ready": False, "processed": 0, "upserts": 0, "errors": 0}
+    if not adaptive_grade_audit_ready():
+        return result
+    result["ready"] = True
+    df = read_df(
+        """
+        SELECT signal_id, scan_owner, created_at, asset, timeframe, signal, grade,
+               regime, reason, strategy_votes, mtf_context, status, exit_reason,
+               exit_at, r_multiple, entry, sl, tp
+        FROM scanner_signals
+        WHERE signal IN ('BUY', 'SELL')
+          AND grade IN ('A+', 'A', 'B', 'C', 'NO TRADE')
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (int(limit),),
+    )
+    if df.empty:
+        return result
+    stats = load_adaptive_lesson_pattern_stats()
+    for col in ["created_at", "exit_at"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce", utc=True)
+    for _, row in df.iterrows():
+        try:
+            sid = str(row.get("signal_id") or "").strip()
+            if not sid:
+                continue
+            revised, reason = revised_grade_for_signal(row, stats)
+            fp = _adaptive_signal_fingerprint(row)
+            original_grade = str(row.get("grade") or "").upper()
+            original_allowed = _adaptive_trade_allowed(original_grade)
+            adaptive_allowed = _adaptive_trade_allowed(revised)
+            r = pd.to_numeric(row.get("r_multiple"), errors="coerce")
+            r_value = float(r) if pd.notna(r) else None
+            outcome = _adaptive_outcome_label(row)
+            original_r = r_value if original_allowed and outcome != "OPEN" else None
+            adaptive_r = r_value if adaptive_allowed and outcome != "OPEN" else None
+            og_score = GRADE_TO_SCORE_ADAPTIVE.get(original_grade, None)
+            rg_score = GRADE_TO_SCORE_ADAPTIVE.get(str(revised).upper(), None)
+            confidence_adjustment = None
+            if og_score is not None and rg_score is not None:
+                confidence_adjustment = float(rg_score - og_score)
+            execute(
+                """
+                INSERT INTO adaptive_grade_audit(
+                    signal_id, scan_owner, asset, timeframe, session, regime, setup_type, signal,
+                    original_grade, revised_grade, adaptive_reason, confidence_adjustment,
+                    original_trade_allowed, adaptive_trade_allowed, outcome, realised_r,
+                    original_r, adaptive_r, profile_version, signal_created_at, closed_at, updated_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1,%s,%s,NOW())
+                ON CONFLICT (signal_id, profile_version) DO UPDATE SET
+                    scan_owner = EXCLUDED.scan_owner,
+                    asset = EXCLUDED.asset,
+                    timeframe = EXCLUDED.timeframe,
+                    session = EXCLUDED.session,
+                    regime = EXCLUDED.regime,
+                    setup_type = EXCLUDED.setup_type,
+                    signal = EXCLUDED.signal,
+                    original_grade = EXCLUDED.original_grade,
+                    revised_grade = EXCLUDED.revised_grade,
+                    adaptive_reason = EXCLUDED.adaptive_reason,
+                    confidence_adjustment = EXCLUDED.confidence_adjustment,
+                    original_trade_allowed = EXCLUDED.original_trade_allowed,
+                    adaptive_trade_allowed = EXCLUDED.adaptive_trade_allowed,
+                    outcome = EXCLUDED.outcome,
+                    realised_r = EXCLUDED.realised_r,
+                    original_r = EXCLUDED.original_r,
+                    adaptive_r = EXCLUDED.adaptive_r,
+                    signal_created_at = EXCLUDED.signal_created_at,
+                    closed_at = EXCLUDED.closed_at,
+                    updated_at = NOW()
+                """,
+                (
+                    sid,
+                    str(row.get("scan_owner") or ""),
+                    fp.get("asset"),
+                    fp.get("timeframe"),
+                    fp.get("session"),
+                    fp.get("regime"),
+                    fp.get("setup_type"),
+                    fp.get("signal"),
+                    original_grade,
+                    str(revised).upper(),
+                    str(reason or ""),
+                    confidence_adjustment,
+                    bool(original_allowed),
+                    bool(adaptive_allowed),
+                    outcome,
+                    r_value,
+                    original_r,
+                    adaptive_r,
+                    _iso_safe(row.get("created_at")),
+                    _iso_safe(row.get("exit_at")),
+                ),
+            )
+            result["processed"] += 1
+            result["upserts"] += 1
+        except Exception:
+            result["errors"] += 1
+            continue
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    return result
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_adaptive_grade_audit() -> pd.DataFrame:
+    """Load the persisted adaptive-vs-original research ledger."""
+    if not adaptive_grade_audit_ready():
+        return pd.DataFrame()
+    df = read_df(
+        """
+        SELECT *
+        FROM adaptive_grade_audit
+        ORDER BY COALESCE(closed_at, signal_created_at, created_at) DESC NULLS LAST
+        LIMIT %s
+        """,
+        (APP_TABLE_MAX_ROWS,),
+    )
+    if df.empty:
+        return df
+    return numeric_cols(df, ["confidence_adjustment", "realised_r", "original_r", "adaptive_r"])
+
+
+def _audit_summary(df: pd.DataFrame, r_col: str, allowed_col: str) -> dict:
+    if df is None or df.empty or r_col not in df.columns:
+        return {"trades": 0, "win_rate": 0.0, "avg_r": 0.0, "total_r": 0.0}
+    sub = df.copy()
+    if allowed_col in sub.columns:
+        sub = sub[sub[allowed_col].astype(bool)].copy()
+    sub[r_col] = pd.to_numeric(sub[r_col], errors="coerce")
+    sub = sub[sub[r_col].notna()].copy()
+    if sub.empty:
+        return {"trades": 0, "win_rate": 0.0, "avg_r": 0.0, "total_r": 0.0}
+    wins = int((sub[r_col] > 0).sum())
+    trades = int(len(sub))
+    return {
+        "trades": trades,
+        "win_rate": round(wins / max(1, trades) * 100.0, 2),
+        "avg_r": round(float(sub[r_col].mean()), 3),
+        "total_r": round(float(sub[r_col].sum()), 3),
+    }
+
+
+def render_adaptive_grade_audit_panel() -> None:
+    """Lessons page research view: original scanner grade vs adaptive grade."""
+    if not adaptive_grade_audit_ready():
+        st.info("Adaptive grade audit table is not available yet. Run the adaptive_grade_audit SQL migration once in Supabase.")
+        return
+
+    try:
+        if not st.session_state.get("adaptive_grade_audit_synced_once", False):
+            sync_result = sync_adaptive_grade_audit(limit=APP_TABLE_MAX_ROWS)
+            st.session_state.adaptive_grade_audit_synced_once = True
+            if sync_result.get("upserts", 0):
+                st.caption(f"Adaptive grade audit synced {sync_result.get('upserts', 0)} signal row(s).")
+    except Exception as exc:
+        st.caption(f"Adaptive grade audit sync skipped: {exc}")
+
+    audit = load_adaptive_grade_audit()
+    if audit.empty:
+        st.info("No adaptive grade audit rows yet. They will appear as generated signals are processed.")
+        return
+
+    closed = audit.copy()
+    closed["realised_r"] = pd.to_numeric(closed.get("realised_r"), errors="coerce")
+    closed = closed[closed["realised_r"].notna()].copy()
+    orig = _audit_summary(closed, "original_r", "original_trade_allowed")
+    adap = _audit_summary(closed, "adaptive_r", "adaptive_trade_allowed")
+    changed = int((audit.get("original_grade", "").astype(str) != audit.get("revised_grade", "").astype(str)).sum()) if not audit.empty else 0
+
+    st.markdown("<div class='benzino-panel-title'>Adaptive Grade Audit</div>", unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        metric_card("Original Win Rate", f"{orig['win_rate']:.2f}%", f"{orig['trades']} closed trades")
+    with c2:
+        metric_card("Adaptive Win Rate", f"{adap['win_rate']:.2f}%", f"{adap['trades']} closed trades")
+    with c3:
+        metric_card("Original Avg R", f"{orig['avg_r']:+.2f}R", f"Total {orig['total_r']:+.2f}R")
+    with c4:
+        metric_card("Adaptive Avg R", f"{adap['avg_r']:+.2f}R", f"{changed} revised grades")
+
+    if not closed.empty:
+        impact = adap["total_r"] - orig["total_r"]
+        render_ai_card(
+            "Adaptive Research Readout",
+            f"Across closed audited signals, the original scanner path totals {orig['total_r']:+.2f}R while the adaptive revised-grade path totals {adap['total_r']:+.2f}R. The current research delta is {impact:+.2f}R. This is a measurement layer only; it does not change scanner entries."
+        )
+
+    transitions = audit.copy()
+    if {"original_grade", "revised_grade"}.issubset(transitions.columns):
+        transitions["Transition"] = transitions["original_grade"].astype(str) + " → " + transitions["revised_grade"].astype(str)
+        trans = transitions.groupby("Transition", dropna=False).size().reset_index(name="Count").sort_values("Count", ascending=False).head(12)
+        if not trans.empty:
+            st.markdown("<div class='benzino-panel-title'>Grade Transition Analysis</div>", unsafe_allow_html=True)
+            st.dataframe(trans, width="stretch", hide_index=True)
+
+    recent = audit.copy().head(250)
+    if not recent.empty:
+        recent["Date"] = pd.to_datetime(recent.get("signal_created_at"), errors="coerce", utc=True).dt.tz_convert(DEFAULT_TIMEZONE).dt.strftime("%d %b %Y %H:%M")
+        recent["Result"] = recent.get("outcome", "").astype(str)
+        recent["R"] = pd.to_numeric(recent.get("realised_r"), errors="coerce").map(lambda x: f"{x:+.2f}R" if pd.notna(x) else "Open")
+        cols = {
+            "Date": "Date", "asset": "Asset", "timeframe": "Timeframe", "session": "Session",
+            "setup_type": "Setup Type", "original_grade": "Original Grade", "revised_grade": "Revised Grade",
+            "Result": "Outcome", "R": "R", "adaptive_reason": "Adaptive Reason", "signal_id": "Signal ID",
+        }
+        table = recent[[c for c in cols.keys() if c in recent.columns]].rename(columns=cols)
+        st.markdown("<div class='benzino-panel-title'>Recent Adaptive Decisions</div>", unsafe_allow_html=True)
+        if AgGrid is not None and GridOptionsBuilder is not None:
+            gb = GridOptionsBuilder.from_dataframe(table)
+            gb.configure_default_column(sortable=True, filter=True, resizable=True, wrapText=True, autoHeight=False)
+            gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=10)
+            gb.configure_grid_options(rowHeight=64, headerHeight=44, suppressMenuHide=True, domLayout="normal", enableCellTextSelection=True)
+            renderers = aggrid_badge_renderers()
+            for _col, _renderer in {"Original Grade": "grade", "Revised Grade": "grade", "Outcome": "outcome"}.items():
+                if _col in table.columns and _renderer in renderers:
+                    gb.configure_column(_col, cellRenderer=renderers[_renderer])
+            if "Asset" in table.columns:
+                gb.configure_column("Asset", pinned="left")
+            AgGrid(
+                table,
+                gridOptions=gb.build(),
+                height=560,
+                fit_columns_on_grid_load=False,
+                theme="balham",
+                allow_unsafe_jscode=True,
+                custom_css=benzino_aggrid_css(),
+                key="adaptive_grade_audit_aggrid",
+            )
+        else:
+            st.dataframe(table, width="stretch", hide_index=True)
+
+
 def save_explain_ai_lesson(signal_id: str, scan_owner: str, lesson_text: str, lesson_type: str = "CLOSED_TRADE", lesson_json: dict | None = None) -> None:
     signal_id = str(signal_id or "").strip()
     scan_owner = str(scan_owner or "").strip()
@@ -5849,6 +6318,16 @@ def render_opportunity_board(username: str, settings: dict) -> None:
                     axis=1,
                 )
 
+            # Adaptive overlay: original scanner grade stays untouched; Revised Grade is learned from stored closed-trade lessons.
+            try:
+                adaptive_stats = load_adaptive_lesson_pattern_stats()
+                revised_pairs = display_df.apply(lambda r: revised_grade_for_signal(r, adaptive_stats), axis=1)
+                display_df["revised_grade"] = [x[0] for x in revised_pairs]
+                display_df["adaptive_grade_reason"] = [x[1] for x in revised_pairs]
+            except Exception:
+                display_df["revised_grade"] = display_df.get("grade", "—")
+                display_df["adaptive_grade_reason"] = "Adaptive overlay unavailable."
+
             # Apply toolbar filters before formatting/renaming.
             if signal_filter != "All" and "signal" in display_df.columns:
                 display_df = display_df[display_df["signal"].astype(str).str.upper().eq(signal_filter)].copy()
@@ -5862,7 +6341,7 @@ def render_opportunity_board(username: str, settings: dict) -> None:
 
             # Required business-readable order. Everything else remains visible after the core fields.
             priority = [
-                "asset", "signal", "grade", "age",
+                "asset", "signal", "grade", "revised_grade", "age",
                 "entry", "sl", "tp", "status", "confidence", "decayed_confidence", "rr",
             ]
             tail = ["ticker", "timeframe", "created_at", "signal_id", "scan_owner"]
@@ -5876,6 +6355,8 @@ def render_opportunity_board(username: str, settings: dict) -> None:
                 "timeframe": "Timeframe",
                 "signal": "Signal",
                 "grade": "Grade",
+                "revised_grade": "Revised Grade",
+                "adaptive_grade_reason": "Adaptive Reason",
                 "age": "Age",
                 "entry": "Entry",
                 "sl": "SL",
@@ -6029,6 +6510,8 @@ def render_opportunity_board(username: str, settings: dict) -> None:
                     "Timeframe": 110,
                     "Signal": 112,
                     "Grade": 94,
+                    "Revised Grade": 128,
+                    "Adaptive Reason": 290,
                     "Age": 128,
                     "Entry": 118,
                     "SL": 118,
@@ -6049,6 +6532,8 @@ def render_opportunity_board(username: str, settings: dict) -> None:
                     gb.configure_column("Signal", cellRenderer=signal_renderer)
                 if "Grade" in display_df.columns:
                     gb.configure_column("Grade", cellRenderer=grade_renderer)
+                if "Revised Grade" in display_df.columns:
+                    gb.configure_column("Revised Grade", cellRenderer=grade_renderer)
                 if "Status" in display_df.columns:
                     gb.configure_column("Status", cellRenderer=status_renderer)
                 for numeric_col in ["Entry", "SL", "TP", "Confidence", "Decayed Confidence", "RR"]:
@@ -6150,6 +6635,8 @@ def render_opportunity_board(username: str, settings: dict) -> None:
                     html_df["Signal"] = html_df["Signal"].apply(_signal)
                 if "Grade" in html_df.columns:
                     html_df["Grade"] = html_df["Grade"].apply(_badge_grade)
+                if "Revised Grade" in html_df.columns:
+                    html_df["Revised Grade"] = html_df["Revised Grade"].apply(_badge_grade)
                 if "Status" in html_df.columns:
                     html_df["Status"] = html_df["Status"].apply(_badge_status)
 
@@ -8206,6 +8693,7 @@ def render_workflow(username: str, settings: dict) -> None:
             adaptive_profile = build_adaptive_learning_profile(load_all_closed_trades_for_explain_ai(limit=APP_TABLE_MAX_ROWS), active_username(), settings)
             profile_saved = save_adaptive_learning_profile(adaptive_profile)
             render_adaptive_learning_panel(adaptive_profile)
+            render_adaptive_grade_audit_panel()
             if not profile_saved:
                 st.caption("Adaptive profile is visible here but was not saved. Run the explain_ai_adaptive_profile SQL migration once in Supabase.")
 
