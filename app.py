@@ -3911,9 +3911,12 @@ def load_adaptive_grade_audit() -> pd.DataFrame:
         return pd.DataFrame()
     df = read_df(
         """
-        SELECT *
-        FROM adaptive_grade_audit
-        ORDER BY COALESCE(closed_at, signal_created_at, created_at) DESC NULLS LAST
+        SELECT
+            a.*,
+            COALESCE(NULLIF(ss.display_id, ''), a.signal_id) AS display_id
+        FROM adaptive_grade_audit a
+        LEFT JOIN scanner_signals ss ON ss.signal_id = a.signal_id
+        ORDER BY COALESCE(a.closed_at, a.signal_created_at, a.created_at) DESC NULLS LAST
         LIMIT %s
         """,
         (APP_TABLE_MAX_ROWS,),
@@ -4005,9 +4008,10 @@ def render_adaptive_grade_audit_panel() -> None:
         cols = {
             "Date": "Date", "asset": "Asset", "timeframe": "Timeframe", "session": "Session",
             "setup_type": "Setup Type", "original_grade": "Original Grade", "revised_grade": "Revised Grade",
-            "Result": "Outcome", "R": "R", "adaptive_reason": "Adaptive Reason", "signal_id": "Signal ID",
+            "Result": "Outcome", "R": "R", "adaptive_reason": "Adaptive Reason", "display_id": "Signal ID",
         }
         table = recent[[c for c in cols.keys() if c in recent.columns]].rename(columns=cols)
+        table = table.loc[:, ~table.columns.duplicated()].copy()
         st.markdown("<div class='benzino-panel-title'>Recent Adaptive Decisions</div>", unsafe_allow_html=True)
         if AgGrid is not None and GridOptionsBuilder is not None:
             gb = GridOptionsBuilder.from_dataframe(table)
@@ -6480,7 +6484,9 @@ def render_opportunity_board(username: str, settings: dict) -> None:
         if "display_id" in generated.columns:
             display = generated["display_id"].astype(str).replace({"nan": "", "None": "", "NaT": ""})
             fallback = generated["signal_id"].astype(str) if "signal_id" in generated.columns else display
-            generated["signal_id"] = display.where(display.str.strip().ne(""), fallback)
+            generated["display_signal_id"] = display.where(display.str.strip().ne(""), fallback)
+        elif "signal_id" in generated.columns:
+            generated["display_signal_id"] = generated["signal_id"].astype(str)
         if "created_at" in generated.columns:
             generated = generated.sort_values("created_at", ascending=False)
         generated = generated.copy()
@@ -6572,17 +6578,21 @@ def render_opportunity_board(username: str, settings: dict) -> None:
 
             # Required business-readable order. Everything else remains visible after the core fields.
             priority = [
-                "asset", "signal", "grade", "revised_grade", "age",
+                "asset", "signal", "grade", "age",
                 "entry", "sl", "tp", "status", "confidence", "decayed_confidence", "rr",
             ]
-            tail = ["ticker", "timeframe", "created_at", "signal_id", "scan_owner"]
-            research_tail = ["revised_grade", "adaptive_grade_reason"]
+            # Raw signal_id is kept internally for joins, but the user-facing table shows the
+            # Supabase scanner_signals.display_id at the very end.
+            hidden_internal = ["signal_id", "display_id"]
+            tail = ["ticker", "timeframe", "created_at", "scan_owner"]
+            research_tail = ["revised_grade", "adaptive_grade_reason", "display_signal_id"]
             front = [c for c in priority if c in display_df.columns]
             tail_cols = [c for c in tail if c in display_df.columns]
             research_cols = [c for c in research_tail if c in display_df.columns]
-            rest = [c for c in display_df.columns if c not in front and c not in tail_cols and c not in research_cols]
-            # Keep adaptive/research fields at the far end so the production scanner grade remains primary.
+            rest = [c for c in display_df.columns if c not in front and c not in tail_cols and c not in research_cols and c not in hidden_internal]
+            # Keep adaptive/research fields and the user-facing Benzino Signal ID at the far end so the production scanner grade remains primary.
             display_df = display_df[front + rest + tail_cols + research_cols]
+            display_df = display_df.loc[:, ~display_df.columns.duplicated()].copy()
 
             rename_map = {
                 "asset": "Asset",
@@ -6601,10 +6611,12 @@ def render_opportunity_board(username: str, settings: dict) -> None:
                 "status": "Status",
                 "ticker": "Ticker",
                 "created_at": "Created At",
+                "display_signal_id": "Signal ID",
                 "signal_id": "Signal ID",
                 "scan_owner": "Scan Owner",
             }
             display_df = display_df.rename(columns=rename_map)
+            display_df = display_df.loc[:, ~display_df.columns.duplicated()].copy()
             display_df = sort_signal_rows_newest_first(display_df)
 
             # Search across the final display table.
