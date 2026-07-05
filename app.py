@@ -3973,19 +3973,19 @@ def render_adaptive_grade_audit_panel() -> None:
     st.markdown("<div class='benzino-panel-title'>Adaptive Grade Audit</div>", unsafe_allow_html=True)
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        metric_card("Original Win Rate", f"{orig['win_rate']:.2f}%", f"{orig['trades']} closed trades")
+        metric_card("Original Win Rate", fmt_pct(orig["win_rate"]), f"{fmt_count(orig['trades'])} closed trades")
     with c2:
-        metric_card("Adaptive Win Rate", f"{adap['win_rate']:.2f}%", f"{adap['trades']} closed trades")
+        metric_card("Adaptive Win Rate", fmt_pct(adap["win_rate"]), f"{fmt_count(adap['trades'])} closed trades")
     with c3:
-        metric_card("Original Avg R", f"{orig['avg_r']:+.2f}R", f"Total {orig['total_r']:+.2f}R")
+        metric_card("Original Avg R", fmt_r(orig["avg_r"]), f"Total {fmt_r(orig['total_r'])}")
     with c4:
-        metric_card("Adaptive Avg R", f"{adap['avg_r']:+.2f}R", f"{changed} revised grades")
+        metric_card("Adaptive Avg R", fmt_r(adap["avg_r"]), f"{fmt_count(changed)} revised grades")
 
     if not closed.empty:
         impact = adap["total_r"] - orig["total_r"]
         render_ai_card(
             "Adaptive Research Readout",
-            f"Across closed audited signals, the original scanner path totals {orig['total_r']:+.2f}R while the adaptive revised-grade path totals {adap['total_r']:+.2f}R. The current research delta is {impact:+.2f}R. This is a measurement layer only; it does not change scanner entries."
+            f"Across closed audited signals, the original scanner path totals {fmt_r(orig['total_r'])} while the adaptive revised-grade path totals {fmt_r(adap['total_r'])}. The current research delta is {fmt_r(impact)}. This is a measurement layer only; it does not change scanner entries."
         )
 
     transitions = audit.copy()
@@ -4642,40 +4642,108 @@ def save_adaptive_learning_profile(profile: dict) -> bool:
         return False
 
 
+
+def fmt_count(value) -> str:
+    try:
+        return f"{int(float(value or 0)):,}"
+    except Exception:
+        return "0"
+
+
+def fmt_pct(value) -> str:
+    try:
+        return f"{float(value or 0):,.2f}%"
+    except Exception:
+        return "0.00%"
+
+
+def fmt_r(value) -> str:
+    try:
+        return f"{float(value or 0):+,.2f}R"
+    except Exception:
+        return "+0.00R"
+
+
+def fmt_currency(value) -> str:
+    try:
+        return f"${float(value or 0):,.2f}"
+    except Exception:
+        return "$0.00"
+
+
+def _format_learning_rows(rows, include_dimension: bool = True) -> pd.DataFrame:
+    df = pd.DataFrame(rows or [])
+    if df.empty:
+        return df
+    for col in ["trades", "Count"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).map(lambda x: f"{int(x):,}")
+    if "win_rate" in df.columns:
+        df["win_rate"] = pd.to_numeric(df["win_rate"], errors="coerce").map(lambda x: f"{x:,.2f}%" if pd.notna(x) else "")
+    if "avg_r" in df.columns:
+        df["avg_r"] = pd.to_numeric(df["avg_r"], errors="coerce").map(lambda x: f"{x:+,.2f}R" if pd.notna(x) else "")
+    preferred = ["dimension", "name", "trades", "win_rate", "avg_r"] if include_dimension else ["name", "trades", "win_rate", "avg_r"]
+    return df[[c for c in preferred if c in df.columns]].rename(columns={
+        "dimension": "Pattern", "name": "What the system sees", "trades": "Trades", "win_rate": "Win Rate", "avg_r": "Avg R"
+    })
+
+
+def build_holistic_adaptive_read(profile: dict) -> str:
+    best = list(profile.get("best_patterns") or [])[:3]
+    risk = list(profile.get("risk_patterns") or [])[:3]
+    sessions = list(profile.get("session_profile") or [])
+    grades = list(profile.get("grade_profile") or [])
+    timeframes = list(profile.get("timeframe_profile") or [])
+    lines = []
+    lines.append(f"The adaptive layer has learned from **{fmt_count(profile.get('closed_trade_count'))} closed trades**. Overall, learned outcomes are running at **{fmt_pct(profile.get('win_rate'))}** with an average result of **{fmt_r(profile.get('avg_r'))}**.")
+    if best:
+        fav = "; ".join([f"{b.get('dimension','Pattern')} {b.get('name','')} ({fmt_count(b.get('trades'))} trades, {fmt_pct(b.get('win_rate'))}, {fmt_r(b.get('avg_r'))})" for b in best if b.get('name')])
+        if fav:
+            lines.append(f"**What is working:** {fav}.")
+    if risk:
+        caut = "; ".join([f"{r.get('dimension','Pattern')} {r.get('name','')} ({fmt_count(r.get('trades'))} trades, {fmt_pct(r.get('win_rate'))}, {fmt_r(r.get('avg_r'))})" for r in risk if r.get('name')])
+        if caut:
+            lines.append(f"**Where the system should be stricter:** {caut}.")
+    if sessions:
+        strongest_session = max(sessions, key=lambda x: float(x.get('avg_r') or 0))
+        lines.append(f"**Session read:** the strongest session profile so far is **{strongest_session.get('name','')}**, based on {fmt_count(strongest_session.get('trades'))} trades.")
+    if grades:
+        strongest_grade = max(grades, key=lambda x: float(x.get('avg_r') or 0))
+        lines.append(f"**Grade read:** **{strongest_grade.get('name','')}** setups currently have the best learned expectancy.")
+    if timeframes:
+        strongest_tf = max(timeframes, key=lambda x: float(x.get('avg_r') or 0))
+        lines.append(f"**Timeframe read:** **{strongest_tf.get('name','')}** has the strongest learned average result so far.")
+    lines.append("The scanner grade is still preserved. Adaptive Learning only provides a revised-grade research overlay until the evidence is strong enough to use it for live decisions.")
+    return "\n\n".join(lines)
+
 def render_adaptive_learning_panel(profile: dict) -> None:
-    st.markdown("<div class='benzino-panel-title'>Adaptive Learning Profile</div>", unsafe_allow_html=True)
+    st.markdown("<div class='benzino-panel-title' style='margin-bottom:16px;'>Adaptive Learning Profile</div>", unsafe_allow_html=True)
     metric_cols = st.columns(3)
     with metric_cols[0]:
-        metric_card("Lessons learned from", f"{int(profile.get('closed_trade_count') or 0)} trades", "Closed User Journal outcomes")
+        metric_card("Lessons learned from", f"{fmt_count(profile.get('closed_trade_count'))} trades", "Closed User Journal outcomes")
     with metric_cols[1]:
-        metric_card("Learning win rate", f"{float(profile.get('win_rate') or 0):.2f}%", "Closed outcomes only")
+        metric_card("Learning win rate", fmt_pct(profile.get("win_rate")), "Closed outcomes only")
     with metric_cols[2]:
-        metric_card("Average result", f"{float(profile.get('avg_r') or 0):+.2f}R", "Across learned trades")
+        metric_card("Average result", fmt_r(profile.get("avg_r")), "Across learned trades")
 
-    render_ai_card("Current Adaptive Read", str(profile.get("recommendation_text") or "Not enough closed trades yet."))
+    st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
+    render_ai_card("What the System Has Learned", build_holistic_adaptive_read(profile))
 
-    best = pd.DataFrame(profile.get("best_patterns") or [])
-    risk = pd.DataFrame(profile.get("risk_patterns") or [])
-    setup = pd.DataFrame(profile.get("setup_profile") or [])
+    best_table = _format_learning_rows(profile.get("best_patterns") or [])
+    risk_table = _format_learning_rows(profile.get("risk_patterns") or [])
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("<div class='benzino-panel-title'>Patterns to favour</div>", unsafe_allow_html=True)
-        if best.empty:
+        if best_table.empty:
             st.caption("More closed trades are needed.")
         else:
-            st.dataframe(best[[c for c in ["dimension", "name", "trades", "win_rate", "avg_r"] if c in best.columns]], width="stretch", hide_index=True)
+            st.dataframe(best_table, width="stretch", hide_index=True)
     with c2:
         st.markdown("<div class='benzino-panel-title'>Patterns to be stricter with</div>", unsafe_allow_html=True)
-        if risk.empty:
+        if risk_table.empty:
             st.caption("More closed trades are needed.")
         else:
-            st.dataframe(risk[[c for c in ["dimension", "name", "trades", "win_rate", "avg_r"] if c in risk.columns]], width="stretch", hide_index=True)
-
-    st.markdown("<div class='benzino-panel-title'>Setup-type learning</div>", unsafe_allow_html=True)
-    if setup.empty:
-        st.caption("More closed trades are needed before setup-type learning is reliable.")
-    else:
-        st.dataframe(setup[[c for c in ["name", "trades", "win_rate", "avg_r"] if c in setup.columns]], width="stretch", hide_index=True)
+            st.dataframe(risk_table, width="stretch", hide_index=True)
 
 
 def render_ai_card(title: str, body: str) -> None:
@@ -8857,77 +8925,8 @@ def render_workflow(username: str, settings: dict) -> None:
                 st.info("No saved adaptive profile yet. Click Refresh Data once to build lessons and the adaptive profile from closed trades.")
             render_adaptive_grade_audit_panel()
 
-            lessons_df = load_explain_ai_lessons_table(limit=APP_TABLE_MAX_ROWS)
-            if lessons_df.empty:
-                st.info("Lessons are being generated from closed trades. Refresh shortly if the table is still empty.")
-            else:
-                display = lessons_df.copy()
-                display["Outcome"] = display.get("exit_reason", "").astype(str).str.upper().replace({"TP": "Win", "SL": "Loss", "EXPIRY": "Expired"})
-                display["R Multiple"] = pd.to_numeric(display.get("r_multiple", 0), errors="coerce").fillna(0).map(lambda x: f"{x:+.2f}R")
-                display["Lesson"] = display.get("lesson_text", "").astype(str).str.replace("\n", " ", regex=False).str.slice(0, 260)
-                display["Date"] = display.get("created_at_eat", "").astype(str)
-                display["Exit Date"] = display.get("exit_at_eat", "").astype(str)
-                for src, dst in [("asset", "Asset"), ("timeframe", "Timeframe"), ("signal", "Signal"), ("grade", "Grade"), ("session", "Session"), ("entry", "Entry"), ("sl", "SL"), ("tp", "TP"), ("signal_id", "Signal ID")]:
-                    if src in display.columns:
-                        display[dst] = display[src]
-                for col in ["Entry", "SL", "TP"]:
-                    if col in display.columns:
-                        display[col] = pd.to_numeric(display[col], errors="coerce").map(lambda x: f"{x:,.5f}" if pd.notna(x) else "")
-
-                title_col, asset_col, grade_col, outcome_col, search_col = st.columns([3.2, 1.2, 1.0, 1.1, 2.4], vertical_alignment="center")
-                with title_col:
-                    st.markdown("<div class='benzino-panel-title'>Historical Lessons</div>", unsafe_allow_html=True)
-                with asset_col:
-                    assets = ["All"] + sorted([x for x in display.get("Asset", pd.Series(dtype=str)).dropna().astype(str).unique().tolist() if x])
-                    lesson_asset_filter = st.selectbox("Asset", assets, label_visibility="collapsed", key="lesson_asset_filter")
-                with grade_col:
-                    lesson_grade_filter = st.selectbox("Grade", ["All", "A+", "A", "B", "C"], label_visibility="collapsed", key="lesson_grade_filter")
-                with outcome_col:
-                    lesson_outcome_filter = st.selectbox("Outcome", ["All", "Win", "Loss", "Expired"], label_visibility="collapsed", key="lesson_outcome_filter")
-                with search_col:
-                    lesson_search = st.text_input("Search lessons", placeholder="Search lessons…", label_visibility="collapsed", key="lesson_search")
-
-                filtered = display.copy()
-                if lesson_asset_filter != "All" and "Asset" in filtered.columns:
-                    filtered = filtered[filtered["Asset"].astype(str).eq(lesson_asset_filter)]
-                if lesson_grade_filter != "All" and "Grade" in filtered.columns:
-                    filtered = filtered[filtered["Grade"].astype(str).eq(lesson_grade_filter)]
-                if lesson_outcome_filter != "All" and "Outcome" in filtered.columns:
-                    filtered = filtered[filtered["Outcome"].astype(str).eq(lesson_outcome_filter)]
-                if lesson_search:
-                    q = str(lesson_search).lower().strip()
-                    filtered = filtered[filtered.astype(str).apply(lambda col: col.str.lower().str.contains(q, na=False)).any(axis=1)]
-
-                preferred_cols = ["Date", "Asset", "Timeframe", "Signal", "Grade", "Outcome", "R Multiple", "Session", "Setup Type", "Learning", "Rule Implication", "Risk Tags", "Lesson", "Entry", "SL", "TP", "Signal ID"]
-                table = filtered[[c for c in preferred_cols if c in filtered.columns]].copy()
-
-                if AgGrid is not None and GridOptionsBuilder is not None:
-                    gb = GridOptionsBuilder.from_dataframe(table)
-                    gb.configure_default_column(sortable=True, filter=True, resizable=True, wrapText=True, autoHeight=False)
-                    gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=12)
-                    gb.configure_grid_options(rowHeight=72, headerHeight=44, suppressMenuHide=True, domLayout="normal", enableCellTextSelection=True)
-                    renderers = aggrid_badge_renderers()
-                    if "Asset" in table.columns:
-                        gb.configure_column("Asset", pinned="left")
-                    for _col, _renderer in {"Signal": "signal", "Grade": "grade", "Outcome": "outcome"}.items():
-                        if _col in table.columns and _renderer in renderers:
-                            gb.configure_column(_col, cellRenderer=renderers[_renderer])
-                    AgGrid(
-                        table,
-                        gridOptions=gb.build(),
-                        height=640,
-                        fit_columns_on_grid_load=False,
-                        theme="balham",
-                        allow_unsafe_jscode=True,
-                        custom_css=benzino_aggrid_css(),
-                        key="explain_ai_lessons_aggrid",
-                    )
-                else:
-                    st.dataframe(table, width="stretch", hide_index=True)
-
-                if not filtered.empty:
-                    latest = filtered.iloc[0]
-                    render_ai_card("Latest Lesson", str(latest.get("lesson_text") or latest.get("Lesson") or ""))
+            # Historical per-trade lessons are intentionally kept in Supabase.
+            # The user-facing Adaptive Learning page shows the holistic profile and audit, not raw lesson rows.
 
 
 
