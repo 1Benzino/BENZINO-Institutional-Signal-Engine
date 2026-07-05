@@ -565,6 +565,7 @@ def init_tables() -> None:
         scan_owner TEXT,
         lesson_type TEXT,
         lesson_text TEXT,
+        lesson_json JSONB,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
     );
@@ -648,6 +649,8 @@ def init_tables() -> None:
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS trade_notes TEXT")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS display_id TEXT")
                 cur.execute("ALTER TABLE scanner_signals ADD COLUMN IF NOT EXISTS replay_checked_at TIMESTAMPTZ")
+                cur.execute("ALTER TABLE explain_ai_lessons ADD COLUMN IF NOT EXISTS lesson_json JSONB")
+                cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_explain_lessons_signal_type_unique ON explain_ai_lessons(signal_id, lesson_type)")
                 cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS raw_json JSONB")
                 cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS environment TEXT")
                 cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS match_quality TEXT")
@@ -3377,7 +3380,191 @@ def rich_closed_trade_explanation(row: pd.Series) -> str:
     )
 
 
-def save_explain_ai_lesson(signal_id: str, scan_owner: str, lesson_text: str, lesson_type: str = "CLOSED_TRADE") -> None:
+@st.cache_data(ttl=300, show_spinner=False)
+def explain_ai_lessons_supports_json() -> bool:
+    """Return True when explain_ai_lessons.lesson_json exists."""
+    try:
+        df = read_df(
+            """
+            SELECT 1 AS ok
+            FROM information_schema.columns
+            WHERE table_name = 'explain_ai_lessons'
+              AND column_name = 'lesson_json'
+            LIMIT 1
+            """
+        )
+        return not df.empty
+    except Exception:
+        return False
+
+
+def _iso_safe(value) -> str:
+    try:
+        ts = pd.to_datetime(value, errors="coerce", utc=True)
+        if pd.isna(ts):
+            return ""
+        return ts.isoformat()
+    except Exception:
+        return ""
+
+
+def classify_setup_type(row: pd.Series) -> str:
+    """Deterministic setup classifier used by adaptive learning."""
+    text = " ".join([
+        str(row.get("reason", "") or ""),
+        json.dumps(parse_jsonish(row.get("strategy_votes")) or {}, default=str),
+    ]).lower()
+    if any(k in text for k in ["breakout", "donchian", "turtle", "adx"]):
+        return "Breakout / trend expansion"
+    if any(k in text for k in ["momentum", "macd", "continuation", "trend"]):
+        return "Momentum continuation"
+    if any(k in text for k in ["mean reversion", "rsi-2", "oversold", "overbought", "reversion"]):
+        return "Mean reversion"
+    if any(k in text for k in ["ml", "probability", "ensemble"]):
+        return "ML-supported confluence"
+    return "General confluence"
+
+
+def build_structured_trade_lesson(row: pd.Series) -> dict:
+    """Create machine-readable learning data from one closed trade."""
+    asset = str(row.get("asset", "") or "").upper()
+    tf = str(row.get("timeframe", "") or "").lower()
+    signal = str(row.get("signal", "") or "").upper()
+    grade = str(row.get("grade", "") or "")
+    status = str(row.get("status", "") or "")
+    exit_reason = str(row.get("exit_reason", "") or "")
+    regime = str(row.get("regime", "") or "Unknown") or "Unknown"
+    try:
+        session = str(session_name(row.get("created_at")))
+    except Exception:
+        try:
+            session = str(session_label(row.get("created_at")))
+        except Exception:
+            session = "Unknown"
+    r_multiple = float(pd.to_numeric(row.get("r_multiple"), errors="coerce") or 0.0)
+    rr = float(pd.to_numeric(row.get("rr"), errors="coerce") or 0.0)
+    rsi = float(pd.to_numeric(row.get("rsi"), errors="coerce") or 0.0)
+    mtf_score = float(pd.to_numeric(row.get("mtf_score"), errors="coerce") or 0.0)
+    edge_score = float(pd.to_numeric(row.get("edge_score"), errors="coerce") or 0.0)
+    confidence = float(pd.to_numeric(row.get("confidence"), errors="coerce") or 0.0)
+    ml_prob = float(pd.to_numeric(row.get("ml_prob"), errors="coerce") or 0.0)
+    votes = parse_jsonish(row.get("strategy_votes")) or {}
+    mtf = parse_jsonish(row.get("mtf_context")) or {}
+    setup_type = classify_setup_type(row)
+    outcome = "WIN" if r_multiple > 0 else ("LOSS" if r_multiple < 0 else "NEUTRAL")
+
+    risk_tags = []
+    strength_tags = []
+    if mtf_score >= 67:
+        strength_tags.append("strong_mtf_alignment")
+    elif mtf_score and mtf_score < 34:
+        risk_tags.append("weak_mtf_alignment")
+    if grade in {"A+", "A"}:
+        strength_tags.append("high_grade")
+    if grade == "C":
+        risk_tags.append("lower_grade")
+    if signal == "BUY" and rsi >= 75:
+        risk_tags.append("buy_after_extended_rsi")
+    if signal == "SELL" and rsi <= 25:
+        risk_tags.append("sell_after_extended_rsi")
+    if rr and rr < 1.8:
+        risk_tags.append("thin_reward_to_risk")
+    if outcome == "WIN":
+        strength_tags.append("validated_by_closed_win")
+    elif outcome == "LOSS":
+        risk_tags.append("invalidated_by_closed_loss")
+
+    if outcome == "WIN" and r_multiple >= 1:
+        rule_action = "favour_similar_setups_after_sample_confirms"
+        rule_direction = "positive"
+    elif outcome == "LOSS":
+        rule_action = "tighten_or_downgrade_similar_setups_if_pattern_repeats"
+        rule_direction = "negative"
+    else:
+        rule_action = "monitor_for_stalling_or_expiry_pattern"
+        rule_direction = "neutral"
+
+    return sanitize_for_json({
+        "schema_version": 1,
+        "signal_id": str(row.get("signal_id") or ""),
+        "created_at": _iso_safe(row.get("created_at")),
+        "closed_at": _iso_safe(row.get("exit_at")),
+        "fingerprint": {
+            "asset": asset,
+            "timeframe": tf,
+            "session": session,
+            "grade": grade,
+            "signal": signal,
+            "regime": regime,
+            "setup_type": setup_type,
+        },
+        "outcome": {
+            "label": outcome,
+            "status": status,
+            "exit_reason": exit_reason,
+            "r_multiple": round(r_multiple, 4),
+        },
+        "features": {
+            "asset": asset,
+            "timeframe": tf,
+            "session": session,
+            "signal": signal,
+            "grade": grade,
+            "regime": regime,
+            "setup_type": setup_type,
+            "rr": round(rr, 4),
+            "rsi": round(rsi, 4),
+            "mtf_score": round(mtf_score, 4),
+            "edge_score": round(edge_score, 4),
+            "confidence": round(confidence, 4),
+            "ml_prob": round(ml_prob, 4),
+        },
+        "context": {
+            "reason": str(row.get("reason", "") or ""),
+            "strategy_votes": votes,
+            "mtf_context": mtf,
+        },
+        "learning_signal": {
+            "direction": rule_direction,
+            "rule_action": rule_action,
+            "strength_tags": strength_tags,
+            "risk_tags": risk_tags,
+            "sample_weight": round(min(2.0, max(0.5, abs(r_multiple) if r_multiple else 0.5)), 3),
+        },
+        "future_use": {
+            "coach_ai": True,
+            "explain_ai": True,
+            "scanner_overlay_ready": True,
+            "scanner_core_change": False,
+            "minimum_sample_before_execution_use": 20,
+        },
+    })
+
+
+def lesson_json_to_flat_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Expose structured lesson JSON in the Lessons table without breaking old rows."""
+    if df is None or df.empty or "lesson_json" not in df.columns:
+        return df
+    out = df.copy()
+    setup_types, rule_actions, learning_dirs, risk_tags, strength_tags = [], [], [], [], []
+    for value in out["lesson_json"].tolist():
+        obj = parse_jsonish(value) or {}
+        features = obj.get("features") if isinstance(obj, dict) else {}
+        learning = obj.get("learning_signal") if isinstance(obj, dict) else {}
+        setup_types.append(str((features or {}).get("setup_type") or ""))
+        rule_actions.append(str((learning or {}).get("rule_action") or ""))
+        learning_dirs.append(str((learning or {}).get("direction") or ""))
+        risk_tags.append(", ".join([str(x) for x in ((learning or {}).get("risk_tags") or [])]))
+        strength_tags.append(", ".join([str(x) for x in ((learning or {}).get("strength_tags") or [])]))
+    out["setup_type"] = setup_types
+    out["rule_action"] = rule_actions
+    out["learning_direction"] = learning_dirs
+    out["risk_tags"] = risk_tags
+    out["strength_tags"] = strength_tags
+    return out
+
+
+def save_explain_ai_lesson(signal_id: str, scan_owner: str, lesson_text: str, lesson_type: str = "CLOSED_TRADE", lesson_json: dict | None = None) -> None:
     signal_id = str(signal_id or "").strip()
     scan_owner = str(scan_owner or "").strip()
     lesson_text = str(lesson_text or "").strip()
@@ -3393,23 +3580,44 @@ def save_explain_ai_lesson(signal_id: str, scan_owner: str, lesson_text: str, le
         """,
         (signal_id, lesson_type),
     )
+    json_supported = explain_ai_lessons_supports_json()
+    lesson_json_text = json.dumps(sanitize_for_json(lesson_json or {}), allow_nan=False)
     if existing.empty:
-        execute(
-            """
-            INSERT INTO explain_ai_lessons(signal_id, scan_owner, lesson_type, lesson_text, created_at, updated_at)
-            VALUES (%s,%s,%s,%s,NOW(),NOW())
-            """,
-            (signal_id, scan_owner, lesson_type, lesson_text),
-        )
+        if json_supported:
+            execute(
+                """
+                INSERT INTO explain_ai_lessons(signal_id, scan_owner, lesson_type, lesson_text, lesson_json, created_at, updated_at)
+                VALUES (%s,%s,%s,%s,%s::jsonb,NOW(),NOW())
+                """,
+                (signal_id, scan_owner, lesson_type, lesson_text, lesson_json_text),
+            )
+        else:
+            execute(
+                """
+                INSERT INTO explain_ai_lessons(signal_id, scan_owner, lesson_type, lesson_text, created_at, updated_at)
+                VALUES (%s,%s,%s,%s,NOW(),NOW())
+                """,
+                (signal_id, scan_owner, lesson_type, lesson_text),
+            )
     else:
-        execute(
-            """
-            UPDATE explain_ai_lessons
-            SET scan_owner = %s, lesson_text = %s, updated_at = NOW()
-            WHERE id = %s
-            """,
-            (scan_owner, lesson_text, str(existing.iloc[0]["id"])),
-        )
+        if json_supported:
+            execute(
+                """
+                UPDATE explain_ai_lessons
+                SET scan_owner = %s, lesson_text = %s, lesson_json = %s::jsonb, updated_at = NOW()
+                WHERE id = %s
+                """,
+                (scan_owner, lesson_text, lesson_json_text, str(existing.iloc[0]["id"])),
+            )
+        else:
+            execute(
+                """
+                UPDATE explain_ai_lessons
+                SET scan_owner = %s, lesson_text = %s, updated_at = NOW()
+                WHERE id = %s
+                """,
+                (scan_owner, lesson_text, str(existing.iloc[0]["id"])),
+            )
 
 
 def load_explain_ai_lesson(signal_id: str, lesson_type: str = "CLOSED_TRADE") -> str:
@@ -3431,6 +3639,55 @@ def load_explain_ai_lesson(signal_id: str, lesson_type: str = "CLOSED_TRADE") ->
     return str(df.iloc[0].get("lesson_text") or "")
 
 
+
+def load_explain_ai_lessons_table(limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFrame:
+    """Load stored Explain AI lessons with trade context for the user-facing Explain AI page."""
+    lesson_json_select = "l.lesson_json," if explain_ai_lessons_supports_json() else "NULL::jsonb AS lesson_json,"
+    df = read_df(
+        f"""
+        SELECT
+            l.created_at AS lesson_created_at,
+            l.updated_at AS lesson_updated_at,
+            l.lesson_type,
+            l.lesson_text,
+            {lesson_json_select}
+            l.signal_id,
+            COALESCE(l.scan_owner, ss.scan_owner) AS scan_owner,
+            ss.asset, ss.timeframe, ss.signal, ss.grade, ss.status,
+            ss.entry, ss.sl, ss.tp, ss.exit_price, ss.exit_reason, ss.exit_at,
+            ss.r_multiple, ss.created_at AS trade_created_at,
+            ss.reason, ss.regime, ss.mtf_score
+        FROM explain_ai_lessons l
+        LEFT JOIN scanner_signals ss ON ss.signal_id = l.signal_id
+        WHERE l.lesson_type = 'CLOSED_TRADE'
+        ORDER BY COALESCE(ss.exit_at, l.updated_at, l.created_at) DESC NULLS LAST
+        LIMIT %s
+        """,
+        (int(limit or APP_TABLE_MAX_ROWS),),
+    )
+    if df.empty:
+        return df
+    df = numeric_cols(df, ["entry", "sl", "tp", "exit_price", "r_multiple", "mtf_score"])
+    for col in ["lesson_created_at", "lesson_updated_at", "trade_created_at", "exit_at"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce", utc=True)
+    if "trade_created_at" in df.columns:
+        df["session"] = df["trade_created_at"].apply(session_name)
+        df["created_at_eat"] = df["trade_created_at"].apply(fmt_nairobi)
+    if "exit_at" in df.columns:
+        df["exit_at_eat"] = df["exit_at"].apply(fmt_nairobi)
+    return lesson_json_to_flat_columns(df)
+
+def auto_sync_all_closed_trade_lessons_once() -> dict:
+    """Automatically create missing lessons from all historical closed trades once per app session."""
+    key = "explain_ai_auto_all_closed_lessons_synced"
+    if st.session_state.get(key):
+        return {"ran": False, "created": 0, "checked": 0, "closed_trades": 0, "skipped": 0, "errors": 0, "profile_saved": False}
+    result = backfill_all_historical_explain_ai_lessons(limit=APP_TABLE_MAX_ROWS, batch_size=1500)
+    result["ran"] = True
+    st.session_state[key] = True
+    return result
+
 def sync_missing_explain_ai_lessons(closed_trades: pd.DataFrame, limit: int = 1000) -> dict:
     """Persist one CLOSED_TRADE lesson for every closed trade that does not have one yet."""
     out = {"checked": 0, "created": 0, "skipped": 0, "errors": 0}
@@ -3446,39 +3703,61 @@ def sync_missing_explain_ai_lessons(closed_trades: pd.DataFrame, limit: int = 10
     signal_ids = lessons_df["signal_id"].head(int(limit or 1000)).tolist()
     out["checked"] = len(signal_ids)
 
+    json_supported = explain_ai_lessons_supports_json()
+    json_missing_ids = set()
     try:
-        existing = read_df(
-            """
-            SELECT signal_id
+        existing_sql = """
+            SELECT signal_id%s
             FROM explain_ai_lessons
             WHERE lesson_type = 'CLOSED_TRADE'
               AND signal_id = ANY(%s)
-            """,
-            (signal_ids,),
-        )
+            """ % (", lesson_json" if json_supported else "")
+        existing = read_df(existing_sql, (signal_ids,))
         existing_ids = set(existing["signal_id"].astype(str).tolist()) if not existing.empty and "signal_id" in existing.columns else set()
+        if json_supported and not existing.empty and "lesson_json" in existing.columns:
+            for _, erow in existing.iterrows():
+                sid0 = str(erow.get("signal_id") or "").strip()
+                val = erow.get("lesson_json")
+                if sid0 and (val is None or str(val).strip() in {"", "{}", "null", "None"}):
+                    json_missing_ids.add(sid0)
     except Exception:
         existing_ids = set()
 
     rows_to_insert = []
+    rows_to_update_json = []
     for _, row in lessons_df[lessons_df["signal_id"].isin(signal_ids)].iterrows():
         sid = str(row.get("signal_id") or "").strip()
-        if not sid or sid in existing_ids:
+        if not sid:
             out["skipped"] += 1
             continue
         try:
+            lesson_json = build_structured_trade_lesson(row)
+            if sid in existing_ids:
+                if json_supported and sid in json_missing_ids:
+                    rows_to_update_json.append((sid, lesson_json))
+                else:
+                    out["skipped"] += 1
+                continue
             lesson_text = rich_closed_trade_explanation(row)
             if not str(lesson_text or "").strip():
                 out["skipped"] += 1
                 continue
-            rows_to_insert.append((sid, str(row.get("scan_owner") or active_username() or ""), "CLOSED_TRADE", lesson_text))
+            rows_to_insert.append((sid, str(row.get("scan_owner") or active_username() or ""), "CLOSED_TRADE", lesson_text, lesson_json))
         except Exception:
             out["errors"] += 1
 
-    if not rows_to_insert:
+    if not rows_to_insert and not rows_to_update_json:
         return out
 
-    sql = """
+    sql_json = """
+        INSERT INTO explain_ai_lessons(signal_id, scan_owner, lesson_type, lesson_text, lesson_json, created_at, updated_at)
+        SELECT %s, %s, %s, %s, %s::jsonb, NOW(), NOW()
+        WHERE NOT EXISTS (
+            SELECT 1 FROM explain_ai_lessons
+            WHERE signal_id = %s AND lesson_type = %s
+        )
+    """
+    sql_text = """
         INSERT INTO explain_ai_lessons(signal_id, scan_owner, lesson_type, lesson_text, created_at, updated_at)
         SELECT %s, %s, %s, %s, NOW(), NOW()
         WHERE NOT EXISTS (
@@ -3490,12 +3769,28 @@ def sync_missing_explain_ai_lessons(closed_trades: pd.DataFrame, limit: int = 10
         conn = db_connect()
         with conn:
             with conn.cursor() as cur:
-                for sid, owner, lesson_type, lesson_text in rows_to_insert:
-                    cur.execute(sql, (sid, owner, lesson_type, lesson_text, sid, lesson_type))
+                for sid, owner, lesson_type, lesson_text, lesson_json in rows_to_insert:
+                    if json_supported:
+                        cur.execute(sql_json, (sid, owner, lesson_type, lesson_text, json.dumps(sanitize_for_json(lesson_json or {}), allow_nan=False), sid, lesson_type))
+                    else:
+                        cur.execute(sql_text, (sid, owner, lesson_type, lesson_text, sid, lesson_type))
                     out["created"] += int(cur.rowcount or 0)
+                if json_supported:
+                    for sid, lesson_json in rows_to_update_json:
+                        cur.execute(
+                            """
+                            UPDATE explain_ai_lessons
+                            SET lesson_json = %s::jsonb, updated_at = NOW()
+                            WHERE signal_id = %s AND lesson_type = 'CLOSED_TRADE'
+                              AND (lesson_json IS NULL OR lesson_json = '{}'::jsonb)
+                            """,
+                            (json.dumps(sanitize_for_json(lesson_json or {}), allow_nan=False), sid),
+                        )
+                        out["created"] += 0
+                        out["skipped"] += 1
         conn.close()
     except Exception:
-        out["errors"] += len(rows_to_insert)
+        out["errors"] += len(rows_to_insert) + len(rows_to_update_json)
     return out
 
 
@@ -3651,9 +3946,14 @@ def build_adaptive_learning_profile(closed_trades: pd.DataFrame, username: str, 
     out["session_profile"] = _learning_bucket_summary(df, "session", min_trades=5, top_n=8)
     out["grade_profile"] = _learning_bucket_summary(df, "grade", min_trades=3, top_n=8)
     out["timeframe_profile"] = _learning_bucket_summary(df, "timeframe", min_trades=3, top_n=8)
+    try:
+        df["setup_type"] = df.apply(classify_setup_type, axis=1)
+    except Exception:
+        df["setup_type"] = "General confluence"
+    out["setup_profile"] = _learning_bucket_summary(df, "setup_type", min_trades=3, top_n=8)
 
     all_patterns = []
-    for label, rows in [("Asset", out["asset_profile"]), ("Session", out["session_profile"]), ("Grade", out["grade_profile"]), ("Timeframe", out["timeframe_profile"])]:
+    for label, rows in [("Asset", out["asset_profile"]), ("Session", out["session_profile"]), ("Grade", out["grade_profile"]), ("Timeframe", out["timeframe_profile"]), ("Setup", out.get("setup_profile", []))]:
         for row in rows:
             item = dict(row)
             item["dimension"] = label
@@ -3732,6 +4032,7 @@ def render_adaptive_learning_panel(profile: dict) -> None:
 
     best = pd.DataFrame(profile.get("best_patterns") or [])
     risk = pd.DataFrame(profile.get("risk_patterns") or [])
+    setup = pd.DataFrame(profile.get("setup_profile") or [])
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("<div class='benzino-panel-title'>Patterns to favour</div>", unsafe_allow_html=True)
@@ -3745,6 +4046,12 @@ def render_adaptive_learning_panel(profile: dict) -> None:
             st.caption("More closed trades are needed.")
         else:
             st.dataframe(risk[[c for c in ["dimension", "name", "trades", "win_rate", "avg_r"] if c in risk.columns]], width="stretch", hide_index=True)
+
+    st.markdown("<div class='benzino-panel-title'>Setup-type learning</div>", unsafe_allow_html=True)
+    if setup.empty:
+        st.caption("More closed trades are needed before setup-type learning is reliable.")
+    else:
+        st.dataframe(setup[[c for c in ["name", "trades", "win_rate", "avg_r"] if c in setup.columns]], width="stretch", hide_index=True)
 
 
 def render_ai_card(title: str, body: str) -> None:
@@ -7886,165 +8193,93 @@ def render_workflow(username: str, settings: dict) -> None:
         render_ai_card("User Journal Coaching", "\n\n".join(journal_parts))
 
     with t6:
-        workflow_commentary("Closed outcomes are now the adaptive-learning source. BENZINO auto-saves missing CLOSED_TRADE lessons, builds an adaptive profile from closed outcomes, and uses that profile to guide Coach/Explain AI recommendations without changing scanner entries automatically.")
+        workflow_commentary("Explain AI now shows BENZINO's adaptive learning layer. Lessons are generated automatically from every closed A+/A/B/C trade in Supabase, then used to build the playbook guidance below. No manual backfill button is needed.")
 
-        backfill_col, backfill_status_col = st.columns([1.25, 3.75], vertical_alignment="center")
-        with backfill_col:
-            run_full_lesson_backfill = st.button("Build lessons from all closed trades", key="explain_ai_full_history_backfill")
-        with backfill_status_col:
-            st.caption("Safe to rerun: existing lessons are skipped, missing CLOSED_TRADE lessons are generated from every resolved trade in Supabase.")
-        if run_full_lesson_backfill:
-            with st.spinner("Building Explain AI lessons from all historical closed trades…"):
-                full_backfill_result = backfill_all_historical_explain_ai_lessons(limit=APP_TABLE_MAX_ROWS, batch_size=1500)
-            st.success(
-                f"Historical lesson backfill complete: {full_backfill_result.get('created', 0)} new lesson(s) created, "
-                f"{full_backfill_result.get('skipped', 0)} already existed/skipped, "
-                f"{full_backfill_result.get('closed_trades', 0)} closed trade(s) reviewed."
-            )
-            if full_backfill_result.get("errors", 0):
-                st.warning(f"{full_backfill_result.get('errors')} lesson/profile item(s) could not be generated. The rest were saved.")
-            if not full_backfill_result.get("profile_saved"):
-                st.caption("Lessons were saved, but the system-wide adaptive profile was not saved. Confirm the explain_ai_adaptive_profile SQL migration has been run.")
-            st.session_state[f"explain_ai_lesson_sync_{active_username()}"] = True
+        if closed_trades.empty:
+            st.info("No closed trades yet. Explain AI will populate once TP, SL, or expiry outcomes are recorded.")
+        else:
+            with st.spinner("Updating Explain AI lessons from closed trades…"):
+                auto_lesson_result = auto_sync_all_closed_trade_lessons_once()
+            if auto_lesson_result.get("ran") and auto_lesson_result.get("created", 0):
+                st.caption(f"Explain AI automatically saved {auto_lesson_result.get('created', 0)} new closed-trade lesson(s). Existing lessons were skipped.")
 
-        lesson_sync_key = f"explain_ai_lesson_sync_{active_username()}"
-        if not closed_trades.empty and not st.session_state.get(lesson_sync_key):
-            sync_result = sync_missing_explain_ai_lessons(closed_trades, limit=2000)
-            st.session_state[lesson_sync_key] = True
-            if sync_result.get("created", 0):
-                st.caption(f"Explain AI saved {sync_result['created']} missing closed-trade lesson(s) to Supabase.")
-
-        if not closed_trades.empty:
-            adaptive_profile = build_adaptive_learning_profile(closed_trades, active_username(), settings)
+            adaptive_profile = build_adaptive_learning_profile(load_all_closed_trades_for_explain_ai(limit=APP_TABLE_MAX_ROWS), active_username(), settings)
             profile_saved = save_adaptive_learning_profile(adaptive_profile)
             render_adaptive_learning_panel(adaptive_profile)
             if not profile_saved:
                 st.caption("Adaptive profile is visible here but was not saved. Run the explain_ai_adaptive_profile SQL migration once in Supabase.")
 
-        if closed_trades.empty:
-            st.info("No closed trades yet. Explain AI will populate once TP, SL, or expiry outcomes are recorded.")
-        else:
-            review_queue = closed_trades.sort_values("created_at", ascending=False).copy().reset_index(drop=True)
-            # Load the full closed-trade lesson history first; filtering/search should not be limited before the user interacts.
-            review_display = prepare_signal_table(review_queue, limit=None).reset_index(drop=True)
-            # Preserve the real DB signal_id for row selection; prepare_signal_table may display the public Benzino ID.
-            if "signal_id" in review_queue.columns and len(review_queue) == len(review_display):
-                review_display["Raw Signal ID"] = review_queue["signal_id"].astype(str).values
-            elif "Signal ID" in review_display.columns:
-                review_display["Raw Signal ID"] = review_display["Signal ID"].astype(str).values
+            lessons_df = load_explain_ai_lessons_table(limit=APP_TABLE_MAX_ROWS)
+            if lessons_df.empty:
+                st.info("Lessons are being generated from closed trades. Refresh shortly if the table is still empty.")
             else:
-                review_display["Raw Signal ID"] = ""
-            preferred_cols = ["Asset", "Timeframe", "Signal", "Grade", "Status", "Outcome", "R Multiple", "Session", "Created At", "Raw Signal ID", "Entry", "SL", "TP"]
-            review_display = review_display[[c for c in preferred_cols if c in review_display.columns] + [c for c in review_display.columns if c not in preferred_cols and c != "Review Case"]]
+                display = lessons_df.copy()
+                display["Outcome"] = display.get("exit_reason", "").astype(str).str.upper().replace({"TP": "Win", "SL": "Loss", "EXPIRY": "Expired"})
+                display["R Multiple"] = pd.to_numeric(display.get("r_multiple", 0), errors="coerce").fillna(0).map(lambda x: f"{x:+.2f}R")
+                display["Lesson"] = display.get("lesson_text", "").astype(str).str.replace("\n", " ", regex=False).str.slice(0, 260)
+                display["Date"] = display.get("created_at_eat", "").astype(str)
+                display["Exit Date"] = display.get("exit_at_eat", "").astype(str)
+                for src, dst in [("asset", "Asset"), ("timeframe", "Timeframe"), ("signal", "Signal"), ("grade", "Grade"), ("session", "Session"), ("entry", "Entry"), ("sl", "SL"), ("tp", "TP"), ("signal_id", "Signal ID")]:
+                    if src in display.columns:
+                        display[dst] = display[src]
+                for col in ["Entry", "SL", "TP"]:
+                    if col in display.columns:
+                        display[col] = pd.to_numeric(display[col], errors="coerce").map(lambda x: f"{x:,.5f}" if pd.notna(x) else "")
 
-            title_col, sig_col, grade_col, status_col, search_col = st.columns([4.0, 1.1, 1.1, 1.25, 2.2], vertical_alignment="center")
-            with title_col:
-                st.markdown("<div class='benzino-panel-title'>Closed Trade Lessons</div>", unsafe_allow_html=True)
-            with sig_col:
-                explain_signal_filter = st.selectbox("Signal", ["All", "BUY", "SELL"], label_visibility="collapsed", key="explain_review_signal_filter")
-            with grade_col:
-                explain_grade_filter = st.selectbox("Grade", ["All", "A+", "A", "B", "C"], label_visibility="collapsed", key="explain_review_grade_filter")
-            with status_col:
-                _status_options = ["All"] + sorted(review_display["Status"].dropna().astype(str).unique().tolist()) if "Status" in review_display.columns else ["All"]
-                explain_status_filter = st.selectbox("Status", _status_options, label_visibility="collapsed", key="explain_review_status_filter")
-            with search_col:
-                explain_review_search = st.text_input("Search closed trade lessons", placeholder="Search…", label_visibility="collapsed", key="explain_review_search")
+                title_col, asset_col, grade_col, outcome_col, search_col = st.columns([3.2, 1.2, 1.0, 1.1, 2.4], vertical_alignment="center")
+                with title_col:
+                    st.markdown("<div class='benzino-panel-title'>Historical Lessons</div>", unsafe_allow_html=True)
+                with asset_col:
+                    assets = ["All"] + sorted([x for x in display.get("Asset", pd.Series(dtype=str)).dropna().astype(str).unique().tolist() if x])
+                    lesson_asset_filter = st.selectbox("Asset", assets, label_visibility="collapsed", key="lesson_asset_filter")
+                with grade_col:
+                    lesson_grade_filter = st.selectbox("Grade", ["All", "A+", "A", "B", "C"], label_visibility="collapsed", key="lesson_grade_filter")
+                with outcome_col:
+                    lesson_outcome_filter = st.selectbox("Outcome", ["All", "Win", "Loss", "Expired"], label_visibility="collapsed", key="lesson_outcome_filter")
+                with search_col:
+                    lesson_search = st.text_input("Search lessons", placeholder="Search lessons…", label_visibility="collapsed", key="lesson_search")
 
-            if explain_signal_filter != "All" and "Signal" in review_display.columns:
-                review_display = review_display[review_display["Signal"].astype(str).str.upper().str.contains(explain_signal_filter, na=False)]
-            if explain_grade_filter != "All" and "Grade" in review_display.columns:
-                review_display = review_display[review_display["Grade"].astype(str).str.upper().eq(explain_grade_filter.upper())]
-            if explain_status_filter != "All" and "Status" in review_display.columns:
-                review_display = review_display[review_display["Status"].astype(str).eq(explain_status_filter)]
-            if explain_review_search:
-                q = str(explain_review_search).lower().strip()
-                review_display = review_display[review_display.astype(str).apply(lambda col: col.str.lower().str.contains(q, na=False)).any(axis=1)]
+                filtered = display.copy()
+                if lesson_asset_filter != "All" and "Asset" in filtered.columns:
+                    filtered = filtered[filtered["Asset"].astype(str).eq(lesson_asset_filter)]
+                if lesson_grade_filter != "All" and "Grade" in filtered.columns:
+                    filtered = filtered[filtered["Grade"].astype(str).eq(lesson_grade_filter)]
+                if lesson_outcome_filter != "All" and "Outcome" in filtered.columns:
+                    filtered = filtered[filtered["Outcome"].astype(str).eq(lesson_outcome_filter)]
+                if lesson_search:
+                    q = str(lesson_search).lower().strip()
+                    filtered = filtered[filtered.astype(str).apply(lambda col: col.str.lower().str.contains(q, na=False)).any(axis=1)]
 
-            selected_sid = ""
-            display_cols = review_display.drop(columns=["Raw Signal ID"], errors="ignore")
+                preferred_cols = ["Date", "Asset", "Timeframe", "Signal", "Grade", "Outcome", "R Multiple", "Session", "Setup Type", "Learning", "Rule Implication", "Risk Tags", "Lesson", "Entry", "SL", "TP", "Signal ID"]
+                table = filtered[[c for c in preferred_cols if c in filtered.columns]].copy()
 
-            if AgGrid is not None and GridOptionsBuilder is not None:
-                ag_view = review_display.copy()
-                gb = GridOptionsBuilder.from_dataframe(ag_view)
-                gb.configure_default_column(sortable=True, filter=True, resizable=True, wrapText=False, autoHeight=False)
-                gb.configure_selection(selection_mode="single", use_checkbox=False)
-                gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=12)
-                gb.configure_grid_options(
-                    rowHeight=52,
-                    headerHeight=44,
-                    suppressMenuHide=True,
-                    domLayout="normal",
-                    animateRows=True,
-                    enableCellTextSelection=True,
-                    quickFilterText=None,
-                )
-                renderers = aggrid_badge_renderers()
-                if "Asset" in ag_view.columns:
-                    gb.configure_column("Asset", pinned="left")
-                if "Raw Signal ID" in ag_view.columns:
-                    gb.configure_column("Raw Signal ID", hide=True)
-                for _col, _renderer in {"Signal": "signal", "Grade": "grade", "Status": "status", "Outcome": "outcome"}.items():
-                    if _col in ag_view.columns and _renderer in renderers:
-                        gb.configure_column(_col, cellRenderer=renderers[_renderer])
-                explain_response = AgGrid(
-                    ag_view,
-                    gridOptions=gb.build(),
-                    height=640,
-                    fit_columns_on_grid_load=False,
-                    theme="balham",
-                    allow_unsafe_jscode=True,
-                    custom_css=benzino_aggrid_css(),
-                    key="explain_ai_closed_trade_aggrid",
-                )
-                selected = explain_response.get("selected_rows", [])
-                if isinstance(selected, pd.DataFrame):
-                    selected_records = selected.to_dict("records")
+                if AgGrid is not None and GridOptionsBuilder is not None:
+                    gb = GridOptionsBuilder.from_dataframe(table)
+                    gb.configure_default_column(sortable=True, filter=True, resizable=True, wrapText=True, autoHeight=False)
+                    gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=12)
+                    gb.configure_grid_options(rowHeight=72, headerHeight=44, suppressMenuHide=True, domLayout="normal", enableCellTextSelection=True)
+                    renderers = aggrid_badge_renderers()
+                    if "Asset" in table.columns:
+                        gb.configure_column("Asset", pinned="left")
+                    for _col, _renderer in {"Signal": "signal", "Grade": "grade", "Outcome": "outcome"}.items():
+                        if _col in table.columns and _renderer in renderers:
+                            gb.configure_column(_col, cellRenderer=renderers[_renderer])
+                    AgGrid(
+                        table,
+                        gridOptions=gb.build(),
+                        height=640,
+                        fit_columns_on_grid_load=False,
+                        theme="balham",
+                        allow_unsafe_jscode=True,
+                        custom_css=benzino_aggrid_css(),
+                        key="explain_ai_lessons_aggrid",
+                    )
                 else:
-                    selected_records = selected or []
-                if selected_records:
-                    selected_sid = str(selected_records[0].get("Raw Signal ID") or selected_records[0].get("Signal ID") or "")
-            else:
-                event = st.dataframe(
-                    display_cols,
-                    width="stretch",
-                    hide_index=True,
-                    selection_mode="single-row",
-                    on_select="rerun",
-                    key="explain_ai_closed_trade_table",
-                )
-                try:
-                    selected_rows = event.selection.rows
-                except Exception:
-                    selected_rows = []
-                if selected_rows:
-                    idx = selected_rows[0]
-                    if 0 <= idx < len(review_display):
-                        selected_sid = str(review_display.iloc[idx].get("Raw Signal ID") or "")
+                    st.dataframe(table, width="stretch", hide_index=True)
 
-            if selected_sid:
-                row_df = review_queue[review_queue["signal_id"].astype(str).eq(selected_sid)]
-                if not row_df.empty:
-                    selected_row = row_df.iloc[0].copy()
-                    generated_lesson = rich_closed_trade_explanation(selected_row)
-                    stored_lesson = load_explain_ai_lesson(selected_sid)
-                    lesson_text = stored_lesson or generated_lesson
-                    if not stored_lesson:
-                        try:
-                            save_explain_ai_lesson(selected_sid, str(selected_row.get("scan_owner") or active_username()), generated_lesson)
-                        except Exception as exc:
-                            st.warning(f"Could not save Explain AI lesson: {exc}")
-
-                    @st.dialog("Closed Trade Lesson", width="large")
-                    def _show_closed_lesson():
-                        render_ai_card("Closed Trade Lesson", lesson_text)
-                        if st.button("Regenerate and save latest lesson", type="primary", key=f"regen_lesson_{selected_sid}"):
-                            try:
-                                save_explain_ai_lesson(selected_sid, str(selected_row.get("scan_owner") or active_username()), generated_lesson)
-                                st.success("Lesson regenerated and saved to explain_ai_lessons.")
-                            except Exception as exc:
-                                st.error(f"Failed to save lesson: {exc}")
-                    _show_closed_lesson()
-
+                if not filtered.empty:
+                    latest = filtered.iloc[0]
+                    render_ai_card("Latest Lesson", str(latest.get("lesson_text") or latest.get("Lesson") or ""))
 
 
 
