@@ -244,6 +244,46 @@ def read_df(sql: str, params: tuple = ()) -> pd.DataFrame:
 
 
 def init_tables() -> None:
+    """Initialise database schema only when explicitly requested.
+
+    Normal Streamlit app startup must not run CREATE INDEX / ALTER TABLE work,
+    because that can deadlock with the background scanner or another app session.
+    Apply migrations manually in Supabase, or temporarily set
+    APP_RUN_SCHEMA_MIGRATIONS=true for one controlled maintenance run.
+    """
+    run_migrations = str(os.getenv("APP_RUN_SCHEMA_MIGRATIONS", "false")).strip().lower() in {"1", "true", "yes", "y"}
+    if not run_migrations:
+        # Lightweight readiness check only: no DDL, no indexes, no ALTER TABLE.
+        # to_regclass checks existence without taking AccessExclusiveLock.
+        required_tables = [
+            "users", "user_settings", "user_watchlists", "scanner_signals",
+            "user_telegram_settings", "user_journal_history",
+            "capital_execution_audit", "capital_executed_trades",
+            "prop_challenge_history",
+        ]
+        try:
+            conn = db_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT t, to_regclass(t) IS NOT NULL AS exists FROM unnest(%s::text[]) AS t",
+                        (required_tables,),
+                    )
+                    rows = cur.fetchall()
+                missing = [str(r.get("t")) for r in rows if not bool(r.get("exists"))]
+                if missing:
+                    st.error(
+                        "Database not ready: missing table(s): " + ", ".join(missing) +
+                        ". Run the Supabase migration once, then restart the app."
+                    )
+                    st.stop()
+            finally:
+                conn.close()
+        except Exception as exc:
+            st.error(f"Database not ready: {exc}")
+            st.stop()
+        return
+
     ddl = """
     CREATE TABLE IF NOT EXISTS users (
         username TEXT PRIMARY KEY,
