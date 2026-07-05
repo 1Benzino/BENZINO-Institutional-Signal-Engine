@@ -3951,7 +3951,7 @@ def render_adaptive_grade_audit_panel() -> None:
 
     try:
         if not st.session_state.get("adaptive_grade_audit_synced_once", False):
-            sync_result = sync_adaptive_grade_audit(limit=APP_TABLE_MAX_ROWS)
+            sync_result = sync_adaptive_grade_audit(limit=75)
             st.session_state.adaptive_grade_audit_synced_once = True
             if sync_result.get("upserts", 0):
                 st.caption(f"Adaptive grade audit synced {sync_result.get('upserts', 0)} signal row(s).")
@@ -4110,7 +4110,7 @@ def load_explain_ai_lesson(signal_id: str, lesson_type: str = "CLOSED_TRADE") ->
 
 
 def load_explain_ai_lessons_table(limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFrame:
-    """Load stored Explain AI lessons with trade context for the user-facing Explain AI page."""
+    """Load stored Adaptive Learning lessons with trade context for the user-facing Explain AI page."""
     lesson_json_select = "l.lesson_json," if explain_ai_lessons_supports_json() else "NULL::jsonb AS lesson_json,"
     df = read_df(
         f"""
@@ -4147,15 +4147,123 @@ def load_explain_ai_lessons_table(limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFra
         df["exit_at_eat"] = df["exit_at"].apply(fmt_nairobi)
     return lesson_json_to_flat_columns(df)
 
-def auto_sync_all_closed_trade_lessons_once() -> dict:
-    """Automatically create missing lessons from all historical closed trades once per app session."""
-    key = "explain_ai_auto_all_closed_lessons_synced"
+def load_missing_closed_trades_for_lessons(limit: int = 25) -> pd.DataFrame:
+    """Load a small batch of closed trades that still need Adaptive Learning lessons.
+
+    This keeps Workflow responsive. The app no longer attempts to process every
+    historical trade during a normal rerun; it steadily catches up in small
+    batches whenever Explain AI is rendered.
+    """
+    json_filter = ""
+    if explain_ai_lessons_supports_json():
+        json_filter = "OR l.lesson_json IS NULL OR l.lesson_json = '{}'::jsonb"
+    df = read_df(
+        f"""
+        SELECT ss.*
+        FROM scanner_signals ss
+        LEFT JOIN explain_ai_lessons l
+          ON l.signal_id = ss.signal_id
+         AND l.lesson_type = 'CLOSED_TRADE'
+        WHERE (
+            UPPER(COALESCE(ss.status, '')) IN ('CLOSED_TP', 'CLOSED_SL', 'EXPIRED', 'CLOSED')
+            OR ss.exit_at IS NOT NULL
+            OR ss.r_multiple IS NOT NULL
+        )
+          AND UPPER(COALESCE(ss.grade, '')) IN ('A+', 'A', 'B', 'C')
+          AND UPPER(COALESCE(ss.signal, '')) IN ('BUY', 'SELL')
+          AND (l.signal_id IS NULL {json_filter})
+        ORDER BY COALESCE(ss.exit_at, ss.created_at) ASC
+        LIMIT %s
+        """,
+        (int(limit or 25),),
+    )
+    if df.empty:
+        return df
+    df = numeric_cols(df, [
+        "confidence", "edge_score", "ml_prob", "entry", "sl", "tp", "rr",
+        "rsi", "atr", "exit_price", "r_multiple", "bars_open", "mtf_score",
+        "shadow_r_multiple",
+    ])
+    for col in ["created_at", "exit_at", "shadow_closed_at", "candle_close"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce", utc=True)
+    if "created_at" in df.columns:
+        df["created_at_eat"] = df["created_at"].apply(fmt_nairobi)
+        df["session"] = df["created_at"].apply(session_name)
+    return closed_resolved_trades(df)
+
+
+def auto_sync_all_closed_trade_lessons_once(batch_size: int = 25) -> dict:
+    """Automatically create missing lessons incrementally.
+
+    One Streamlit rerun should never backfill the whole database. This function
+    processes a small batch, then returns immediately so the rest of Workflow can
+    finish rendering.
+    """
+    key = "explain_ai_auto_incremental_lessons_synced"
     if st.session_state.get(key):
         return {"ran": False, "created": 0, "checked": 0, "closed_trades": 0, "skipped": 0, "errors": 0, "profile_saved": False}
-    result = backfill_all_historical_explain_ai_lessons(limit=APP_TABLE_MAX_ROWS, batch_size=1500)
-    result["ran"] = True
+    batch = load_missing_closed_trades_for_lessons(limit=batch_size)
+    result = {"ran": True, "created": 0, "checked": 0, "closed_trades": int(len(batch) if batch is not None else 0), "skipped": 0, "errors": 0, "profile_saved": False}
+    if batch is not None and not batch.empty:
+        res = sync_missing_explain_ai_lessons(batch, limit=len(batch))
+        for k in ("created", "checked", "skipped", "errors"):
+            result[k] = int(res.get(k, 0) or 0)
     st.session_state[key] = True
     return result
+
+
+
+def reset_adaptive_learning_sync_flags() -> None:
+    """Allow the next Adaptive Learning sync to run again."""
+    for key in [
+        "explain_ai_auto_incremental_lessons_synced",
+        "adaptive_grade_audit_synced_once",
+    ]:
+        try:
+            st.session_state.pop(key, None)
+        except Exception:
+            pass
+
+
+def run_adaptive_learning_sync(username: str, settings: dict, *, reason: str = "page", lesson_batch_size: int = 25, audit_limit: int = 75) -> dict:
+    """Incrementally update the adaptive learning layer.
+
+    This is intentionally trigger-driven. It should run only when the user opens
+    Adaptive Learning or clicks Refresh Data, not on normal Workflow tab renders.
+    """
+    out = {
+        "reason": reason,
+        "lessons_created": 0,
+        "lessons_checked": 0,
+        "profile_saved": False,
+        "audit_upserts": 0,
+        "errors": [],
+    }
+    try:
+        lesson_result = auto_sync_all_closed_trade_lessons_once(batch_size=lesson_batch_size)
+        out["lessons_created"] = int(lesson_result.get("created", 0) or 0)
+        out["lessons_checked"] = int(lesson_result.get("checked", 0) or 0)
+    except Exception as exc:
+        out["errors"].append(f"lesson sync: {exc}")
+
+    # Rebuild the profile on explicit triggers. This uses stored closed outcomes
+    # and structured lessons as guidance only; it does not change scanner logic.
+    try:
+        closed_for_learning = load_all_closed_trades_for_explain_ai(limit=APP_TABLE_MAX_ROWS)
+        adaptive_profile = build_adaptive_learning_profile(closed_for_learning, normalize_username(username), settings)
+        out["profile_saved"] = bool(save_adaptive_learning_profile(adaptive_profile))
+    except Exception as exc:
+        out["errors"].append(f"profile rebuild: {exc}")
+
+    try:
+        if adaptive_grade_audit_ready():
+            audit_result = sync_adaptive_grade_audit(limit=audit_limit)
+            out["audit_upserts"] = int(audit_result.get("upserts", 0) or 0)
+            st.session_state["adaptive_grade_audit_synced_once"] = True
+    except Exception as exc:
+        out["errors"].append(f"grade audit: {exc}")
+    return out
 
 def sync_missing_explain_ai_lessons(closed_trades: pd.DataFrame, limit: int = 1000) -> dict:
     """Persist one CLOSED_TRADE lesson for every closed trade that does not have one yet."""
@@ -4446,6 +4554,53 @@ def build_adaptive_learning_profile(closed_trades: pd.DataFrame, username: str, 
             "More closed trades are needed before strong caution patterns are reliable."
         )
     return out
+
+
+def _json_value_to_obj(value, default):
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return json.loads(value)
+        except Exception:
+            return default
+    return default
+
+
+def load_adaptive_learning_profile(username: str) -> dict:
+    """Load the most recent saved adaptive profile. Lightweight fallback for normal page renders."""
+    try:
+        df = read_df(
+            """
+            SELECT *
+            FROM explain_ai_adaptive_profile
+            WHERE scan_owner IN (%s, 'system_all_closed_trades')
+               OR scope_key IN (%s, 'ALL_CLOSED_TRADES')
+            ORDER BY generated_at DESC NULLS LAST, updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            (str(username or active_username() or ""), str(username or active_username() or "")),
+        )
+        if df.empty:
+            return {}
+        row = df.iloc[0]
+        return {
+            "scan_owner": str(row.get("scan_owner") or username or active_username() or ""),
+            "scope_key": str(row.get("scope_key") or ""),
+            "closed_trade_count": int(pd.to_numeric(row.get("closed_trade_count"), errors="coerce") or 0),
+            "win_rate": float(pd.to_numeric(row.get("win_rate"), errors="coerce") or 0.0),
+            "avg_r": float(pd.to_numeric(row.get("avg_r"), errors="coerce") or 0.0),
+            "best_patterns": _json_value_to_obj(row.get("best_patterns"), []),
+            "risk_patterns": _json_value_to_obj(row.get("risk_patterns"), []),
+            "asset_profile": _json_value_to_obj(row.get("asset_profile"), []),
+            "session_profile": _json_value_to_obj(row.get("session_profile"), []),
+            "grade_profile": _json_value_to_obj(row.get("grade_profile"), []),
+            "timeframe_profile": _json_value_to_obj(row.get("timeframe_profile"), []),
+            "recommendation_text": str(row.get("recommendation_text") or ""),
+        }
+    except Exception:
+        return {}
+    return {}
 
 
 def save_adaptive_learning_profile(profile: dict) -> bool:
@@ -6094,8 +6249,13 @@ def sidebar_controls(username: str, settings: dict) -> str:
         )
         st.markdown("<div class='benzino-refresh-wrap'>", unsafe_allow_html=True)
         if st.button("⟳  Refresh Data", width="stretch", key="sidebar_refresh_data"):
-            with st.spinner("Refreshing dashboard from Supabase…"):
+            with st.spinner("Refreshing dashboard and adaptive learning from Supabase…"):
                 st.cache_data.clear()
+                reset_adaptive_learning_sync_flags()
+                try:
+                    run_adaptive_learning_sync(username, settings, reason="refresh", lesson_batch_size=25, audit_limit=75)
+                except Exception as exc:
+                    st.session_state["adaptive_learning_refresh_error"] = str(exc)
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("<div class='benzino-side-title'>Main Menu</div>", unsafe_allow_html=True)
@@ -7331,9 +7491,15 @@ def render_workflow(username: str, settings: dict) -> None:
     open_trades = trades[trades["status"].astype(str).str.upper().eq("OPEN")]
     closed_trades = trades[trades["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])]
 
-    t1, t2, t3, t_cap, t4, t5, t6 = st.tabs(["User Journal", "System Performance", "Prop Firm", "Capital.com", "No Trade Tracker", "Coach AI", "Explain AI"])
+    workflow_section = st.radio(
+        "Workflow section",
+        ["User Journal", "System Performance", "Prop Firm", "Capital.com", "No Trade Tracker", "Coach AI", "Adaptive Learning"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="workflow_section_selector",
+    )
 
-    with t1:
+    if workflow_section == "User Journal":
         uj_entries_tab, uj_history_tab = st.tabs(["Entries", "History"])
         with uj_entries_tab:
                 workflow_commentary("This view shows the logged-in user's watchlist-scoped journal trades for the selected timeframe. Open, closed, and resolved outcomes update from Supabase as the scanner evaluates TP, SL, and expiry.")
@@ -7446,13 +7612,13 @@ def render_workflow(username: str, settings: dict) -> None:
         with uj_history_tab:
             render_user_journal_history_page(username, settings)
 
-    with t2:
+    elif workflow_section == "System Performance":
         # System Performance must use the full Supabase scanner history, not the user's
         # currently selected View Performance timeframe. The user's journal tab is
         # timeframe-scoped; this tab is intentionally global/system-wide.
         render_system_performance(system_raw_df, settings)
 
-    with t3:
+    elif workflow_section == "Prop Firm":
         challenge_tf = str(settings.get("preferred_timeframe") or settings.get("view_timeframe") or "1h")
 
         # Prop Firm is a user-scoped view, not the old global scanner ledger.
@@ -8328,7 +8494,7 @@ def render_workflow(username: str, settings: dict) -> None:
         else:
             st.info("No completed prop-firm challenges have been archived yet. Passed or failed attempts will appear here automatically.")
 
-    with t_cap:
+    elif workflow_section == "Capital.com":
         workflow_commentary("Activation stays under Settings. This page shows the Capital.com Execution Audit: auto-traded broker rows, fill quality, planned-vs-filled prices, realised P/L, and broker status for the logged-in user's visible data.")
 
         cap_comp = load_capital_execution_audit(limit=APP_TABLE_MAX_ROWS)
@@ -8412,7 +8578,7 @@ def render_workflow(username: str, settings: dict) -> None:
                 st.warning("Capital.com executions were imported, but BENZINO auto-traded audit rows are not available yet.")
 
 
-    with t4:
+    elif workflow_section == "No Trade Tracker":
         workflow_commentary("All signals the scanner blocked from being journaled as real trades. Includes two types: (1) directional ideas (BUY/SELL) where the grade was too weak or R:R too thin — these are hypothetically tracked against TP/SL/expiry to see if they'd have worked. (2) HOLD rows where the systems genuinely split with no directional consensus — these have no hypothetical outcome since there's no entry thesis, but they're recorded so you can see how often the scanner truly sees no edge.")
         no_trades_directional = no_trades[no_trades["signal"].astype(str).str.upper().isin(["BUY", "SELL"])].copy() if not no_trades.empty else pd.DataFrame()
         no_trades_hold = no_trades[no_trades["signal"].astype(str).str.upper().eq("HOLD")].copy() if not no_trades.empty else pd.DataFrame()
@@ -8567,7 +8733,7 @@ def render_workflow(username: str, settings: dict) -> None:
             show_status_filter=False,
         )
 
-    with t5:
+    elif workflow_section == "Coach AI":
         workflow_commentary("Coach AI reviews your journal patterns and turns trade history into practical behaviour, risk, and execution guidance. The guidance is split between prop-firm discipline and broader user-journal improvement.")
 
         resolved = closed_resolved_trades(closed_trades) if not closed_trades.empty else pd.DataFrame()
@@ -8679,22 +8845,25 @@ def render_workflow(username: str, settings: dict) -> None:
         render_ai_card("Prop Firm Coaching", "\n\n".join(prop_parts))
         render_ai_card("User Journal Coaching", "\n\n".join(journal_parts))
 
-    with t6:
-        workflow_commentary("Explain AI now shows BENZINO's adaptive learning layer. Lessons are generated automatically from every closed A+/A/B/C trade in Supabase, then used to build the playbook guidance below. No manual backfill button is needed.")
+    elif workflow_section == "Adaptive Learning":
+        workflow_commentary("Adaptive Learning turns closed trades into structured lessons, rebuilds the learning profile, and tracks original grade versus revised grade performance. It updates when this page is opened or when Refresh Data is clicked.")
 
         if closed_trades.empty:
-            st.info("No closed trades yet. Explain AI will populate once TP, SL, or expiry outcomes are recorded.")
+            st.info("No closed trades yet. Adaptive Learning will populate once TP, SL, or expiry outcomes are recorded.")
         else:
-            with st.spinner("Updating Explain AI lessons from closed trades…"):
-                auto_lesson_result = auto_sync_all_closed_trade_lessons_once()
-            if auto_lesson_result.get("ran") and auto_lesson_result.get("created", 0):
-                st.caption(f"Explain AI automatically saved {auto_lesson_result.get('created', 0)} new closed-trade lesson(s). Existing lessons were skipped.")
+            with st.spinner("Updating Adaptive Learning from closed trades…"):
+                sync_result = run_adaptive_learning_sync(active_username(), settings, reason="adaptive_page", lesson_batch_size=25, audit_limit=75)
+            if sync_result.get("lessons_created", 0):
+                st.caption(f"Adaptive Learning saved {sync_result.get('lessons_created', 0)} new closed-trade lesson(s). Existing lessons were skipped.")
+            if sync_result.get("audit_upserts", 0):
+                st.caption(f"Adaptive grade audit updated {sync_result.get('audit_upserts', 0)} signal row(s).")
+            if sync_result.get("errors"):
+                st.caption("Adaptive sync skipped part of the update: " + "; ".join(sync_result.get("errors", [])[:2]))
 
             adaptive_profile = build_adaptive_learning_profile(load_all_closed_trades_for_explain_ai(limit=APP_TABLE_MAX_ROWS), active_username(), settings)
-            profile_saved = save_adaptive_learning_profile(adaptive_profile)
             render_adaptive_learning_panel(adaptive_profile)
             render_adaptive_grade_audit_panel()
-            if not profile_saved:
+            if not sync_result.get("profile_saved", False):
                 st.caption("Adaptive profile is visible here but was not saved. Run the explain_ai_adaptive_profile SQL migration once in Supabase.")
 
             lessons_df = load_explain_ai_lessons_table(limit=APP_TABLE_MAX_ROWS)
