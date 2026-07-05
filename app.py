@@ -6252,8 +6252,10 @@ def sidebar_controls(username: str, settings: dict) -> str:
             with st.spinner("Refreshing dashboard and adaptive learning from Supabase…"):
                 st.cache_data.clear()
                 reset_adaptive_learning_sync_flags()
+                st.session_state.pop("adaptive_learning_refresh_error", None)
                 try:
-                    run_adaptive_learning_sync(username, settings, reason="refresh", lesson_batch_size=25, audit_limit=75)
+                    sync_result = run_adaptive_learning_sync(username, settings, reason="refresh", lesson_batch_size=25, audit_limit=75)
+                    st.session_state["adaptive_learning_last_refresh"] = sync_result
                 except Exception as exc:
                     st.session_state["adaptive_learning_refresh_error"] = str(exc)
             st.rerun()
@@ -7491,15 +7493,9 @@ def render_workflow(username: str, settings: dict) -> None:
     open_trades = trades[trades["status"].astype(str).str.upper().eq("OPEN")]
     closed_trades = trades[trades["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED"])]
 
-    workflow_section = st.radio(
-        "Workflow section",
-        ["User Journal", "System Performance", "Prop Firm", "Capital.com", "No Trade Tracker", "Coach AI", "Adaptive Learning"],
-        horizontal=True,
-        label_visibility="collapsed",
-        key="workflow_section_selector",
-    )
+    workflow_tabs = st.tabs(["User Journal", "System Performance", "Prop Firm", "Capital.com", "No Trade Tracker", "Coach AI", "Adaptive Learning"])
 
-    if workflow_section == "User Journal":
+    with workflow_tabs[0]:
         uj_entries_tab, uj_history_tab = st.tabs(["Entries", "History"])
         with uj_entries_tab:
                 workflow_commentary("This view shows the logged-in user's watchlist-scoped journal trades for the selected timeframe. Open, closed, and resolved outcomes update from Supabase as the scanner evaluates TP, SL, and expiry.")
@@ -7612,13 +7608,13 @@ def render_workflow(username: str, settings: dict) -> None:
         with uj_history_tab:
             render_user_journal_history_page(username, settings)
 
-    elif workflow_section == "System Performance":
+    with workflow_tabs[1]:
         # System Performance must use the full Supabase scanner history, not the user's
         # currently selected View Performance timeframe. The user's journal tab is
         # timeframe-scoped; this tab is intentionally global/system-wide.
         render_system_performance(system_raw_df, settings)
 
-    elif workflow_section == "Prop Firm":
+    with workflow_tabs[2]:
         challenge_tf = str(settings.get("preferred_timeframe") or settings.get("view_timeframe") or "1h")
 
         # Prop Firm is a user-scoped view, not the old global scanner ledger.
@@ -8494,7 +8490,7 @@ def render_workflow(username: str, settings: dict) -> None:
         else:
             st.info("No completed prop-firm challenges have been archived yet. Passed or failed attempts will appear here automatically.")
 
-    elif workflow_section == "Capital.com":
+    with workflow_tabs[3]:
         workflow_commentary("Activation stays under Settings. This page shows the Capital.com Execution Audit: auto-traded broker rows, fill quality, planned-vs-filled prices, realised P/L, and broker status for the logged-in user's visible data.")
 
         cap_comp = load_capital_execution_audit(limit=APP_TABLE_MAX_ROWS)
@@ -8578,7 +8574,7 @@ def render_workflow(username: str, settings: dict) -> None:
                 st.warning("Capital.com executions were imported, but BENZINO auto-traded audit rows are not available yet.")
 
 
-    elif workflow_section == "No Trade Tracker":
+    with workflow_tabs[4]:
         workflow_commentary("All signals the scanner blocked from being journaled as real trades. Includes two types: (1) directional ideas (BUY/SELL) where the grade was too weak or R:R too thin — these are hypothetically tracked against TP/SL/expiry to see if they'd have worked. (2) HOLD rows where the systems genuinely split with no directional consensus — these have no hypothetical outcome since there's no entry thesis, but they're recorded so you can see how often the scanner truly sees no edge.")
         no_trades_directional = no_trades[no_trades["signal"].astype(str).str.upper().isin(["BUY", "SELL"])].copy() if not no_trades.empty else pd.DataFrame()
         no_trades_hold = no_trades[no_trades["signal"].astype(str).str.upper().eq("HOLD")].copy() if not no_trades.empty else pd.DataFrame()
@@ -8733,7 +8729,7 @@ def render_workflow(username: str, settings: dict) -> None:
             show_status_filter=False,
         )
 
-    elif workflow_section == "Coach AI":
+    with workflow_tabs[5]:
         workflow_commentary("Coach AI reviews your journal patterns and turns trade history into practical behaviour, risk, and execution guidance. The guidance is split between prop-firm discipline and broader user-journal improvement.")
 
         resolved = closed_resolved_trades(closed_trades) if not closed_trades.empty else pd.DataFrame()
@@ -8845,26 +8841,21 @@ def render_workflow(username: str, settings: dict) -> None:
         render_ai_card("Prop Firm Coaching", "\n\n".join(prop_parts))
         render_ai_card("User Journal Coaching", "\n\n".join(journal_parts))
 
-    elif workflow_section == "Adaptive Learning":
-        workflow_commentary("Adaptive Learning turns closed trades into structured lessons, rebuilds the learning profile, and tracks original grade versus revised grade performance. It updates when this page is opened or when Refresh Data is clicked.")
+    with workflow_tabs[6]:
+        workflow_commentary("Adaptive Learning shows the latest saved lessons, adaptive profile, and original-vs-revised grade audit. It refreshes only when you click Refresh Data, so switching Workflow pages stays instant.")
+
+        if st.session_state.get("adaptive_learning_refresh_error"):
+            st.caption("Last adaptive refresh warning: " + str(st.session_state.get("adaptive_learning_refresh_error")))
 
         if closed_trades.empty:
-            st.info("No closed trades yet. Adaptive Learning will populate once TP, SL, or expiry outcomes are recorded.")
+            st.info("No closed trades yet. Adaptive Learning will populate once TP, SL, or expiry outcomes are recorded and Refresh Data is clicked.")
         else:
-            with st.spinner("Updating Adaptive Learning from closed trades…"):
-                sync_result = run_adaptive_learning_sync(active_username(), settings, reason="adaptive_page", lesson_batch_size=25, audit_limit=75)
-            if sync_result.get("lessons_created", 0):
-                st.caption(f"Adaptive Learning saved {sync_result.get('lessons_created', 0)} new closed-trade lesson(s). Existing lessons were skipped.")
-            if sync_result.get("audit_upserts", 0):
-                st.caption(f"Adaptive grade audit updated {sync_result.get('audit_upserts', 0)} signal row(s).")
-            if sync_result.get("errors"):
-                st.caption("Adaptive sync skipped part of the update: " + "; ".join(sync_result.get("errors", [])[:2]))
-
-            adaptive_profile = build_adaptive_learning_profile(load_all_closed_trades_for_explain_ai(limit=APP_TABLE_MAX_ROWS), active_username(), settings)
-            render_adaptive_learning_panel(adaptive_profile)
+            adaptive_profile = load_adaptive_learning_profile(active_username())
+            if adaptive_profile:
+                render_adaptive_learning_panel(adaptive_profile)
+            else:
+                st.info("No saved adaptive profile yet. Click Refresh Data once to build lessons and the adaptive profile from closed trades.")
             render_adaptive_grade_audit_panel()
-            if not sync_result.get("profile_saved", False):
-                st.caption("Adaptive profile is visible here but was not saved. Run the explain_ai_adaptive_profile SQL migration once in Supabase.")
 
             lessons_df = load_explain_ai_lessons_table(limit=APP_TABLE_MAX_ROWS)
             if lessons_df.empty:
