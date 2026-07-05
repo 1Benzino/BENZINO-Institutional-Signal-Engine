@@ -2683,13 +2683,11 @@ def add_balance_extreme_labels(
     group_col: str | None = None,
     currency_prefix: str = "$",
 ) -> None:
-    """Add clear low/high/current labels without stacking labels on top of the curve.
+    """Mark each curve's Low, High, and Current points with hover-only labels.
 
-    Instead of placing every text box directly over the line, this pins the
-    labels in a right-side callout rail and staggers their y positions. The
-    actual low/high/current points are still marked on the curve, while the
-    readable amounts sit outside the plot area where they do not hide one
-    another.
+    The chart keeps the useful marker points but removes permanent annotation
+    boxes so the balance curve uses the full width and never gets squeezed by
+    callouts. Users can hover the marker to see the exact amount and timestamp.
     """
     if data is None or data.empty or x_col not in data.columns or y_col not in data.columns:
         return
@@ -2705,9 +2703,9 @@ def add_balance_extreme_labels(
     if group_col and group_col in work.columns:
         groups = [(str(name), grp.copy()) for name, grp in work.groupby(group_col, sort=False) if grp is not None and not grp.empty]
 
-    label_rows: list[dict] = []
-    seen_points: set[tuple[str, str, str]] = set()
-
+    # Use a light marker-only overlay. No annotations are added, so the chart
+    # remains spacious and all details are available through Plotly hover.
+    seen_points: set[tuple[str, str, str, str]] = set()
     for group_name, grp in groups:
         grp = grp.sort_values(x_col).reset_index(drop=True)
         if grp.empty:
@@ -2726,80 +2724,34 @@ def add_balance_extreme_labels(
             except Exception:
                 continue
 
-            # A short line can have low/high/current on the same candle. Show the
-            # current label and avoid duplicate low/high callouts for the same point.
-            point_key = (group_name, str(x_val), f"{y_val:.8f}")
-            if point_key in seen_points and role != "Current":
+            # Avoid duplicate markers for the same role/point, but allow Current
+            # to appear even if it is also the low/high point.
+            point_key = (group_name, role, str(x_val), f"{y_val:.8f}")
+            if point_key in seen_points:
                 continue
             seen_points.add(point_key)
 
-            # Mark the exact point on the curve, but keep the text outside the plot.
+            group_text = group_name if group_name else "Balance"
+            try:
+                time_text = pd.to_datetime(x_val, utc=True).strftime("%d %b %Y %H:%M UTC")
+            except Exception:
+                time_text = str(x_val)
+
             fig.add_trace(
                 go.Scatter(
                     x=[x_val],
                     y=[y_val],
                     mode="markers",
-                    marker=dict(size=7, symbol="circle-open"),
-                    hovertemplate=f"{group_name + ' · ' if group_name else ''}{role}: {currency_prefix}{y_val:,.2f}<extra></extra>",
+                    marker=dict(size=9, symbol="circle-open", line=dict(width=2)),
+                    hovertemplate=(
+                        f"<b>{html.escape(group_text)}</b><br>"
+                        f"{role}: {currency_prefix}{y_val:,.2f}<br>"
+                        f"{html.escape(time_text)}"
+                        "<extra></extra>"
+                    ),
                     showlegend=False,
                 )
             )
-            label_rows.append({
-                "group": group_name,
-                "role": role,
-                "x": x_val,
-                "y": y_val,
-                "label_y": y_val,
-                "text": f"{group_name + ' · ' if group_name else ''}{role}: {currency_prefix}{y_val:,.2f}",
-            })
-
-    if not label_rows:
-        return
-
-    y_values = [float(v) for v in work[y_col].dropna().tolist()]
-    y_min, y_max = min(y_values), max(y_values)
-    y_span = max(y_max - y_min, 1.0)
-    pad = y_span * 0.08
-    lower, upper = y_min - pad, y_max + pad
-    min_gap = y_span * 0.055
-
-    # Stagger the right-side label rail so labels never sit on top of each other.
-    label_rows.sort(key=lambda r: (r["label_y"], r["group"], r["role"]))
-    prev_y = None
-    for row in label_rows:
-        y = float(row["label_y"])
-        if prev_y is not None and y - prev_y < min_gap:
-            y = prev_y + min_gap
-        row["label_y"] = min(y, upper)
-        prev_y = row["label_y"]
-
-    # If the upward pass pushed the top labels out of range, compress downwards.
-    next_y = None
-    for row in reversed(label_rows):
-        y = float(row["label_y"])
-        if next_y is not None and next_y - y < min_gap:
-            y = next_y - min_gap
-        row["label_y"] = max(y, lower)
-        next_y = row["label_y"]
-
-    for row in label_rows:
-        fig.add_annotation(
-            x=1.012,
-            y=row["label_y"],
-            xref="paper",
-            yref="y",
-            text=row["text"],
-            showarrow=False,
-            xanchor="left",
-            align="left",
-            bgcolor="rgba(15,34,53,0.94)",
-            bordercolor="rgba(232,237,242,0.28)",
-            borderwidth=1,
-            borderpad=4,
-            font=dict(size=10, color="#E8EDF2"),
-        )
-
-    fig.update_yaxes(range=[lower, upper])
 
 
 def render_balance_curve(df: pd.DataFrame, settings: dict, title: str = "Balance curve", split_by_grade: bool = False, include_overall: bool = False) -> None:
@@ -2886,8 +2838,8 @@ def render_balance_curve(df: pd.DataFrame, settings: dict, title: str = "Balance
             yaxis_title=f"Balance after ({account:,.0f} start, {risk_pct:.2f}% risk)",
             xaxis_title="Resolved at",
             height=430,
-            margin=dict(l=20, r=230, t=25, b=40),
-            hovermode="x unified",
+            margin=dict(l=20, r=40, t=25, b=40),
+            hovermode="closest",
         )
     else:
         closed = closed.sort_values("curve_time").copy()
@@ -2895,7 +2847,7 @@ def render_balance_curve(df: pd.DataFrame, settings: dict, title: str = "Balance
         color_col = "timeframe" if "timeframe" in closed.columns else None
         fig = px.line(closed, x="curve_time", y="balance_after", color=color_col, title=title)
         add_balance_extreme_labels(fig, closed, "curve_time", "balance_after", color_col)
-        fig.update_layout(yaxis_title="Balance after", xaxis_title="Resolved at", height=430, margin=dict(l=20, r=230, t=25, b=40), hovermode="x unified")
+        fig.update_layout(yaxis_title="Balance after", xaxis_title="Resolved at", height=430, margin=dict(l=20, r=40, t=25, b=40), hovermode="closest")
 
     st.plotly_chart(fig, use_container_width=True)
 
