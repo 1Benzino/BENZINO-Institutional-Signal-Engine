@@ -539,6 +539,26 @@ def init_tables() -> None:
         failure_reason TEXT,
         created_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS prop_challenge_daily_ledger (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        scan_owner TEXT NOT NULL,
+        challenge_number INTEGER,
+        phase TEXT,
+        day DATE,
+        daily_pnl NUMERIC,
+        day_result TEXT,
+        target_hit TEXT,
+        trades INTEGER,
+        opening_balance NUMERIC,
+        closing_balance NUMERIC,
+        intraday_low NUMERIC,
+        daily_loss_floor NUMERIC,
+        phase_target NUMERIC,
+        daily_breach TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(scan_owner, challenge_number, phase, day)
+    );
     CREATE TABLE IF NOT EXISTS explain_ai_lessons (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         signal_id TEXT REFERENCES scanner_signals(signal_id),
@@ -649,6 +669,28 @@ def init_tables() -> None:
                 cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS capital_leverage NUMERIC")
                 cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS ftmo_normalization_factor NUMERIC DEFAULT 1")
                 cur.execute("ALTER TABLE prop_challenge_history ADD COLUMN IF NOT EXISTS failure_reason TEXT")
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS prop_challenge_daily_ledger (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        scan_owner TEXT NOT NULL,
+                        challenge_number INTEGER,
+                        phase TEXT,
+                        day DATE,
+                        daily_pnl NUMERIC,
+                        day_result TEXT,
+                        target_hit TEXT,
+                        trades INTEGER,
+                        opening_balance NUMERIC,
+                        closing_balance NUMERIC,
+                        intraday_low NUMERIC,
+                        daily_loss_floor NUMERIC,
+                        phase_target NUMERIC,
+                        daily_breach TEXT,
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ DEFAULT NOW(),
+                        UNIQUE(scan_owner, challenge_number, phase, day)
+                    )
+                """)
                 # Migration/fix: Telegram delivery must never control journal status.
                 # A+/A/B/C BUY/SELL setups are active journal trades; NO TRADE/HOLD stays SHADOW.
                 cur.execute(
@@ -1567,6 +1609,116 @@ def load_prop_challenge_history(username: str, timeframe: str, limit: int = APP_
     return df
 
 
+def load_prop_challenge_daily_ledger(username: str, timeframe: str, limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFrame:
+    """Read the persisted daily prop-firm ledger for this user/timeframe.
+
+    These rows are intentionally stored in Supabase so the Daily Challenge Ledger
+    does not shift on every app reload. It is replaced only by an explicit replay
+    rebuild or when no saved ledger exists yet.
+    """
+    scope = prop_challenge_scan_owner(username, timeframe)
+    try:
+        df = read_df(
+            """
+            SELECT
+                challenge_number AS "Challenge",
+                phase AS "Phase",
+                day AS "Day",
+                daily_pnl AS "Daily P/L",
+                day_result AS "Day Result",
+                target_hit AS "Target Hit",
+                trades AS "Trades",
+                opening_balance AS "Opening Balance",
+                closing_balance AS "Closing Balance",
+                intraday_low AS "Intraday Low",
+                daily_loss_floor AS "Daily Loss Floor",
+                phase_target AS "Phase Target",
+                daily_breach AS "Daily Breach"
+            FROM prop_challenge_daily_ledger
+            WHERE scan_owner = %s
+            ORDER BY challenge_number DESC, day DESC, phase DESC
+            LIMIT %s
+            """,
+            (scope, limit),
+        )
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    if "Challenge" in df.columns:
+        df["Challenge"] = df["Challenge"].apply(lambda x: f"#{int(x)}" if pd.notna(x) else "—")
+    return numeric_cols(df, ["Daily P/L", "Trades", "Opening Balance", "Closing Balance", "Intraday Low", "Daily Loss Floor", "Phase Target"])
+
+
+def save_prop_challenge_daily_ledger(username: str, timeframe: str, daily_df: pd.DataFrame) -> int:
+    """Replace the persisted daily ledger for this user's prop replay scope."""
+    scope = prop_challenge_scan_owner(username, timeframe)
+    if daily_df is None or daily_df.empty:
+        return 0
+    df = daily_df.copy()
+    # Normalise display labels (#1) back to integers for storage.
+    if "Challenge" not in df.columns:
+        return 0
+    df["challenge_number"] = df["Challenge"].astype(str).str.replace("#", "", regex=False)
+    df["challenge_number"] = pd.to_numeric(df["challenge_number"], errors="coerce").fillna(0).astype(int)
+    rows = []
+    for _, r in df.iterrows():
+        try:
+            day = pd.to_datetime(r.get("Day"), errors="coerce").date()
+            if pd.isna(pd.to_datetime(r.get("Day"), errors="coerce")):
+                continue
+        except Exception:
+            continue
+        rows.append((
+            scope,
+            int(r.get("challenge_number") or 0),
+            str(r.get("Phase", "") or ""),
+            day,
+            float(pd.to_numeric(r.get("Daily P/L"), errors="coerce") or 0.0),
+            str(r.get("Day Result", "") or ""),
+            str(r.get("Target Hit", "") or ""),
+            int(pd.to_numeric(r.get("Trades"), errors="coerce") or 0),
+            float(pd.to_numeric(r.get("Opening Balance"), errors="coerce") or 0.0),
+            float(pd.to_numeric(r.get("Closing Balance"), errors="coerce") or 0.0),
+            float(pd.to_numeric(r.get("Intraday Low"), errors="coerce") or 0.0),
+            float(pd.to_numeric(r.get("Daily Loss Floor"), errors="coerce") or 0.0),
+            float(pd.to_numeric(r.get("Phase Target"), errors="coerce") or 0.0),
+            str(r.get("Daily Breach", "") or ""),
+        ))
+    if not rows:
+        return 0
+    sql = """
+        INSERT INTO prop_challenge_daily_ledger(
+            scan_owner, challenge_number, phase, day, daily_pnl, day_result, target_hit,
+            trades, opening_balance, closing_balance, intraday_low, daily_loss_floor,
+            phase_target, daily_breach, updated_at
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        ON CONFLICT (scan_owner, challenge_number, phase, day) DO UPDATE SET
+            daily_pnl = EXCLUDED.daily_pnl,
+            day_result = EXCLUDED.day_result,
+            target_hit = EXCLUDED.target_hit,
+            trades = EXCLUDED.trades,
+            opening_balance = EXCLUDED.opening_balance,
+            closing_balance = EXCLUDED.closing_balance,
+            intraday_low = EXCLUDED.intraday_low,
+            daily_loss_floor = EXCLUDED.daily_loss_floor,
+            phase_target = EXCLUDED.phase_target,
+            daily_breach = EXCLUDED.daily_breach,
+            updated_at = NOW()
+    """
+    conn = db_connect()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM prop_challenge_daily_ledger WHERE scan_owner = %s", (scope,))
+                cur.executemany(sql, rows)
+        return len(rows)
+    except Exception:
+        return 0
+    finally:
+        conn.close()
+
+
 def archive_prop_challenge_attempt(
     username: str,
     timeframe: str,
@@ -1646,13 +1798,15 @@ def archive_prop_challenge_attempt(
     return True
 
 
-def rebuild_prop_challenge_history_from_trades(username: str, timeframe: str, histories: list[dict]) -> None:
+def rebuild_prop_challenge_history_from_trades(username: str, timeframe: str, histories: list[dict], daily_ledger: pd.DataFrame | None = None) -> None:
     """Replace this user's simulated prop-firm history for the timeframe with a clean replay."""
     scope = prop_challenge_scan_owner(username, timeframe)
     try:
         execute("DELETE FROM prop_challenge_history WHERE scan_owner = %s", (scope,))
     except Exception:
         return
+    if daily_ledger is not None and not daily_ledger.empty:
+        save_prop_challenge_daily_ledger(username, timeframe, daily_ledger)
     for idx, h in enumerate(histories, start=1):
         try:
             execute(
@@ -1697,6 +1851,7 @@ def rebuild_all_user_prop_histories_from_scanner(reset_legacy_ledgers: bool = Tr
             execute("DELETE FROM prop_firm_trades")
             execute("DELETE FROM prop_firm_state")
         execute("DELETE FROM prop_challenge_history")
+        execute("DELETE FROM prop_challenge_daily_ledger")
     except Exception as exc:
         result["errors"].append(f"Could not clear old prop ledgers: {exc}")
         return result
@@ -1752,7 +1907,7 @@ def rebuild_all_user_prop_histories_from_scanner(reset_legacy_ledgers: bool = Tr
 
             sim = simulate_prop_challenge_cycles(scoped, started_i, 10000.0)
             histories = sim.get("history", []) or []
-            rebuild_prop_challenge_history_from_trades(username_i, timeframe_i, histories)
+            rebuild_prop_challenge_history_from_trades(username_i, timeframe_i, histories, sim.get("all_daily", pd.DataFrame()))
             result["users"] += 1
             result["histories"] += len(histories)
         except Exception as exc:
@@ -6496,11 +6651,22 @@ def render_workflow(username: str, settings: dict) -> None:
         # the currently active Phase 1/Phase 2 account, so balances never keep
         # compounding past the $1,000 / $500 targets.
         prop_sim = simulate_prop_challenge_cycles(prop_closed, prop_started_at_raw, starting, trades)
-        rebuild_prop_challenge_history_from_trades(username, challenge_tf, prop_sim.get("history", []))
+        # Persist challenge summaries and the daily ledger only when the saved
+        # ledger is empty or when a replay produces more completed challenges.
+        # This keeps the displayed Daily Challenge Ledger stable across logins.
+        stored_history_for_tf = load_prop_challenge_history(username, challenge_tf, limit=APP_TABLE_MAX_ROWS)
+        saved_count = int(len(stored_history_for_tf)) if stored_history_for_tf is not None and not stored_history_for_tf.empty else 0
+        replay_history = prop_sim.get("history", []) or []
+        stored_daily_for_tf = load_prop_challenge_daily_ledger(username, challenge_tf, limit=APP_TABLE_MAX_ROWS)
+        if (not replay_history and (stored_daily_for_tf is None or stored_daily_for_tf.empty)):
+            pass
+        elif (stored_daily_for_tf is None or stored_daily_for_tf.empty) or len(replay_history) > saved_count:
+            rebuild_prop_challenge_history_from_trades(username, challenge_tf, replay_history, prop_sim.get("all_daily", pd.DataFrame()))
+            stored_daily_for_tf = load_prop_challenge_daily_ledger(username, challenge_tf, limit=APP_TABLE_MAX_ROWS)
         active_prop = prop_sim.get("active", {})
         prop_curve = prop_sim.get("active_curve", pd.DataFrame())
         prop_all_replay = prop_sim.get("all_trades", pd.DataFrame())
-        day_summary = prop_sim.get("all_daily", pd.DataFrame())
+        day_summary = stored_daily_for_tf if stored_daily_for_tf is not None and not stored_daily_for_tf.empty else prop_sim.get("all_daily", pd.DataFrame())
         if day_summary is None or day_summary.empty:
             day_summary = prop_sim.get("active_daily", pd.DataFrame())
         current = float(active_prop.get("equity", starting) or starting)
