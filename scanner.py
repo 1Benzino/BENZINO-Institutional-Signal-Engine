@@ -959,6 +959,33 @@ def init_tables() -> None:
     CREATE INDEX IF NOT EXISTS idx_capital_auto_asset_time
         ON capital_auto_orders (asset, created_at DESC);
 
+    CREATE TABLE IF NOT EXISTS capital_auto_trade_diagnostics (
+        id TEXT PRIMARY KEY,
+        username TEXT,
+        signal_id TEXT REFERENCES scanner_signals(signal_id),
+        display_id TEXT,
+        asset TEXT,
+        timeframe TEXT,
+        direction TEXT,
+        grade TEXT,
+        eligible BOOLEAN DEFAULT FALSE,
+        order_sent BOOLEAN DEFAULT FALSE,
+        status TEXT,
+        skip_reason TEXT,
+        deal_reference TEXT,
+        deal_id TEXT,
+        prop_selected BOOLEAN DEFAULT FALSE,
+        capital_executed BOOLEAN DEFAULT FALSE,
+        api_response JSONB,
+        checked_at TIMESTAMPTZ DEFAULT NOW(),
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_capital_auto_diag_user_time
+        ON capital_auto_trade_diagnostics (username, checked_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_capital_auto_diag_signal
+        ON capital_auto_trade_diagnostics (signal_id);
+
     CREATE TABLE IF NOT EXISTS capital_trade_comparisons (
         id TEXT PRIMARY KEY,
         capital_trade_id TEXT REFERENCES capital_executed_trades(id),
@@ -4845,8 +4872,8 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
                 cur.execute(
                     """
                     SELECT us.username, us.settings_json,
-                           COALESCE(ucc.enabled, FALSE) AS capital_connected,
-                           COALESCE(ucc.auto_trade_enabled, FALSE) AS user_auto_enabled,
+                           COALESCE(ucc.enabled, TRUE) AS capital_connected,
+                           COALESCE(ucc.auto_trade_enabled, TRUE) AS user_auto_enabled,
                            COALESCE(NULLIF(ucc.auto_trade_grades,''), 'A+,A') AS auto_trade_grades,
                            COALESCE(ucc.use_benzino_settings, TRUE) AS use_benzino_settings
                     FROM user_settings us
@@ -4865,8 +4892,8 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
                 cur.execute(
                     """
                     SELECT us.username, us.settings_json,
-                           COALESCE(ucc.enabled, FALSE) AS capital_connected,
-                           COALESCE(ucc.auto_trade_enabled, FALSE) AS user_auto_enabled,
+                           COALESCE(ucc.enabled, TRUE) AS capital_connected,
+                           COALESCE(ucc.auto_trade_enabled, TRUE) AS user_auto_enabled,
                            COALESCE(NULLIF(ucc.auto_trade_grades,''), 'A+,A') AS auto_trade_grades,
                            COALESCE(ucc.use_benzino_settings, TRUE) AS use_benzino_settings
                     FROM user_settings us
@@ -5010,6 +5037,73 @@ def record_capital_auto_order(sig: ScanResult, *, status: str, deal_reference: s
         print(f"[CapitalAuto] failed to record order for {sig.asset}: {exc}")
 
 
+
+
+def record_capital_auto_trade_diagnostic(
+    sig: ScanResult,
+    *,
+    username: str = "",
+    eligible: bool = False,
+    order_sent: bool = False,
+    status: str = "CHECKED",
+    skip_reason: str = "",
+    deal_reference: str = "",
+    deal_id: str = "",
+    prop_selected: bool | None = None,
+    capital_executed: bool | None = None,
+    api_response: dict | None = None,
+) -> None:
+    """Persist every auto-trade decision so the app can explain why orders did/didn't go to Capital.com."""
+    user = str(username or SCAN_OWNER or "").strip().lower()
+    if not user:
+        user = "unknown"
+    display_id = str(getattr(sig, "display_id", "") or "").strip()
+    if not display_id:
+        display_id = str(getattr(sig, "signal_id", "") or "")[:12]
+    if prop_selected is None:
+        prop_selected = bool(eligible)
+    if capital_executed is None:
+        capital_executed = bool(order_sent)
+    diag_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"CAPITAL_AUTO_DIAG::{user}::{getattr(sig, 'signal_id', '')}"))
+    sql = """
+        INSERT INTO capital_auto_trade_diagnostics(
+            id, username, signal_id, display_id, asset, timeframe, direction, grade,
+            eligible, order_sent, status, skip_reason, deal_reference, deal_id,
+            prop_selected, capital_executed, api_response, checked_at, updated_at
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
+        ON CONFLICT (id) DO UPDATE SET
+            display_id = EXCLUDED.display_id,
+            asset = EXCLUDED.asset,
+            timeframe = EXCLUDED.timeframe,
+            direction = EXCLUDED.direction,
+            grade = EXCLUDED.grade,
+            eligible = EXCLUDED.eligible,
+            order_sent = EXCLUDED.order_sent,
+            status = EXCLUDED.status,
+            skip_reason = EXCLUDED.skip_reason,
+            deal_reference = COALESCE(NULLIF(EXCLUDED.deal_reference,''), capital_auto_trade_diagnostics.deal_reference),
+            deal_id = COALESCE(NULLIF(EXCLUDED.deal_id,''), capital_auto_trade_diagnostics.deal_id),
+            prop_selected = EXCLUDED.prop_selected,
+            capital_executed = EXCLUDED.capital_executed,
+            api_response = EXCLUDED.api_response,
+            checked_at = NOW(),
+            updated_at = NOW()
+    """
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (
+                    diag_id, user, getattr(sig, "signal_id", ""), display_id,
+                    getattr(sig, "asset", ""), getattr(sig, "timeframe", ""), getattr(sig, "signal", ""), getattr(sig, "grade", ""),
+                    bool(eligible), bool(order_sent), str(status or ""), str(skip_reason or ""),
+                    str(deal_reference or ""), str(deal_id or ""), bool(prop_selected), bool(capital_executed),
+                    jsonb_dumps(api_response or {}),
+                ))
+        conn.close()
+    except Exception as exc:
+        print(f"[CapitalAutoDiag] failed to record diagnostic for {getattr(sig, 'asset', '')}: {exc}")
+
 def capital_confirm_deal(deal_reference: str) -> dict | None:
     deal_reference = str(deal_reference or "").strip()
     if not deal_reference:
@@ -5143,21 +5237,28 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
     direction = str(sig.signal or "").strip().upper()
     timeframe = str(sig.timeframe or "").strip().lower()
     if not CAPITAL_AUTO_TRADE_ENABLED:
+        record_capital_auto_trade_diagnostic(sig, username=SCAN_OWNER, eligible=False, order_sent=False, status="SKIPPED", skip_reason="platform_auto_trade_disabled")
         return False
     if CAPITAL_AUTO_TRADE_REQUIRE_DEMO and not CAPITAL_DEMO:
+        record_capital_auto_trade_diagnostic(sig, username=SCAN_OWNER, eligible=False, order_sent=False, status="SKIPPED", skip_reason="platform_requires_demo")
         print(f"[CapitalAuto] Refusing to auto-trade {sig.asset}: CAPITAL_DEMO is false.")
         return False
     if not ensure_capital_credentials_loaded():
+        record_capital_auto_trade_diagnostic(sig, username=SCAN_OWNER, eligible=False, order_sent=False, status="SKIPPED", skip_reason="capital_credentials_missing")
         print(f"[CapitalAuto] Capital credentials missing — cannot auto-trade {sig.asset}.")
         return False
     if grade not in CAPITAL_AUTO_TRADE_GRADES or direction not in {"BUY", "SELL"} or timeframe not in CAPITAL_AUTO_TRADE_TIMEFRAMES:
+        reason = "platform_grade_timeframe_or_direction_block"
+        record_capital_auto_trade_diagnostic(sig, username=SCAN_OWNER, eligible=False, order_sent=False, status="SKIPPED", skip_reason=reason)
         return False
     if capital_auto_order_exists(sig.signal_id):
+        record_capital_auto_trade_diagnostic(sig, username=SCAN_OWNER, eligible=False, order_sent=False, status="SKIPPED", skip_reason="duplicate_existing_capital_order")
         return False
 
     epic = capital_find_epic(sig.asset)
     if not epic:
         record_capital_auto_order(sig, status="FAILED", error="No Capital.com epic resolved")
+        record_capital_auto_trade_diagnostic(sig, username=SCAN_OWNER, eligible=False, order_sent=False, status="FAILED", skip_reason="no_capital_epic_resolved")
         print(f"[CapitalAuto] {sig.asset}: no Capital.com epic resolved; order skipped.")
         return False
 
@@ -5165,11 +5266,13 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
     if not bool(sizing.get("auto_trade_allowed")):
         reason = str(sizing.get("skip_reason") or "auto_trade_not_allowed")
         record_capital_auto_order(sig, status="SKIPPED", epic=epic, size=0, error=reason, raw={"sizing": sizing})
+        record_capital_auto_trade_diagnostic(sig, username=str(sizing.get("username") or SCAN_OWNER), eligible=False, order_sent=False, status="SKIPPED", skip_reason=reason, prop_selected=False, capital_executed=False, api_response={"sizing": sizing})
         print(f"[CapitalAuto] {sig.asset} {timeframe} {direction} {grade}: skipped · {reason}.")
         return False
     trade_size = calculate_capital_position_size(sig, sizing)
     if trade_size <= 0:
         record_capital_auto_order(sig, status="FAILED", epic=epic, size=0, error="Dynamic size calculation returned 0", raw={"sizing": sizing})
+        record_capital_auto_trade_diagnostic(sig, username=str(sizing.get("username") or SCAN_OWNER), eligible=False, order_sent=False, status="FAILED", skip_reason="dynamic_size_calculation_returned_0", prop_selected=False, capital_executed=False, api_response={"sizing": sizing})
         print(f"[CapitalAuto] {sig.asset} {timeframe}: size calculation failed; order skipped.")
         return False
 
@@ -5200,6 +5303,7 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
     adj_sl, adj_tp = adjust_levels_for_capital_constraints(sig, market_info)
     if CAPITAL_AUTO_TRADE_USE_STOPS and (adj_sl <= 0 or adj_tp <= 0):
         record_capital_auto_order(sig, status="SKIPPED", epic=epic, size=trade_size, error="Broker stop/TP constraints make a valid positive SL/TP impossible", raw={"sizing": sizing, "broker_constraints": market_info})
+        record_capital_auto_trade_diagnostic(sig, username=str(sizing.get("username") or SCAN_OWNER), eligible=False, order_sent=False, status="SKIPPED", skip_reason="invalid_broker_sl_tp_constraints", prop_selected=False, capital_executed=False, api_response={"sizing": sizing, "broker_constraints": market_info})
         print(f"[CapitalAuto] {sig.asset} {timeframe} {direction} {grade}: skipped · invalid broker SL/TP constraints.")
         return False
 
@@ -5252,7 +5356,9 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
     ok = bool(deal_reference) and (not confirm_status or confirm_status in {"ACCEPTED", "OPEN", "SUCCESS", "CONFIRMED"})
     status = "OPENED" if ok else "REJECTED"
     error = "" if ok else last_error
-    record_capital_auto_order(sig, status=status, deal_reference=deal_reference, deal_id=deal_id, epic=epic, size=confirmed_size, error=error, raw={"payload": last_payload, "original_size": trade_size, "adjusted_sl": adj_sl, "adjusted_tp": adj_tp, "broker_constraints": market_info, "sizing": sizing, "response": response or {}, "confirm": confirm or {}, "ftmo_leverage": FTMO_COMPARISON_LEVERAGE, "capital_leverage": capital_effective_leverage_for_asset(sig.asset, market_info), "ftmo_normalization_factor": ftmo_normalization_factor(sig.asset, market_info)})
+    _auto_raw = {"payload": last_payload, "original_size": trade_size, "adjusted_sl": adj_sl, "adjusted_tp": adj_tp, "broker_constraints": market_info, "sizing": sizing, "response": response or {}, "confirm": confirm or {}, "ftmo_leverage": FTMO_COMPARISON_LEVERAGE, "capital_leverage": capital_effective_leverage_for_asset(sig.asset, market_info), "ftmo_normalization_factor": ftmo_normalization_factor(sig.asset, market_info)}
+    record_capital_auto_order(sig, status=status, deal_reference=deal_reference, deal_id=deal_id, epic=epic, size=confirmed_size, error=error, raw=_auto_raw)
+    record_capital_auto_trade_diagnostic(sig, username=str(sizing.get("username") or SCAN_OWNER), eligible=ok, order_sent=ok, status="EXECUTED" if ok else "REJECTED", skip_reason=error, deal_reference=deal_reference, deal_id=deal_id, prop_selected=ok, capital_executed=ok, api_response=_auto_raw)
     user_label = str(sizing.get("username") or SCAN_OWNER)
     if ok:
         print(f"[CapitalAuto] {sig.asset} {timeframe} {direction} {grade}: demo trade opened for {user_label} · size {confirmed_size} · ref {deal_reference}.")
