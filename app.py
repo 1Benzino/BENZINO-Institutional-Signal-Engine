@@ -8406,13 +8406,30 @@ def render_workflow(username: str, settings: dict) -> None:
             st.info("No A+/A trades have closed yet for this user, watchlist, and selected timeframe.")
         else:
             view = all_closed_view_source.copy()
-            if "prop_event_time" in view.columns:
-                view["closed_at"] = view["prop_event_time"].apply(fmt_nairobi)
-            cols = ["closed_at", "asset", "timeframe", "signal", "grade", "status", "outcome", "r_multiple", "pnl_cash", "balance_after", "exit_reason", "entry", "sl", "tp"]
 
-            closed_trade_table = prepare_signal_table(
-                view[[c for c in cols if c in view.columns]].sort_values("closed_at", ascending=False)
-            )
+            # Build one canonical close timestamp for display/sorting. Some
+            # scoped prop rows come from the user journal stream and may have
+            # exit_at/shadow_closed_at but not prop_event_time. The previous
+            # code sorted by closed_at even when that column was absent, which
+            # caused the KeyError and prevented the Daily Ledger from rendering.
+            close_candidates = []
+            for time_col in ["prop_event_time", "exit_at", "shadow_closed_at", "closed_at", "created_at"]:
+                if time_col in view.columns:
+                    close_candidates.append(pd.to_datetime(view[time_col], errors="coerce", utc=True))
+            if close_candidates:
+                close_ts = close_candidates[0]
+                for candidate in close_candidates[1:]:
+                    close_ts = close_ts.fillna(candidate)
+                view["__closed_at_sort"] = close_ts
+                view["closed_at"] = close_ts.apply(lambda x: fmt_nairobi(x) if pd.notna(x) else "—")
+            else:
+                view["__closed_at_sort"] = pd.NaT
+                view["closed_at"] = "—"
+
+            cols = ["closed_at", "asset", "timeframe", "signal", "grade", "status", "outcome", "r_multiple", "pnl_cash", "balance_after", "exit_reason", "entry", "sl", "tp"]
+            sort_cols = [c for c in cols if c in view.columns]
+            closed_base = view.sort_values("__closed_at_sort", ascending=False, na_position="last")
+            closed_trade_table = prepare_signal_table(closed_base[sort_cols])
             closed_trade_table = closed_trade_table.rename(columns={
                 "closed_at": "Closed At",
                 "pnl_cash": "P/L Cash",
