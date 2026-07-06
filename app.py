@@ -2833,12 +2833,16 @@ def ensure_signal_schema(df: pd.DataFrame | None) -> pd.DataFrame:
     if "created_at_eat" not in df.columns or df["created_at_eat"].astype(str).eq("").all():
         df["created_at_eat"] = df["created_at"].apply(fmt_nairobi) if "created_at" in df.columns else ""
 
-    if "session" not in df.columns or df["session"].astype(str).eq("").all():
-        df["session"] = df["created_at"].apply(session_name) if "created_at" in df.columns else "Unknown"
-    else:
-        blank_session = df["session"].astype(str).str.strip().eq("")
-        if blank_session.any() and "created_at" in df.columns:
-            df.loc[blank_session, "session"] = df.loc[blank_session, "created_at"].apply(session_name)
+    # Session analytics must be based on signal generation time, not close time.
+    # Some historical/normalised rows carry blank/Unknown session values, so rebuild
+    # the session bucket from created_at whenever the stored value is missing/invalid.
+    valid_sessions = {"Asia", "London AM", "London/NY Overlap", "New York PM", "Late / Rollover"}
+    if "session" not in df.columns:
+        df["session"] = "Unknown"
+    session_text = df["session"].astype(str).str.strip()
+    invalid_session = session_text.eq("") | session_text.str.lower().isin({"unknown", "nan", "none", "nat"}) | (~session_text.isin(valid_sessions))
+    if invalid_session.any() and "created_at" in df.columns:
+        df.loc[invalid_session, "session"] = df.loc[invalid_session, "created_at"].apply(session_name)
 
     # Keep raw scanner columns first, then any derived/extra columns added later.
     ordered = [c for c in SIGNAL_SCHEMA_COLUMNS if c in df.columns]
@@ -3063,11 +3067,24 @@ def win_rate_group(group: pd.DataFrame) -> float:
 
 
 def closed_resolved_trades(df: pd.DataFrame) -> pd.DataFrame:
-    """Return rows that count as resolved for performance/win-rate analysis."""
+    """Return rows that count as resolved for performance/win-rate analysis.
+
+    Session is repaired here as a final safety net using signal generation time
+    (`created_at`) only. Close time must never decide session analytics.
+    """
     if df is None or df.empty:
         return pd.DataFrame()
     wins, losses, breakevens, resolved = resolved_outcome_masks(df)
-    return df.loc[resolved].copy()
+    out = df.loc[resolved].copy()
+    if not out.empty:
+        valid_sessions = {"Asia", "London AM", "London/NY Overlap", "New York PM", "Late / Rollover"}
+        if "session" not in out.columns:
+            out["session"] = "Unknown"
+        session_text = out["session"].astype(str).str.strip()
+        invalid_session = session_text.eq("") | session_text.str.lower().isin({"unknown", "nan", "none", "nat"}) | (~session_text.isin(valid_sessions))
+        if invalid_session.any() and "created_at" in out.columns:
+            out.loc[invalid_session, "session"] = out.loc[invalid_session, "created_at"].apply(session_name)
+    return out
 
 
 
