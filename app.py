@@ -5569,16 +5569,50 @@ def render_benzino_aggrid(
     pinned = pinned or []
     badge_cols = badge_cols or {}
     numeric_cols_right = numeric_cols_right or []
+
+    # Keep tables compact by sizing columns to their actual content instead of
+    # stretching every column across the full table width. Long narrative fields
+    # are capped so they remain readable without stealing space from numeric/date
+    # columns. Users can still resize manually in AgGrid.
+    def _content_width(col_name: str) -> int:
+        label = str(col_name)
+        try:
+            sample = view[col_name].dropna().astype(str).head(300)
+            max_len = max([len(label)] + [len(x) for x in sample.tolist()])
+        except Exception:
+            max_len = len(label)
+        lower = label.lower().strip()
+        explicit = {
+            "challenge": 110, "phase": 125, "day": 130, "date": 135,
+            "trades": 95, "signal": 115, "grade": 95, "status": 130,
+            "outcome": 120, "target hit": 120, "day result": 135,
+            "timeframe": 120, "r multiple": 120, "rr": 85,
+            "entry": 120, "sl": 120, "tp": 120,
+            "opening balance": 170, "closing balance": 170,
+            "daily p/l": 135, "intraday low": 150,
+            "daily loss floor": 175, "phase target": 155,
+            "signal id": 150, "asset": 115,
+        }
+        if lower in explicit:
+            return explicit[lower]
+        if "reason" in lower or "lesson" in lower or "notes" in lower:
+            return 280
+        if "created" in lower or "closed" in lower or "opened" in lower or "updated" in lower:
+            return 180
+        if "balance" in lower or "p/l" in lower or "pnl" in lower or "price" in lower:
+            return max(130, min(185, 18 + max_len * 8))
+        return max(90, min(220, 22 + max_len * 8))
+
     for col in view.columns:
-        kwargs = {}
+        kwargs = {"width": _content_width(col), "suppressSizeToFit": True}
         if col in pinned:
             kwargs["pinned"] = "left"
+            kwargs["lockPinned"] = True
         if col in badge_cols and badge_cols[col] in renderers:
             kwargs["cellRenderer"] = renderers[badge_cols[col]]
         if col in numeric_cols_right:
             kwargs["cellStyle"] = {"textAlign": "right", "fontWeight": "700"}
-        if kwargs:
-            gb.configure_column(col, **kwargs)
+        gb.configure_column(col, **kwargs)
 
     response = AgGrid(
         view,
@@ -8829,8 +8863,9 @@ def render_workflow(username: str, settings: dict) -> None:
 
                 daily_view = daily_view.drop(columns=["__challenge_no", "__phase_order", "__day_sort"], errors="ignore")
 
-                # Column order: keep the key result flags immediately after Daily P/L,
-                # then show the balances as properly formatted dollar amounts.
+                # Daily ledger order: challenge first, then phase, then date.
+                # Challenge / Phase / Day are pinned so the rest of the account
+                # statement can scroll horizontally without losing context.
                 preferred_daily_cols = [
                     "Challenge", "Phase", "Day", "Daily P/L", "Day Result", "Target Hit",
                     "Trades", "Opening Balance", "Closing Balance", "Intraday Low",
