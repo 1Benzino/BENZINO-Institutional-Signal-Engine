@@ -4513,26 +4513,144 @@ def _capital_level_from_raw(raw: dict, kind: str):
     return None
 
 
-def capital_fetch_position_detail(deal_id: str = "", deal_reference: str = "") -> dict:
-    """Fetch the broker's current position/deal details for one Capital.com trade.
 
-    Capital.com returns the exact accepted entry/SL/TP on position/deal endpoints.
-    The exact path differs slightly between API versions, so we try the standard
-    position detail endpoint first and then fall back to confirms by reference.
+def _looks_like_internal_or_invalid_deal_id(value: str) -> bool:
+    """Return True for ids that should not be used against /positions/{dealId}.
+
+    Capital.com POST /positions returns a dealReference; GET /confirms/{dealReference}
+    returns the actual broker deal ids in affectedDeals. In earlier builds we sometimes
+    persisted UUID-looking values as deal_id, which Capital rejects with
+    error.not-found.dealId. Avoid hammering the broker with those ids.
+    """
+    s = str(value or "").strip()
+    if not s:
+        return True
+    # UUID-like values in our logs are not usable Capital.com position deal ids.
+    if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", s):
+        return True
+    if s.upper().startswith(("CAPITAL_", "CAPITAL:", "AUTO:", "EXEC_")):
+        return True
+    return False
+
+
+def _extract_capital_affected_deal(confirm: dict) -> dict:
+    """Extract the real broker deal id from GET /confirms/{dealReference}.
+
+    Capital.com documents that a POST /positions response must be confirmed through
+    GET /confirms/{dealReference}; the confirmation contains affectedDeals and more
+    than one deal may be opened. For Benzino market orders we take the first opened
+    deal, and fall back to the first affected deal when no OPEN row is labelled.
+    """
+    confirm = _json_dict(confirm)
+    affected = confirm.get("affectedDeals")
+    if not isinstance(affected, list):
+        affected = confirm.get("affected_deals")
+    if not isinstance(affected, list):
+        affected = []
+
+    candidates = []
+    for d in affected:
+        if isinstance(d, dict):
+            candidates.append(d)
+    if not candidates:
+        return {}
+
+    def _score(d: dict) -> int:
+        status = str(_first_value(d, ["status", "dealStatus"], "") or "").upper()
+        deal_type = str(_first_value(d, ["dealType", "type"], "") or "").upper()
+        score = 0
+        if "OPEN" in status or "OPEN" in deal_type:
+            score += 10
+        if str(_first_value(d, ["dealId", "dealID", "id"], "") or "").strip():
+            score += 5
+        return score
+
+    candidates.sort(key=_score, reverse=True)
+    return candidates[0]
+
+
+def _real_deal_id_from_confirm(confirm: dict) -> str:
+    affected = _extract_capital_affected_deal(confirm)
+    raw = str(
+        _first_value(affected, ["dealId", "dealID", "id", "positionId"], "")
+        or _first_value(_json_dict(confirm), ["dealId", "dealID"], "")
+        or ""
+    ).strip()
+    return "" if _looks_like_internal_or_invalid_deal_id(raw) else raw
+
+
+def _merge_confirm_affected_deal(confirm: dict) -> dict:
+    """Return a broker-detail-shaped dict from confirmation + affectedDeals."""
+    confirm = _json_dict(confirm)
+    affected = _extract_capital_affected_deal(confirm)
+    merged = dict(confirm)
+    if affected:
+        merged["deal"] = affected
+        merged["affectedDeal"] = affected
+        # Preserve affectedDeals too for _capital_level_from_raw paths.
+        if "affectedDeals" not in merged:
+            merged["affectedDeals"] = [affected]
+    return merged
+
+
+def _find_open_position_from_list(deal_id: str = "", deal_reference: str = "", epic: str = "") -> dict:
+    """Find an open Capital.com position from GET /positions without detail endpoint spam."""
+    did = str(deal_id or "").strip()
+    dref = str(deal_reference or "").strip()
+    epic_u = str(epic or "").strip().upper()
+    for row in capital_fetch_open_positions():
+        pos = row.get("position") if isinstance(row.get("position"), dict) else row
+        market = row.get("market") if isinstance(row.get("market"), dict) else {}
+        row_deal_id = str(_first_value(pos, ["dealId", "dealID", "id", "positionId"], "") or "").strip()
+        row_ref = str(_first_value(pos, ["dealReference", "dealRef", "reference"], "") or "").strip()
+        row_epic = str(_first_value(market, ["epic"], "") or _first_value(pos, ["epic", "marketId"], "") or "").strip().upper()
+        if did and row_deal_id and did == row_deal_id:
+            return row
+        if dref and row_ref and dref == row_ref:
+            return row
+        if epic_u and row_epic and epic_u == row_epic and (not did and not dref):
+            return row
+    return {}
+
+def capital_fetch_position_detail(deal_id: str = "", deal_reference: str = "") -> dict:
+    """Fetch broker-confirmed details for one Capital.com trade.
+
+    Correct flow:
+      1. Confirm by dealReference and extract the real broker deal id from affectedDeals.
+      2. Read the open-position list and match that real deal id/reference.
+      3. Only try /positions/{dealId} when the id is a real-looking Capital deal id.
+
+    This prevents the hundreds of 404s caused by querying UUID-looking internal ids.
     """
     deal_id = str(deal_id or "").strip()
     deal_reference = str(deal_reference or "").strip()
-    candidates = []
-    if deal_id:
-        candidates.extend([f"/positions/{deal_id}", f"/positions/deal/{deal_id}"])
+    confirm_data = {}
+
     if deal_reference:
-        candidates.append(f"/confirms/{deal_reference}")
-    for path in candidates:
-        data = capital_request("GET", path, retries=1)
+        confirm_data = capital_confirm_deal(deal_reference) or {}
+        real_id = _real_deal_id_from_confirm(confirm_data)
+        if real_id:
+            deal_id = real_id
+
+    # Most reliable/noiseless source for open broker SL/TP/entry is GET /positions.
+    listed = _find_open_position_from_list(deal_id=deal_id, deal_reference=deal_reference)
+    if isinstance(listed, dict) and listed:
+        merged = dict(listed)
+        if confirm_data:
+            merged["confirm"] = _merge_confirm_affected_deal(confirm_data)
+        return merged
+
+    # If the position is already closed or the list endpoint omits it, keep confirm
+    # details. Confirmation is a broker source and includes affectedDeals/dealId.
+    if confirm_data:
+        return _merge_confirm_affected_deal(confirm_data)
+
+    # Final fallback: direct detail endpoint, but never with known-bad/internal ids.
+    if deal_id and not _looks_like_internal_or_invalid_deal_id(deal_id):
+        data = capital_request("GET", f"/positions/{deal_id}", retries=1)
         if isinstance(data, dict) and data:
             return data
     return {}
-
 
 def _broker_values_from_actual_and_order(actual_raw: dict, order_raw: dict, deal_id: str = "", deal_reference: str = "") -> dict:
     """Return Capital-confirmed broker levels for audit.
@@ -5637,10 +5755,17 @@ def adjust_levels_for_capital_constraints(sig: ScanResult, market_info: dict, *,
 
 
 def capital_update_position_levels(deal_id: str, stop_level: float, profit_level: float) -> dict:
-    """Best-effort update of broker SL/TP to the post-fill fixed 1:2 levels."""
+    """Best-effort update of broker SL/TP to post-fill fixed 1:2 levels.
+
+    Do not use PATCH: Capital.com rejects it with HTTP 405. Also do not attempt
+    any position update when the stored id is the old UUID-looking internal value;
+    that only creates noisy 404s. The normal order payload already sends a 1:2
+    stop/profit plan, so this is only a post-fill normalisation attempt when a
+    real affectedDeals dealId is available.
+    """
     deal_id = str(deal_id or "").strip()
-    if not deal_id:
-        return {"ok": False, "error": "missing_deal_id"}
+    if not deal_id or _looks_like_internal_or_invalid_deal_id(deal_id):
+        return {"ok": False, "skipped": True, "error": "missing_or_invalid_real_deal_id"}
     try:
         stop_level = float(stop_level)
         profit_level = float(profit_level)
@@ -5653,16 +5778,13 @@ def capital_update_position_levels(deal_id: str, stop_level: float, profit_level
         {"guaranteedStop": False, "stopLevel": stop_level, "profitLevel": profit_level},
         {"stopLevel": stop_level, "profitLevel": profit_level},
     ]
-    paths = [f"/positions/{deal_id}"]
     last_error = ""
     for payload in payloads:
-        for method in ("PUT", "PATCH"):
-            for path in paths:
-                _CAPITAL_LAST_ERROR["text"] = ""
-                res = capital_request(method, path, json_body=payload, retries=1)
-                if isinstance(res, dict):
-                    return {"ok": True, "method": method, "path": path, "payload": payload, "response": res}
-                last_error = str(_CAPITAL_LAST_ERROR.get("text") or "")[:500]
+        _CAPITAL_LAST_ERROR["text"] = ""
+        res = capital_request("PUT", f"/positions/{deal_id}", json_body=payload, retries=1)
+        if isinstance(res, dict):
+            return {"ok": True, "method": "PUT", "path": f"/positions/{deal_id}", "payload": payload, "response": res}
+        last_error = str(_CAPITAL_LAST_ERROR.get("text") or "")[:500]
     return {"ok": False, "error": last_error or "position_update_failed", "payload": payloads[0]}
 
 def build_capital_size_attempts(base_size: float, market_info: dict) -> list[float]:
@@ -5826,7 +5948,10 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
         confirm = capital_confirm_deal(deal_reference) if deal_reference else None
         confirm_status_try = str(_first_value(confirm or {}, ["dealStatus", "status"], "") or "").upper()
         reject_reason = str(_first_value(confirm or {}, ["reason", "rejectReason", "errorCode", "errorMessage", "message"], "") or "")
-        deal_id_try = str(_first_value(confirm or {}, ["dealId", "dealID"], "") or "")
+        # Capital confirmation stores the real position deal id inside affectedDeals.
+        # Do not persist UUID-looking/internal ids as deal_id; they cannot be used
+        # with /positions/{dealId} and cause repeated 404s.
+        deal_id_try = _real_deal_id_from_confirm(confirm or {})
         if bool(deal_reference) and (not confirm_status_try or confirm_status_try in {"ACCEPTED", "OPEN", "SUCCESS", "CONFIRMED"}):
             deal_id = deal_id_try
             confirmed_size = float(attempt_size)
