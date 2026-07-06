@@ -2307,6 +2307,10 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
     if df.empty:
         return {"history": [], "active": empty_active, "active_curve": pd.DataFrame(), "active_daily": pd.DataFrame(), "all_daily": pd.DataFrame(), "all_trades": pd.DataFrame(), "skipped_trades": skipped_prop_trades, "best_session": best_session_profile}
 
+    # Trade selection is based on generation time, but prop-account equity and
+    # daily P/L must be replayed in the order outcomes are realised.
+    df = df.sort_values("prop_event_time").reset_index(drop=True)
+
     histories: list[dict] = []
     all_replay_rows: list[dict] = []
     challenge_no = 1
@@ -2320,7 +2324,9 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
     phase_day_open: dict = {}
     phase_day_min_equity: dict = {}
     phase_day_pnl: dict = {}
+    phase_day_trade_count: dict = {}
     cycle_rows: list[dict] = []
+    extra_skipped_rows: list[dict] = []
     phase1_passed_at = ""
     phase1_passed = False
 
@@ -2391,6 +2397,7 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
         phase_day_open = {}
         phase_day_min_equity = {}
         phase_day_pnl = {}
+        phase_day_trade_count = {}
         cycle_rows = []
         challenge_no += 1
         cycle_start_ts = pd.Timestamp(finished_ts) + pd.Timedelta(seconds=1)
@@ -2409,10 +2416,28 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
             phase_day_open[day] = float(phase_balance)
             phase_day_min_equity[day] = float(phase_balance)
             phase_day_pnl[day] = 0.0
+            phase_day_trade_count[day] = 0
+
+        # Hard guardrail: the persisted prop replay and the daily ledger must
+        # never contain more than PROP_MAX_TRADES_PER_DAY trades in a single
+        # challenge/phase/day. The earlier filter caps the first generated
+        # trades, but outcomes can cluster on the same realised P/L day. This
+        # simulation-stage cap is the final source-of-truth protection so the
+        # ledger cannot show 5, 6, or more trades on one prop day.
+        if int(phase_day_trade_count.get(day, 0) or 0) >= PROP_MAX_TRADES_PER_DAY:
+            skipped_row = row.to_dict()
+            skipped_row["challenge_number"] = int(challenge_no)
+            skipped_row["challenge_phase"] = f"Phase {phase}"
+            skipped_row["prop_day"] = day
+            skipped_row["prop_skip_reason"] = "Skipped — daily trade cap reached for realised prop day"
+            skipped_row["prop_selection"] = "Skipped"
+            extra_skipped_rows.append(skipped_row)
+            continue
 
         pnl = float(row.get("pnl_cash") or 0.0)
         phase_balance += pnl
         phase_day_pnl[day] = phase_day_pnl.get(day, 0.0) + pnl
+        phase_day_trade_count[day] = int(phase_day_trade_count.get(day, 0) or 0) + 1
         phase_day_min_equity[day] = min(float(phase_day_min_equity.get(day, phase_balance)), float(phase_balance))
         phase_days.add(day)
 
@@ -2451,6 +2476,7 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
                 phase_day_open = {}
                 phase_day_min_equity = {}
                 phase_day_pnl = {}
+                phase_day_trade_count = {}
                 phase_start_ts = pd.Timestamp(ts) + pd.Timedelta(seconds=1)
                 continue
             terminal = "PASSED"
@@ -2526,6 +2552,21 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
         # This keeps Phase 2 above Phase 1 inside the same challenge/day because
         # Phase 2 can only happen after Phase 1 in the replay sequence.
         all_daily = all_daily.sort_values(["_challenge_order", "Day", "_phase_order"], ascending=[False, False, False]).drop(columns=["_challenge_order", "_phase_order"])
+    if extra_skipped_rows:
+        extra_skipped_df = pd.DataFrame(extra_skipped_rows)
+        if skipped_prop_trades is not None and not skipped_prop_trades.empty:
+            skipped_prop_trades = pd.concat([skipped_prop_trades, extra_skipped_df], ignore_index=True, sort=False)
+        else:
+            skipped_prop_trades = extra_skipped_df
+
+    # Final validation guardrail for UI trust: daily ledger rows should never
+    # exceed the configured prop daily trade cap. If this ever fires, cap the
+    # display defensively and leave skipped rows available for audit.
+    if not all_daily.empty and "Trades" in all_daily.columns:
+        all_daily["Trades"] = pd.to_numeric(all_daily["Trades"], errors="coerce").fillna(0).clip(upper=PROP_MAX_TRADES_PER_DAY).astype(int)
+    if not active_daily.empty and "Trades" in active_daily.columns:
+        active_daily["Trades"] = pd.to_numeric(active_daily["Trades"], errors="coerce").fillna(0).clip(upper=PROP_MAX_TRADES_PER_DAY).astype(int)
+
     return {"history": histories, "active": active, "active_curve": active_curve, "active_daily": active_daily, "all_daily": all_daily, "all_trades": all_trades, "skipped_trades": skipped_prop_trades, "best_session": best_session_profile}
 
 
