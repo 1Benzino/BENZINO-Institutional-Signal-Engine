@@ -2425,6 +2425,42 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
         all_daily = all_daily.sort_values(["_challenge_order", "Day", "_phase_order"], ascending=[False, False, False]).drop(columns=["_challenge_order", "_phase_order"])
     return {"history": histories, "active": active, "active_curve": active_curve, "active_daily": active_daily, "all_daily": all_daily, "all_trades": all_trades, "skipped_trades": skipped_prop_trades, "best_session": best_session_profile}
 
+
+
+def rebuild_user_prop_challenge_ledger(username: str, settings: dict) -> dict:
+    """Explicitly rebuild this user's persisted prop challenge ledger.
+
+    Called from Refresh Data, not normal page load. This gives the user a stable
+    persisted ledger while still allowing a deliberate rebuild after rules/data
+    changes.
+    """
+    out = {"rebuilt": False, "history_rows": 0, "daily_rows": 0, "error": ""}
+    try:
+        challenge_tf = str(settings.get("preferred_timeframe") or settings.get("view_timeframe") or "1h")
+        user_df = load_signals_for_user(username, settings)
+        if user_df is None or user_df.empty:
+            return out
+        tf_settings = dict(settings or {})
+        tf_settings["view_timeframe"] = challenge_tf
+        user_df = apply_timeframe_view(user_df, tf_settings)
+        prop_source = user_df[user_df.get("grade", pd.Series(dtype=str)).astype(str).isin(["A+", "A"])].copy() if user_df is not None and not user_df.empty else pd.DataFrame()
+        prop_closed = closed_resolved_trades(prop_source) if prop_source is not None and not prop_source.empty else pd.DataFrame()
+        sim = simulate_prop_challenge_cycles(
+            prop_closed,
+            str(settings.get("tracking_started_at", "") or ""),
+            10000.0,
+            user_df,
+        )
+        histories = sim.get("history", []) or []
+        daily = sim.get("all_daily", pd.DataFrame())
+        rebuild_prop_challenge_history_from_trades(username, challenge_tf, histories, daily)
+        out["rebuilt"] = True
+        out["history_rows"] = int(len(histories))
+        out["daily_rows"] = int(len(daily)) if daily is not None and not daily.empty else 0
+    except Exception as exc:
+        out["error"] = str(exc)
+    return out
+
 def prop_firm_monte_carlo(trades_df: pd.DataFrame, state: dict, runs: int = 2000) -> dict:
     """
     Bootstrap the REAL closed A+/A R-multiples to estimate forward pass/fail odds
@@ -2563,6 +2599,25 @@ def load_all_system_signals(settings: dict, limit: int = APP_TABLE_MAX_ROWS) -> 
     df["session"] = df["created_at"].apply(session_name)
     return enrich_position_sizing(df, settings)
 
+
+
+
+def load_system_resolved_trades_source(settings: dict | None = None, limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFrame:
+    """Return the single source-of-truth closed-trade dataset used everywhere.
+
+    System Performance, Adaptive Learning lessons, and Adaptive Grade Audit
+    must all reconcile to this same resolved A+/A/B/C BUY/SELL scanner sample.
+    """
+    base_settings = settings or DEFAULT_SETTINGS.copy()
+    df = load_all_system_signals(base_settings, limit=limit)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    work = df.copy()
+    if "grade" in work.columns:
+        work = work[work["grade"].astype(str).isin(VALID_GRADES)].copy()
+    if "signal" in work.columns:
+        work = work[work["signal"].astype(str).str.upper().isin(["BUY", "SELL"])].copy()
+    return closed_resolved_trades(work)
 
 def apply_timeframe_view(df: pd.DataFrame, settings: dict) -> pd.DataFrame:
     """Filter dashboard rows to the selected timeframe, while keeping All available."""
@@ -3963,9 +4018,28 @@ def render_adaptive_grade_audit_panel() -> None:
     closed = audit.copy()
     closed["realised_r"] = pd.to_numeric(closed.get("realised_r"), errors="coerce")
     closed = closed[closed["realised_r"].notna()].copy()
-    orig = _audit_summary(closed, "original_r", "original_trade_allowed")
-    adap = _audit_summary(closed, "adaptive_r", "adaptive_trade_allowed")
+
+    # Original scanner performance must reconcile to System Performance.
+    system_closed = load_system_resolved_trades_source(DEFAULT_SETTINGS.copy(), limit=APP_TABLE_MAX_ROWS)
+    if system_closed is not None and not system_closed.empty:
+        system_r = pd.to_numeric(system_closed.get("r_multiple"), errors="coerce")
+        system_r = system_r[system_r.notna()]
+        orig = {
+            "trades": int(len(system_r)),
+            "win_rate": round(float((system_r > 0).mean() * 100.0), 2) if len(system_r) else 0.0,
+            "avg_r": round(float(system_r.mean()), 3) if len(system_r) else 0.0,
+            "total_r": round(float(system_r.sum()), 3) if len(system_r) else 0.0,
+        }
+    else:
+        orig = _audit_summary(closed, "original_r", "original_trade_allowed")
+
     changed = int((audit.get("original_grade", "").astype(str) != audit.get("revised_grade", "").astype(str)).sum()) if not audit.empty else 0
+    if changed == 0:
+        # If the adaptive engine has not changed any grades, its performance is
+        # mathematically the same as the production/system path.
+        adap = dict(orig)
+    else:
+        adap = _audit_summary(closed, "adaptive_r", "adaptive_trade_allowed")
 
     st.markdown("<div class='benzino-panel-title'>Adaptive Grade Audit</div>", unsafe_allow_html=True)
     st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
@@ -4372,42 +4446,12 @@ def sync_missing_explain_ai_lessons(closed_trades: pd.DataFrame, limit: int = 10
 
 
 def load_all_closed_trades_for_explain_ai(limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFrame:
-    """Load every resolved closed trade in scanner_signals for historical lesson backfill.
+    """Load the same system-wide resolved closed trades used by System Performance.
 
-    This is intentionally system-wide: it is not limited to the logged-in user's
-    watchlist or tracking period because adaptive learning should be able to
-    learn from all closed outcomes already stored in Supabase.
+    This keeps Adaptive Learning, lessons, and Original vs Adaptive analysis
+    reconciled with the System Performance source of truth.
     """
-    df = read_df(
-        """
-        SELECT *
-        FROM scanner_signals
-        WHERE (
-            UPPER(COALESCE(status, '')) IN ('CLOSED_TP', 'CLOSED_SL', 'EXPIRED', 'CLOSED')
-            OR exit_at IS NOT NULL
-            OR r_multiple IS NOT NULL
-        )
-          AND UPPER(COALESCE(grade, '')) IN ('A+', 'A', 'B', 'C')
-          AND UPPER(COALESCE(signal, '')) IN ('BUY', 'SELL')
-        ORDER BY COALESCE(exit_at, created_at) ASC
-        LIMIT %s
-        """,
-        (int(limit or APP_TABLE_MAX_ROWS),),
-    )
-    if df.empty:
-        return df
-    df = numeric_cols(df, [
-        "confidence", "edge_score", "ml_prob", "entry", "sl", "tp", "rr",
-        "rsi", "atr", "exit_price", "r_multiple", "bars_open", "mtf_score",
-        "shadow_r_multiple",
-    ])
-    for col in ["created_at", "exit_at", "shadow_closed_at", "candle_close"]:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce", utc=True)
-    if "created_at" in df.columns:
-        df["created_at_eat"] = df["created_at"].apply(fmt_nairobi)
-        df["session"] = df["created_at"].apply(session_name)
-    return closed_resolved_trades(df)
+    return load_system_resolved_trades_source(DEFAULT_SETTINGS.copy(), limit=limit)
 
 
 def backfill_all_historical_explain_ai_lessons(limit: int = APP_TABLE_MAX_ROWS, batch_size: int = 1500) -> dict:
@@ -4719,7 +4763,7 @@ def render_adaptive_learning_panel(profile: dict) -> None:
     st.markdown("<div class='benzino-panel-title' style='margin-bottom:16px;'>Adaptive Learning Profile</div>", unsafe_allow_html=True)
     metric_cols = st.columns(3)
     with metric_cols[0]:
-        metric_card("Lessons learned from", f"{fmt_count(profile.get('closed_trade_count'))} trades", "Closed User Journal outcomes")
+        metric_card("Lessons learned from", f"{fmt_count(profile.get('closed_trade_count'))} trades", "System Performance source")
     with metric_cols[1]:
         metric_card("Learning win rate", fmt_pct(profile.get("win_rate")), "Closed outcomes only")
     with metric_cols[2]:
@@ -6331,6 +6375,8 @@ def sidebar_controls(username: str, settings: dict) -> str:
                         lesson_batch_size=APP_TABLE_MAX_ROWS,
                         audit_limit=APP_TABLE_MAX_ROWS,
                     )
+                    prop_rebuild = rebuild_user_prop_challenge_ledger(username, settings)
+                    sync_result["prop_rebuild"] = prop_rebuild
                     st.session_state["adaptive_learning_last_refresh"] = sync_result
                 except Exception as exc:
                     st.session_state["adaptive_learning_refresh_error"] = str(exc)
@@ -7017,11 +7063,14 @@ def render_system_performance(system_df: pd.DataFrame, settings: dict) -> None:
     graded = system_df[system_df["grade"].astype(str).isin(VALID_GRADES)].copy()
     no_trade = system_df[system_df["grade"].astype(str).eq("NO TRADE")].copy()
     open_trades = graded[graded["status"].astype(str).str.upper().eq("OPEN")].copy()
-    closed = graded[graded["outcome"].isin(["WIN", "LOSS", "BREAKEVEN", "CLOSED", "EXPIRED_WIN", "EXPIRED_LOSS", "EXPIRED_BREAKEVEN"])].copy()
-    resolved = closed_resolved_trades(closed)
 
-    win_rate = win_rate_from_resolved(closed)
-    avg_r = pd.to_numeric(closed.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean() if len(closed) else 0.0
+    # Source of truth: only rows that the shared resolved-outcome logic counts.
+    # Adaptive Learning and Adaptive Grade Audit must reconcile to this exact set.
+    resolved = closed_resolved_trades(graded)
+    closed = resolved.copy()
+
+    win_rate = win_rate_from_resolved(resolved)
+    avg_r = pd.to_numeric(resolved.get("r_multiple", pd.Series(dtype=float)), errors="coerce").mean() if len(resolved) else 0.0
 
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1: metric_card("All scanner rows", f"{len(system_df):,}", "Full Supabase history")
@@ -7729,7 +7778,7 @@ def render_workflow(username: str, settings: dict) -> None:
             prop_start_map = {}
         prop_started_at_raw = str(settings.get("tracking_started_at", "") or "")
 
-        workflow_commentary(f"This view recalculates the FTMO-style challenge from your current watchlist and selected timeframe <b>({html.escape(str(challenge_tf))})</b>. It uses only <b>A+/A closed trades</b>, a fixed <b>&#36;10,000</b> account, <b>1% risk per trade</b>, a <b>&#36;1,000 Phase 1 target</b>, a <b>&#36;500 Phase 2 target</b>, a <b>5% max daily loss</b>, and a <b>10% max total loss</b>. Completed cycles are rebuilt from Supabase on every load. Best-session selection is calculated from your User Journal By session table using all closed trades in the current tracking period. The prop challenge still only takes A+/A trades.")
+        workflow_commentary(f"This view recalculates the FTMO-style challenge from your current watchlist and selected timeframe <b>({html.escape(str(challenge_tf))})</b>. It uses only <b>A+/A closed trades</b>, a fixed <b>&#36;10,000</b> account, <b>1% risk per trade</b>, a <b>&#36;1,000 Phase 1 target</b>, a <b>&#36;500 Phase 2 target</b>, a <b>5% max daily loss</b>, and a <b>10% max total loss</b>. Completed cycles are persisted in Supabase and only rebuilt when Refresh Data/replay explicitly updates them. Best-session selection is calculated from your User Journal By session table using all closed trades in the current tracking period. The prop challenge still only takes A+/A trades.")
 
         prop_source = trades[
             trades.get("grade", pd.Series(dtype=str)).astype(str).isin(["A+", "A"])
@@ -8017,9 +8066,10 @@ def render_workflow(username: str, settings: dict) -> None:
         saved_count = int(len(stored_history_for_tf)) if stored_history_for_tf is not None and not stored_history_for_tf.empty else 0
         replay_history = prop_sim.get("history", []) or []
         stored_daily_for_tf = load_prop_challenge_daily_ledger(username, challenge_tf, limit=APP_TABLE_MAX_ROWS)
-        if (not replay_history and (stored_daily_for_tf is None or stored_daily_for_tf.empty)):
-            pass
-        elif (stored_daily_for_tf is None or stored_daily_for_tf.empty) or len(replay_history) > saved_count:
+        # Do not overwrite an existing daily ledger on normal page load.
+        # The ledger is a persisted challenge record; recomputing it every login
+        # can make prior days disappear if filters/session logic evolve.
+        if (stored_daily_for_tf is None or stored_daily_for_tf.empty) and replay_history:
             rebuild_prop_challenge_history_from_trades(username, challenge_tf, replay_history, prop_sim.get("all_daily", pd.DataFrame()))
             stored_daily_for_tf = load_prop_challenge_daily_ledger(username, challenge_tf, limit=APP_TABLE_MAX_ROWS)
         active_prop = prop_sim.get("active", {})
@@ -8028,7 +8078,23 @@ def render_workflow(username: str, settings: dict) -> None:
         day_summary = stored_daily_for_tf if stored_daily_for_tf is not None and not stored_daily_for_tf.empty else prop_sim.get("all_daily", pd.DataFrame())
         if day_summary is None or day_summary.empty:
             day_summary = prop_sim.get("active_daily", pd.DataFrame())
+
+        # If a persisted ledger exists, use its latest closing balance for the
+        # displayed prop account balance. This keeps the account stable across
+        # logins and prevents a fresh in-app replay from silently changing the
+        # user's challenge history.
+        persisted_ledger_available = stored_daily_for_tf is not None and not stored_daily_for_tf.empty
         current = float(active_prop.get("equity", starting) or starting)
+        if persisted_ledger_available and "Closing Balance" in stored_daily_for_tf.columns:
+            try:
+                latest_ledger = stored_daily_for_tf.copy()
+                latest_ledger["__challenge_no"] = latest_ledger.get("Challenge", "").astype(str).str.replace("#", "", regex=False)
+                latest_ledger["__challenge_no"] = pd.to_numeric(latest_ledger["__challenge_no"], errors="coerce").fillna(-1).astype(int)
+                latest_ledger["__day_sort"] = pd.to_datetime(latest_ledger.get("Day"), errors="coerce")
+                latest_ledger = latest_ledger.sort_values(["__challenge_no", "__day_sort"], ascending=[False, False])
+                current = float(pd.to_numeric(latest_ledger.iloc[0].get("Closing Balance"), errors="coerce") or current)
+            except Exception:
+                pass
         roi_pct = float(active_prop.get("roi_pct", 0.0) or 0.0)
         progress_to_target = float(active_prop.get("progress", 0.0) or 0.0)
         trading_days = int(active_prop.get("trading_days", 0) or 0)
@@ -8335,7 +8401,7 @@ def render_workflow(username: str, settings: dict) -> None:
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         st.subheader("Closed A+/A trades")
-        all_closed_view_source = prop_all_replay if 'prop_all_replay' in locals() and prop_all_replay is not None and not prop_all_replay.empty else prop_closed
+        all_closed_view_source = prop_closed  # show all scoped closed A+/A trades, not only the currently selected/replayed prop subset
         if all_closed_view_source is None or all_closed_view_source.empty:
             st.info("No A+/A trades have closed yet for this user, watchlist, and selected timeframe.")
         else:
