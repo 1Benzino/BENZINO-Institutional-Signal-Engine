@@ -2285,11 +2285,11 @@ def classify_open_prop_candidates(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Classify currently-open A+/A signals as prop-selected or skipped.
 
-    This function must use the same real-world constraints as the deterministic
-    prop replay, but with one extra requirement: currently-open trades must be
-    considered together with already-selected closed prop trades. Otherwise the
-    UI can show impossible states such as 4 closed selected trades plus 3 still
-    open selected trades for the same entry day.
+    This function must use the same hard constraints as the deterministic
+    prop replay, but open trades are forward-looking and must use the CURRENT
+    active prop filter shown on the Prop Firm cards. Historical closed replay
+    can lock old days to the old best session; current open candidates cannot
+    use an old day-profile that conflicts with the live filter.
 
     Selection is based on signal generation time. Closing time is used only to
     release the one-open-trade-per-asset lock.
@@ -2348,18 +2348,13 @@ def classify_open_prop_candidates(
         asset = str(row.get("asset", "") or "").strip().upper()
         day = row.get("prop_day_all")
 
-        # Pick the session using only evidence available before this day starts,
-        # matching the locked-session prop replay rule.
+        # For CURRENT open prop candidates, use the active/current prop filter
+        # shown on the Prop Firm cards. Historical closed replay locks each past
+        # day to the evidence available then, but open trades are forward-looking:
+        # if today's active filter is London/NY Overlap, an Asia signal must not
+        # be displayed as a selected open prop trade.
         best = str(profile.get("active_filter_session") or profile.get("best_session") or "All sessions") if isinstance(profile, dict) else "All sessions"
         sample_ready = bool(profile.get("sample_ready")) if isinstance(profile, dict) else False
-        try:
-            day_start = pd.Timestamp(day).tz_localize(NAIROBI_TZ).tz_convert("UTC")
-            evidence = source[source["prop_event_time"] < day_start].copy() if source is not None and not source.empty else pd.DataFrame()
-            day_profile = prop_best_session_profile(evidence, PROP_MIN_SESSION_TRADES)
-            best = str(day_profile.get("active_filter_session") or day_profile.get("best_session") or best)
-            sample_ready = bool(day_profile.get("sample_ready"))
-        except Exception:
-            pass
 
         if sample_ready and best not in {"", "All sessions"}:
             gate_ok, gate_reason = prop_session_entry_window_status(entry_ts, best)
