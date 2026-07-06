@@ -10128,19 +10128,24 @@ def render_settings(username: str, settings: dict) -> None:
         try:
             cap = read_df("SELECT username, account_type, enabled, auto_trade_enabled, auto_trade_grades, use_benzino_settings, updated_at FROM user_capital_connections WHERE username = %s", (username,))
             cap_row = cap.iloc[0].to_dict() if not cap.empty else {}
+            connection_active = bool(cap_row.get("enabled", False))
+            demo_trading_active = bool(cap_row.get("auto_trade_enabled", False)) and connection_active
             cc1, cc2, cc3, cc4 = st.columns(4)
-            with cc1: metric_card("Capital.com connection", "Active" if bool(cap_row.get("enabled", False)) else "Inactive", str(cap_row.get("account_type") or "DEMO"))
-            with cc2: metric_card("Auto-trading", "ON" if bool(cap_row.get("auto_trade_enabled", False)) else "OFF", str(cap_row.get("auto_trade_grades") or "A+,A") + " · best session · max 4/day")
+            with cc1: metric_card("Capital.com connection", "Active" if connection_active else "Inactive", str(cap_row.get("account_type") or "DEMO"))
+            with cc2: metric_card("Demo trading", "ON" if demo_trading_active else "OFF", str(cap_row.get("auto_trade_grades") or "A+,A") + " · best session · max 4/day")
             with cc3: metric_card("Sizing source", "BENZINO" if bool(cap_row.get("use_benzino_settings", True)) else "Capital.com", "Default keeps FTMO simulation aligned")
             with cc4: metric_card("Last updated", fmt_nairobi(cap_row.get("updated_at", "")) if cap_row else "Never")
+
+            settings_commentary("You can save Capital.com credentials while keeping demo trading OFF. When demo trading is OFF, BENZINO still journals signals, runs prop simulation, sends alerts, and tracks performance, but the scanner will not place Capital.com demo orders for this account.")
 
             with st.form("capital_connection_form", clear_on_submit=False):
                 api_key = st.text_input("Capital API key", type="password", help="Use a demo API key while testing.")
                 identifier = st.text_input("Capital identifier / login email")
                 password = st.text_input("Capital password", type="password")
                 account_type = st.selectbox("Account type", ["DEMO", "LIVE"], index=0 if str(cap_row.get("account_type", "DEMO")).upper() != "LIVE" else 1)
-                enabled = st.checkbox("Connection enabled", value=bool(cap_row.get("enabled", False)))
-                auto_enabled = st.checkbox("Enable auto-trading on my Capital demo", value=bool(cap_row.get("auto_trade_enabled", False)))
+                enabled = st.checkbox("Keep Capital.com connection active", value=connection_active, help="Stores and uses your Capital.com credentials for account/execution sync. This does not place trades by itself.")
+                _toggle = getattr(st, "toggle", st.checkbox)
+                auto_enabled = _toggle("Demo trading", value=demo_trading_active, help="Turn this OFF to pause BENZINO demo orders without deleting your Capital.com credentials.")
                 saved_grades = [g.strip().upper() for g in str(cap_row.get("auto_trade_grades") or "A+,A").split(",") if g.strip()]
                 grade_options = ["A+", "A", "B", "C"]
                 selected_grades = st.multiselect(
@@ -10152,7 +10157,9 @@ def render_settings(username: str, settings: dict) -> None:
                 use_benzino = st.checkbox("Use BENZINO account size, leverage and risk settings", value=bool(cap_row.get("use_benzino_settings", True)))
                 submitted = st.form_submit_button("Save Capital.com settings", type="primary")
             if submitted:
-                if auto_enabled and account_type.upper() != "DEMO":
+                if auto_enabled and not enabled:
+                    st.error("Turn the Capital.com connection ON before enabling demo trading.")
+                elif auto_enabled and account_type.upper() != "DEMO":
                     st.error("Live auto-trading is blocked from the app. Use DEMO while testing.")
                 elif enabled and (not api_key.strip() or not identifier.strip() or not password.strip()) and cap.empty:
                     st.error("Enter API key, identifier and password before enabling the connection.")
@@ -10179,7 +10186,7 @@ def render_settings(username: str, settings: dict) -> None:
                         """,
                         (username, api_key.strip() or old.get("api_key", ""), identifier.strip() or old.get("identifier", ""), password.strip() or old.get("password", ""), account_type, enabled, auto_enabled, ",".join(selected_grades), use_benzino),
                     )
-                    st.success("Capital.com settings saved.")
+                    st.success("Capital.com settings saved. Demo trading is " + ("ON." if auto_enabled else "OFF."))
                     st.rerun()
 
             settings_commentary("Execution details and broker audit rows now live under Workflow → Capital.com.")

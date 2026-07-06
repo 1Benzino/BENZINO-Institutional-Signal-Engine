@@ -4845,8 +4845,8 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
                 cur.execute(
                     """
                     SELECT us.username, us.settings_json,
-                           COALESCE(ucc.enabled, TRUE) AS capital_connected,
-                           COALESCE(ucc.auto_trade_enabled, TRUE) AS user_auto_enabled,
+                           COALESCE(ucc.enabled, FALSE) AS capital_connected,
+                           COALESCE(ucc.auto_trade_enabled, FALSE) AS user_auto_enabled,
                            COALESCE(NULLIF(ucc.auto_trade_grades,''), 'A+,A') AS auto_trade_grades,
                            COALESCE(ucc.use_benzino_settings, TRUE) AS use_benzino_settings
                     FROM user_settings us
@@ -4865,8 +4865,8 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
                 cur.execute(
                     """
                     SELECT us.username, us.settings_json,
-                           COALESCE(ucc.enabled, TRUE) AS capital_connected,
-                           COALESCE(ucc.auto_trade_enabled, TRUE) AS user_auto_enabled,
+                           COALESCE(ucc.enabled, FALSE) AS capital_connected,
+                           COALESCE(ucc.auto_trade_enabled, FALSE) AS user_auto_enabled,
                            COALESCE(NULLIF(ucc.auto_trade_grades,''), 'A+,A') AS auto_trade_grades,
                            COALESCE(ucc.use_benzino_settings, TRUE) AS use_benzino_settings
                     FROM user_settings us
