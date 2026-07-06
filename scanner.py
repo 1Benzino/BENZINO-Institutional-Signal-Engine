@@ -614,7 +614,7 @@ CAPITAL_STRICT_1M_REPLAY_ONLY = os.environ.get("CAPITAL_STRICT_1M_REPLAY_ONLY", 
 CAPITAL_MARGIN_BUFFER_PCT = float(os.environ.get("CAPITAL_MARGIN_BUFFER_PCT", "0.95"))
 CAPITAL_FTMO_NORMALIZE_PNL = os.environ.get("CAPITAL_FTMO_NORMALIZE_PNL", "true").strip().lower() in {"1", "true", "yes", "y"}
 FTMO_COMPARISON_LEVERAGE = float(os.environ.get("FTMO_COMPARISON_LEVERAGE", "100"))
-CAPITAL_AUTO_TRADE_MAX_PER_DAY = int(os.environ.get("CAPITAL_AUTO_TRADE_MAX_PER_DAY", "4"))
+CAPITAL_AUTO_TRADE_MAX_PER_DAY = int(os.environ.get("CAPITAL_AUTO_TRADE_MAX_PER_DAY", "10"))
 CAPITAL_AUTO_TRADE_MIN_SESSION_TRADES = int(os.environ.get("CAPITAL_AUTO_TRADE_MIN_SESSION_TRADES", "20"))
 NAIROBI_TZ = ZoneInfo("Africa/Nairobi")
 
@@ -985,6 +985,23 @@ def init_tables() -> None:
         ON capital_auto_trade_diagnostics (username, checked_at DESC);
     CREATE INDEX IF NOT EXISTS idx_capital_auto_diag_signal
         ON capital_auto_trade_diagnostics (signal_id);
+
+    CREATE TABLE IF NOT EXISTS capital_auto_daily_state (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        username TEXT NOT NULL,
+        trading_day DATE NOT NULL,
+        timeframe TEXT NOT NULL,
+        session_order JSONB NOT NULL,
+        daily_trade_cap INTEGER DEFAULT 10,
+        trades_taken INTEGER DEFAULT 0,
+        locked_at TIMESTAMPTZ DEFAULT NOW(),
+        completed BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(username, trading_day, timeframe)
+    );
+    CREATE INDEX IF NOT EXISTS idx_capital_auto_daily_state_user_day
+        ON capital_auto_daily_state (username, trading_day DESC, timeframe);
 
     CREATE TABLE IF NOT EXISTS capital_trade_comparisons (
         id TEXT PRIMARY KEY,
@@ -4401,6 +4418,81 @@ def _parse_float_or_none(value):
     except Exception:
         return None
 
+def _json_dict(value) -> dict:
+    """Return a dict from psycopg2 JSONB/text values without throwing."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _capital_level_from_raw(raw: dict, kind: str):
+    """Extract broker-confirmed levels from Capital.com raw order/position JSON.
+
+    kind: entry | stop | limit | exit
+    Capital.com responses are not perfectly consistent across endpoints, so this
+    checks confirm, response, payload and open-position raw JSON before falling
+    back to None. This prevents the audit from pretending that planned and broker
+    prices are identical when Capital did not return the fill in the main row.
+    """
+    raw = _json_dict(raw)
+    position = raw.get("position") if isinstance(raw.get("position"), dict) else raw
+    market = raw.get("market") if isinstance(raw.get("market"), dict) else {}
+    payload = _json_dict(raw.get("payload"))
+    confirm = _json_dict(raw.get("confirm"))
+    response = _json_dict(raw.get("response"))
+    details = _json_dict(raw.get("details"))
+
+    if kind == "entry":
+        keys = ["level", "openLevel", "entryPrice", "price", "executedLevel", "dealLevel"]
+        paths = [["affectedDeals", 0, "level"], ["deal", "level"], ["position", "level"]]
+    elif kind == "exit":
+        keys = ["closeLevel", "exitPrice", "closePrice"]
+        paths = [["affectedDeals", 0, "closeLevel"], ["deal", "closeLevel"], ["position", "closeLevel"]]
+    elif kind == "stop":
+        keys = ["stopLevel", "stopLossLevel", "sl", "stopPrice"]
+        paths = [["position", "stopLevel"], ["deal", "stopLevel"], ["affectedDeals", 0, "stopLevel"]]
+    else:  # limit / take profit
+        keys = ["profitLevel", "limitLevel", "takeProfitLevel", "tp", "limitPrice"]
+        paths = [["position", "profitLevel"], ["position", "limitLevel"], ["deal", "limitLevel"], ["affectedDeals", 0, "limitLevel"]]
+
+    # direct dict checks first
+    for obj in (position, confirm, response, details, payload, market):
+        if isinstance(obj, dict):
+            val = _first_value(obj, keys, None)
+            parsed = _parse_float_or_none(val)
+            if parsed is not None:
+                return parsed
+
+    # nested/list paths
+    for root in (raw, confirm, response):
+        for path in paths:
+            cur = root
+            ok = True
+            for key in path:
+                if isinstance(key, int):
+                    if isinstance(cur, list) and len(cur) > key:
+                        cur = cur[key]
+                    else:
+                        ok = False
+                        break
+                else:
+                    if isinstance(cur, dict) and key in cur:
+                        cur = cur.get(key)
+                    else:
+                        ok = False
+                        break
+            if ok:
+                parsed = _parse_float_or_none(cur)
+                if parsed is not None:
+                    return parsed
+    return None
+
 
 def deterministic_uuid_text(seed: str) -> str:
     """Return a UUID string for comparison rows even when Supabase id is UUID.
@@ -4728,53 +4820,116 @@ def _safe_float_setting(settings: dict, keys: list[str], default: float) -> floa
     return float(default)
 
 
+
+def capital_session_windows_scanner() -> dict[str, tuple[int, int]]:
+    """Capital auto-trade session windows in EAT hours.
+
+    The execution engine ranks these sessions daily, then only trades a session
+    from one hour after its open until that session closes. The daily cap is a
+    maximum, not a quota.
+    """
+    return {
+        "Asia": (0, 8),
+        "London AM": (8, 16),
+        "London/NY Overlap": (16, 20),
+        "New York PM": (20, 24),
+    }
+
+
 def prop_session_from_timestamp_scanner(ts) -> str:
     try:
-        dt = pd.to_datetime(ts, utc=True)
-        hour = dt.tz_convert(NAIROBI_TZ).hour
+        dt = pd.to_datetime(ts, utc=True).tz_convert(NAIROBI_TZ)
+        hour = int(dt.hour)
     except Exception:
         return "Unknown"
-    if 0 <= hour < 8:
-        return "Asia"
-    if 8 <= hour < 16:
-        return "London"
-    return "New York"
+    for name, (start_hour, end_hour) in capital_session_windows_scanner().items():
+        if start_hour <= hour < end_hour:
+            return name
+    return "Unknown"
 
 
 def prop_session_open_hour_scanner(session: str) -> int | None:
-    session = str(session or "").strip().lower()
-    if session == "asia":
-        return 0
-    if session == "london":
-        return 8
-    if session in {"new york", "newyork", "ny"}:
-        return 16
-    return None
+    session_norm = str(session or "").strip().lower()
+    aliases = {
+        "asia": "Asia",
+        "london": "London AM",
+        "london am": "London AM",
+        "london/ny": "London/NY Overlap",
+        "london/ny overlap": "London/NY Overlap",
+        "new york": "New York PM",
+        "new york pm": "New York PM",
+        "ny": "New York PM",
+        "ny pm": "New York PM",
+    }
+    session_name = aliases.get(session_norm, str(session or "").strip())
+    window = capital_session_windows_scanner().get(session_name)
+    return int(window[0]) if window else None
+
+
+def capital_session_end_hour_scanner(session: str) -> int | None:
+    session_norm = str(session or "").strip().lower()
+    aliases = {
+        "asia": "Asia",
+        "london": "London AM",
+        "london am": "London AM",
+        "london/ny": "London/NY Overlap",
+        "london/ny overlap": "London/NY Overlap",
+        "new york": "New York PM",
+        "new york pm": "New York PM",
+        "ny": "New York PM",
+        "ny pm": "New York PM",
+    }
+    session_name = aliases.get(session_norm, str(session or "").strip())
+    window = capital_session_windows_scanner().get(session_name)
+    return int(window[1]) if window else None
 
 
 def prop_is_one_hour_after_session_open_scanner(ts, session: str) -> bool:
     open_hour = prop_session_open_hour_scanner(session)
-    if open_hour is None:
+    end_hour = capital_session_end_hour_scanner(session)
+    if open_hour is None or end_hour is None:
         return True
     try:
         dt = pd.to_datetime(ts, utc=True).tz_convert(NAIROBI_TZ)
     except Exception:
         return False
-    return dt.hour >= open_hour + 1
+    return int(dt.hour) >= open_hour + 1 and int(dt.hour) < end_hour
 
 
-def capital_best_session_profile_for_user(username: str, timeframe: str, assets: set[str]) -> dict:
-    """Dynamic best session from closed A/A+ simulated trades only."""
+def capital_session_has_ended_scanner(dt_eat: pd.Timestamp, session: str) -> bool:
+    end_hour = capital_session_end_hour_scanner(session)
+    if end_hour is None:
+        return False
+    return int(dt_eat.hour) >= end_hour
+
+
+def capital_session_entry_open_scanner(dt_eat: pd.Timestamp, session: str) -> bool:
+    open_hour = prop_session_open_hour_scanner(session)
+    end_hour = capital_session_end_hour_scanner(session)
+    if open_hour is None or end_hour is None:
+        return False
+    return (int(dt_eat.hour) >= open_hour + 1) and (int(dt_eat.hour) < end_hour)
+
+
+def capital_session_order_for_user(username: str, timeframe: str, assets: set[str]) -> dict:
+    """Rank all execution sessions from closed A/A+ user-journal outcomes.
+
+    Session is classified from the original signal generation time (`created_at`),
+    never from the trade close time. Sessions with at least the configured sample
+    threshold are ranked first; below-sample sessions are still retained as lower
+    priority fallbacks so the engine can use later remaining sessions without
+    forcing trades.
+    """
     username = str(username or "").strip().lower()
     timeframe = _normalize_timeframe(timeframe)
     if not assets:
-        return {"best_session": "", "sample_ready": False, "trade_count": 0, "reason": "empty_watchlist"}
+        return {"session_order": [], "sample_ready": False, "reason": "empty_watchlist"}
     try:
         conn = db_connect()
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT asset, timeframe, created_at, exit_at, r_multiple, exit_reason, status, grade
+                SELECT asset, timeframe, created_at, r_multiple, grade
                 FROM scanner_signals
                 WHERE asset = ANY(%s)
                   AND timeframe = %s
@@ -4788,11 +4943,12 @@ def capital_best_session_profile_for_user(username: str, timeframe: str, assets:
             rows = [dict(r) for r in cur.fetchall()]
         conn.close()
     except Exception as exc:
-        print(f"[CapitalAuto] Best-session lookup failed for {username}: {exc}")
-        return {"best_session": "", "sample_ready": False, "trade_count": 0, "reason": "lookup_failed"}
-    buckets: dict[str, list[float]] = {}
+        print(f"[CapitalAuto] Session ranking lookup failed for {username}: {exc}")
+        return {"session_order": [], "sample_ready": False, "reason": "lookup_failed"}
+
+    buckets: dict[str, list[float]] = {name: [] for name in capital_session_windows_scanner().keys()}
     for r in rows:
-        sess = prop_session_from_timestamp_scanner(r.get("exit_at") or r.get("created_at"))
+        sess = prop_session_from_timestamp_scanner(r.get("created_at"))
         if sess == "Unknown":
             continue
         try:
@@ -4800,26 +4956,202 @@ def capital_best_session_profile_for_user(username: str, timeframe: str, assets:
         except Exception:
             rr = 0.0
         buckets.setdefault(sess, []).append(rr)
+
     ranked = []
     for sess, vals in buckets.items():
-        if not vals:
-            continue
         gross_profit = sum(v for v in vals if v > 0)
         gross_loss = abs(sum(v for v in vals if v < 0))
         pf = gross_profit / gross_loss if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
-        wr = 100.0 * (sum(1 for v in vals if v > 0) / len(vals))
+        wr = 100.0 * (sum(1 for v in vals if v > 0) / len(vals)) if vals else 0.0
         net = sum(vals)
-        ranked.append({"best_session": sess, "profit_factor": pf, "win_rate": wr, "net_r": net, "trade_count": len(vals), "sample_ready": len(vals) >= CAPITAL_AUTO_TRADE_MIN_SESSION_TRADES})
-    if not ranked:
-        return {"best_session": "", "sample_ready": False, "trade_count": 0, "reason": "no_closed_A_trades"}
-    eligible = [x for x in ranked if x["sample_ready"]]
-    best = sorted(eligible or ranked, key=lambda x: (x["profit_factor"], x["win_rate"], x["net_r"], x["trade_count"]), reverse=True)[0]
+        ranked.append({
+            "session": sess,
+            "profit_factor": pf,
+            "win_rate": wr,
+            "net_r": net,
+            "trade_count": len(vals),
+            "sample_ready": len(vals) >= CAPITAL_AUTO_TRADE_MIN_SESSION_TRADES,
+        })
+    # Reliable samples rank above provisional sessions, then by quality.
+    ranked = sorted(ranked, key=lambda x: (bool(x["sample_ready"]), x["profit_factor"], x["win_rate"], x["net_r"], x["trade_count"]), reverse=True)
+    return {
+        "session_order": ranked,
+        "best_session": ranked[0]["session"] if ranked else "",
+        "sample_ready": bool(ranked and ranked[0].get("sample_ready")),
+        "trade_count": int(ranked[0].get("trade_count", 0)) if ranked else 0,
+        "reason": "" if ranked else "no_closed_A_trades",
+    }
+
+
+def capital_best_session_profile_for_user(username: str, timeframe: str, assets: set[str]) -> dict:
+    ranked = capital_session_order_for_user(username, timeframe, assets)
+    order = ranked.get("session_order") or []
+    if not order:
+        return {"best_session": "", "sample_ready": False, "trade_count": 0, "reason": ranked.get("reason") or "no_closed_A_trades"}
+    best = dict(order[0])
+    best["best_session"] = best.get("session", "")
     if not best.get("sample_ready"):
         best["reason"] = f"best_session_sample_below_{CAPITAL_AUTO_TRADE_MIN_SESSION_TRADES}"
+    best["session_order"] = order
     return best
 
 
+def capital_auto_trading_day_eat(ts=None):
+    try:
+        dt = pd.to_datetime(ts or datetime.now(timezone.utc), utc=True).tz_convert(NAIROBI_TZ)
+    except Exception:
+        dt = pd.Timestamp.now(tz=NAIROBI_TZ)
+    return dt.date(), dt
+
+
+def load_or_create_capital_auto_daily_state(username: str, timeframe: str, assets: set[str], ts=None) -> dict:
+    """Freeze the user's session ranking for one EAT trading day.
+
+    The state makes auto-trading restart-safe. It does not force 10 trades; the
+    cap is a maximum. If the app/scanner restarts, the same session order is
+    reused for the rest of the day.
+    """
+    username = str(username or "").strip().lower()
+    timeframe = _normalize_timeframe(timeframe)
+    trading_day, dt_eat = capital_auto_trading_day_eat(ts)
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capital_auto_daily_state (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        username TEXT NOT NULL,
+                        trading_day DATE NOT NULL,
+                        timeframe TEXT NOT NULL,
+                        session_order JSONB NOT NULL,
+                        daily_trade_cap INTEGER DEFAULT 10,
+                        trades_taken INTEGER DEFAULT 0,
+                        locked_at TIMESTAMPTZ DEFAULT NOW(),
+                        completed BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ DEFAULT NOW(),
+                        UNIQUE(username, trading_day, timeframe)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM capital_auto_daily_state
+                    WHERE LOWER(username) = %s AND trading_day = %s AND timeframe = %s
+                    LIMIT 1
+                    """,
+                    (username, trading_day, timeframe),
+                )
+                row = cur.fetchone()
+                if row:
+                    state = dict(row)
+                    so = state.get("session_order") or []
+                    if isinstance(so, str):
+                        try: so = json.loads(so)
+                        except Exception: so = []
+                    state["session_order"] = so
+                    conn.close()
+                    return state
+                ranking = capital_session_order_for_user(username, timeframe, assets)
+                session_order = ranking.get("session_order") or []
+                if not session_order:
+                    session_order = [{"session": name, "profit_factor": 0, "win_rate": 0, "net_r": 0, "trade_count": 0, "sample_ready": False} for name in capital_session_windows_scanner().keys()]
+                cur.execute(
+                    """
+                    INSERT INTO capital_auto_daily_state(username, trading_day, timeframe, session_order, daily_trade_cap, trades_taken, completed, updated_at)
+                    VALUES (%s,%s,%s,%s::jsonb,%s,0,FALSE,NOW())
+                    ON CONFLICT (username, trading_day, timeframe) DO UPDATE SET
+                        updated_at = NOW()
+                    RETURNING *
+                    """,
+                    (username, trading_day, timeframe, json.dumps(session_order), int(CAPITAL_AUTO_TRADE_MAX_PER_DAY)),
+                )
+                row = cur.fetchone() or {}
+        conn.close()
+        state = dict(row)
+        so = state.get("session_order") or []
+        if isinstance(so, str):
+            try: so = json.loads(so)
+            except Exception: so = []
+        state["session_order"] = so
+        return state
+    except Exception as exc:
+        print(f"[CapitalAuto] Daily state failed for {username}: {exc}")
+        ranking = capital_session_order_for_user(username, timeframe, assets)
+        return {"username": username, "trading_day": trading_day, "timeframe": timeframe, "session_order": ranking.get("session_order") or [], "daily_trade_cap": int(CAPITAL_AUTO_TRADE_MAX_PER_DAY), "trades_taken": 0, "fallback_state": True}
+
+
+def capital_auto_session_gate_for_signal(sig: ScanResult, username: str, timeframe: str, assets: set[str]) -> dict:
+    """Capital.com daily session gate.
+
+    Important rule: EVERY ranked session has the same +1 hour delay. If the
+    engine moves from the best session to the next remaining session, it still
+    cannot accept signals from that next session until that session's own
+    open + 1 hour. The gate is evaluated from the signal generation time
+    (created_at) first, not the candle close, so the scanner never backfills
+    trades from the first hour of a session just because it switched sessions
+    later in the day.
+    """
+    signal_ts = getattr(sig, "created_at", "") or getattr(sig, "candle_close", "") or datetime.now(timezone.utc)
+    try:
+        dt_eat = pd.to_datetime(signal_ts, utc=True).tz_convert(NAIROBI_TZ)
+    except Exception:
+        return {"allowed": False, "reason": "invalid_signal_time"}
+
+    state = load_or_create_capital_auto_daily_state(username, timeframe, assets, signal_ts)
+    order = state.get("session_order") or []
+    ordered_sessions = [
+        str(x.get("session") or x.get("best_session") or "").strip()
+        for x in order
+        if str(x.get("session") or x.get("best_session") or "").strip()
+    ]
+    if not ordered_sessions:
+        return {"allowed": False, "reason": "no_session_order", "daily_state": state}
+
+    current_session = prop_session_from_timestamp_scanner(signal_ts)
+    if current_session not in ordered_sessions:
+        return {"allowed": False, "reason": f"session_not_ranked:{current_session}", "current_session": current_session, "daily_state": state}
+
+    # Only the highest-ranked session that is currently tradable is active.
+    # Higher-ranked sessions that have already ended are skipped. Higher-ranked
+    # sessions that are still upcoming or still in their +1h warm-up window block
+    # lower-ranked sessions.
+    for sess in ordered_sessions:
+        if capital_session_has_ended_scanner(dt_eat, sess):
+            continue
+
+        if sess != current_session:
+            return {
+                "allowed": False,
+                "reason": f"waiting_for_higher_ranked_session:{sess}",
+                "current_session": current_session,
+                "active_session": sess,
+                "daily_state": state,
+            }
+
+        if not capital_session_entry_open_scanner(dt_eat, sess):
+            return {
+                "allowed": False,
+                "reason": f"before_session_plus_1h_entry_window:{sess}",
+                "current_session": current_session,
+                "active_session": sess,
+                "daily_state": state,
+            }
+
+        return {"allowed": True, "reason": "", "current_session": current_session, "active_session": sess, "daily_state": state}
+
+    return {"allowed": False, "reason": "session_order_exhausted", "current_session": current_session, "daily_state": state}
+
+
 def capital_auto_trades_taken_today(username: str) -> int:
+    """Count accepted Capital.com auto-orders for the current EAT day.
+
+    This is the hard concurrency guard. It counts all selected execution grades,
+    not only A/A+, because the user may choose A only, A+/A, or wider demo sets.
+    """
     try:
         conn = db_connect()
         with conn.cursor() as cur:
@@ -4828,8 +5160,7 @@ def capital_auto_trades_taken_today(username: str) -> int:
                 SELECT COUNT(*) AS n
                 FROM capital_auto_orders
                 WHERE LOWER(COALESCE(scan_owner,'')) = %s
-                  AND grade IN ('A+','A')
-                  AND status IN ('OPENED','ACCEPTED','CONFIRMED','OPEN')
+                  AND status IN ('OPENED','ACCEPTED','CONFIRMED','OPEN','EXECUTED')
                   AND (created_at AT TIME ZONE 'Africa/Nairobi')::date = (NOW() AT TIME ZONE 'Africa/Nairobi')::date
                 """,
                 (str(username or "").lower(),),
@@ -4842,6 +5173,22 @@ def capital_auto_trades_taken_today(username: str) -> int:
         return CAPITAL_AUTO_TRADE_MAX_PER_DAY
 
 
+def update_capital_auto_daily_state_count(username: str, timeframe: str, increment: int = 1) -> None:
+    try:
+        trading_day, _ = capital_auto_trading_day_eat()
+        execute(
+            """
+            UPDATE capital_auto_daily_state
+            SET trades_taken = GREATEST(0, COALESCE(trades_taken,0) + %s),
+                completed = CASE WHEN GREATEST(0, COALESCE(trades_taken,0) + %s) >= COALESCE(daily_trade_cap, %s) THEN TRUE ELSE completed END,
+                updated_at = NOW()
+            WHERE LOWER(username) = %s AND trading_day = %s AND timeframe = %s
+            """,
+            (int(increment), int(increment), int(CAPITAL_AUTO_TRADE_MAX_PER_DAY), str(username or "").lower(), trading_day, _normalize_timeframe(timeframe)),
+        )
+    except Exception as exc:
+        print(f"[CapitalAuto] daily state count update failed: {exc}")
+
 def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
     """Resolve the user settings that should size this auto-trade.
 
@@ -4849,8 +5196,9 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
       • only the user's watchlist
       • only the user's selected timeframe
       • only the grades the user selected for demo testing
-      • only the user's dynamic best session
-      • max 4 accepted auto-orders per Nairobi day
+      • daily session ranking is frozen per user/timeframe in EAT
+      • trades begin one hour after the active ranked session opens
+      • max accepted auto-orders per Nairobi day is a hard cap, not a quota
     """
     asset = str(getattr(sig, "asset", "") or "").strip().upper()
     grade = str(getattr(sig, "grade", "") or "").strip().upper()
@@ -4934,22 +5282,18 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
         allowed_user_grades = user_grades & set(CAPITAL_AUTO_TRADE_GRADES)
         if grade not in allowed_user_grades:
             return {**fallback, "username": username, "auto_trade_allowed": False, "skip_reason": f"grade_not_selected:{grade}", "selected_grades": sorted(allowed_user_grades)}
-        # Watchlist used for best-session analysis.
+        # Watchlist used for daily session ranking and execution state.
         watch = load_user_watchlist(username)
         watch_assets = {a.upper() for a in watch.keys()} or {asset}
+        signal_time_for_session = getattr(sig, "created_at", "") or getattr(sig, "candle_close", "")
+        session_gate = capital_auto_session_gate_for_signal(sig, username, timeframe, watch_assets)
         session_profile = capital_best_session_profile_for_user(username, timeframe, watch_assets)
-        best_session = str(session_profile.get("best_session") or "")
-        signal_time_for_session = getattr(sig, "candle_close", "") or getattr(sig, "created_at", "")
-        current_session = prop_session_from_timestamp_scanner(signal_time_for_session)
-        if not session_profile.get("sample_ready"):
-            return {**fallback, "username": username, "auto_trade_allowed": False, "skip_reason": session_profile.get("reason") or "best_session_not_ready", "session_profile": session_profile}
-        if current_session != best_session:
-            return {**fallback, "username": username, "auto_trade_allowed": False, "skip_reason": f"outside_best_session:{current_session}!={best_session}", "session_profile": session_profile}
-        if not prop_is_one_hour_after_session_open_scanner(signal_time_for_session, best_session):
-            return {**fallback, "username": username, "auto_trade_allowed": False, "skip_reason": f"first_hour_after_best_session_open:{best_session}", "session_profile": session_profile, "current_session": current_session}
+        current_session = str(session_gate.get("current_session") or prop_session_from_timestamp_scanner(signal_time_for_session))
+        if not bool(session_gate.get("allowed")):
+            return {**fallback, "username": username, "auto_trade_allowed": False, "skip_reason": str(session_gate.get("reason") or "session_gate_blocked"), "session_profile": session_profile, "session_gate": session_gate, "current_session": current_session}
         taken_today = capital_auto_trades_taken_today(username)
         if taken_today >= CAPITAL_AUTO_TRADE_MAX_PER_DAY:
-            return {**fallback, "username": username, "auto_trade_allowed": False, "skip_reason": "daily_auto_trade_cap_reached", "session_profile": session_profile}
+            return {**fallback, "username": username, "auto_trade_allowed": False, "skip_reason": "daily_auto_trade_cap_reached", "session_profile": session_profile, "session_gate": session_gate}
         account_size = _safe_float_setting(settings, ["account_size", "account_balance", "starting_balance"], ACCOUNT_SIZE)
         risk_pct = _safe_float_setting(settings, ["risk_pct", "risk_per_trade_pct"], float(RISK_PER_TRADE) * 100.0)
         leverage = _safe_float_setting(settings, ["leverage"], LEVERAGE)
@@ -4963,6 +5307,8 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
             "skip_reason": "",
             "session_profile": session_profile,
             "current_session": current_session,
+            "active_session": str(session_gate.get("active_session") or current_session),
+            "daily_state": session_gate.get("daily_state") or {},
             "auto_trades_taken_today": taken_today,
             "selected_grades": sorted(allowed_user_grades),
         }
@@ -5361,6 +5707,7 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
     record_capital_auto_trade_diagnostic(sig, username=str(sizing.get("username") or SCAN_OWNER), eligible=ok, order_sent=ok, status="EXECUTED" if ok else "REJECTED", skip_reason=error, deal_reference=deal_reference, deal_id=deal_id, prop_selected=ok, capital_executed=ok, api_response=_auto_raw)
     user_label = str(sizing.get("username") or SCAN_OWNER)
     if ok:
+        update_capital_auto_daily_state_count(str(sizing.get("username") or SCAN_OWNER), timeframe, 1)
         print(f"[CapitalAuto] {sig.asset} {timeframe} {direction} {grade}: demo trade opened for {user_label} · size {confirmed_size} · ref {deal_reference}.")
     else:
         print(f"[CapitalAuto] {sig.asset} {timeframe} {direction} {grade}: order not accepted · {error}.")
@@ -5418,10 +5765,32 @@ def rebuild_capital_execution_audit(limit: int = 500) -> int:
                         actual = cur.fetchone()
                     actual = dict(actual) if actual else {}
 
+                    order_raw = _json_dict(row.get("raw_json"))
+                    actual_raw = _json_dict(actual.get("raw_json")) if actual else {}
+
+                    # Signal plan stays as the reference price. Broker levels come
+                    # from Capital.com open-position/confirm data where available.
                     planned_entry = _parse_float_or_none(row.get("entry"))
-                    executed_entry = _parse_float_or_none(actual.get("entry_price")) or planned_entry
+                    executed_entry = (
+                        _parse_float_or_none(actual.get("entry_price"))
+                        or _capital_level_from_raw(actual_raw, "entry")
+                        or _capital_level_from_raw(order_raw, "entry")
+                    )
                     planned_exit = _parse_float_or_none(row.get("replay_exit"))
-                    actual_exit = _parse_float_or_none(actual.get("exit_price"))
+                    actual_exit = (
+                        _parse_float_or_none(actual.get("exit_price"))
+                        or _capital_level_from_raw(actual_raw, "exit")
+                    )
+                    broker_sl = (
+                        _capital_level_from_raw(actual_raw, "stop")
+                        or _capital_level_from_raw(order_raw, "stop")
+                        or _parse_float_or_none(row.get("sl"))
+                    )
+                    broker_tp = (
+                        _capital_level_from_raw(actual_raw, "limit")
+                        or _capital_level_from_raw(order_raw, "limit")
+                        or _parse_float_or_none(row.get("tp"))
+                    )
                     entry_slippage = (executed_entry - planned_entry) if executed_entry is not None and planned_entry is not None else None
                     exit_slippage = (actual_exit - planned_exit) if actual_exit is not None and planned_exit is not None else None
 
@@ -5450,6 +5819,8 @@ def rebuild_capital_execution_audit(limit: int = 500) -> int:
                             capital_trade_id = EXCLUDED.capital_trade_id,
                             executed_entry = EXCLUDED.executed_entry,
                             entry_slippage = EXCLUDED.entry_slippage,
+                            planned_sl = EXCLUDED.planned_sl,
+                            planned_tp = EXCLUDED.planned_tp,
                             planned_exit = EXCLUDED.planned_exit,
                             actual_exit = EXCLUDED.actual_exit,
                             exit_slippage = EXCLUDED.exit_slippage,
@@ -5472,7 +5843,7 @@ def rebuild_capital_execution_audit(limit: int = 500) -> int:
                             audit_id, actual.get("id"), row.get("signal_id"), row.get("scan_owner"), row.get("asset"), row.get("timeframe"),
                             row.get("direction"), row.get("grade"),
                             planned_entry, executed_entry, entry_slippage,
-                            _parse_float_or_none(row.get("sl")), _parse_float_or_none(row.get("tp")), planned_exit, actual_exit, exit_slippage,
+                            broker_sl, broker_tp, planned_exit, actual_exit, exit_slippage,
                             _parse_float_or_none(row.get("replay_r")), actual_r,
                             _parse_float_or_none(actual.get("pnl")), _parse_float_or_none(actual.get("pnl_ftmo_equiv")),
                             _parse_float_or_none(row.get("ftmo_leverage")), _parse_float_or_none(row.get("capital_leverage")), _parse_float_or_none(row.get("ftmo_normalization_factor")),

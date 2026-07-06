@@ -485,6 +485,23 @@ def init_tables() -> None:
     CREATE INDEX IF NOT EXISTS idx_capital_auto_diag_signal
         ON capital_auto_trade_diagnostics (signal_id);
 
+    CREATE TABLE IF NOT EXISTS capital_auto_daily_state (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        username TEXT NOT NULL,
+        trading_day DATE NOT NULL,
+        timeframe TEXT NOT NULL,
+        session_order JSONB NOT NULL,
+        daily_trade_cap INTEGER DEFAULT 10,
+        trades_taken INTEGER DEFAULT 0,
+        locked_at TIMESTAMPTZ DEFAULT NOW(),
+        completed BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(username, trading_day, timeframe)
+    );
+    CREATE INDEX IF NOT EXISTS idx_capital_auto_daily_state_user_day
+        ON capital_auto_daily_state (username, trading_day DESC, timeframe);
+
     CREATE TABLE IF NOT EXISTS capital_trade_comparisons (
         id TEXT PRIMARY KEY,
         capital_trade_id TEXT REFERENCES capital_executed_trades(id),
@@ -1658,9 +1675,10 @@ def humanize_capital_skip_reason(reason: str) -> str:
         "timeframe_not_enabled": "Timeframe not enabled",
         "not_in_watchlist": "Asset not in your watchlist",
         "outside_best_session": "Before or outside the active prop session window",
-        "before_session_entry_window": "Before session entry window",
-        "before_best_session_plus_1h": "Before session entry window",
-        "session_gate": "Before session entry window",
+        "before_session_entry_window": "Before session +1h entry window",
+        "before_session_plus_1h_entry_window": "Before session +1h entry window",
+        "before_best_session_plus_1h": "Before session +1h entry window",
+        "session_gate": "Before session +1h entry window",
     }
     for key, label in mapping.items():
         if low == key or low.startswith(key + ":") or key in low:
@@ -5855,6 +5873,7 @@ def is_price_display_column(col_name: str) -> bool:
 
     exact = {
         "entry", "sl", "tp",
+        "planned sl", "planned tp", "broker sl", "broker tp", "signal entry", "broker entry",
         "sim entry", "actual entry", "sim exit", "actual exit",
         "simulated entry", "simulated exit",
         "hypothetical entry", "hypothetical sl", "hypothetical tp", "hypothetical exit",
@@ -9591,16 +9610,18 @@ def render_workflow(username: str, settings: dict) -> None:
             if not cap_comp.empty:
                 comp = cap_comp.copy()
                 comp["Opened"] = pd.to_datetime(comp.get("opened_at"), errors="coerce", utc=True).dt.tz_convert(NAIROBI_TZ).dt.strftime("%Y-%m-%d %H:%M")
+                if "auto_trade" in comp.columns:
+                    comp["auto_trade"] = comp["auto_trade"].fillna(False).astype(bool).map({True: "YES", False: "NO"})
                 comp_display = comp.rename(columns={
                     "asset": "Asset",
                     "timeframe": "Timeframe",
                     "grade": "Grade",
                     "direction": "Direction",
-                    "planned_entry": "Planned Entry",
-                    "executed_entry": "Executed Entry",
+                    "planned_entry": "Signal Entry",
+                    "executed_entry": "Broker Entry",
                     "entry_slippage": "Entry Slippage",
-                    "planned_sl": "Planned SL",
-                    "planned_tp": "Planned TP",
+                    "planned_sl": "Broker SL",
+                    "planned_tp": "Broker TP",
                     "planned_exit": "Replay Exit",
                     "actual_exit": "Broker Exit",
                     "exit_slippage": "Exit Slippage",
@@ -9616,7 +9637,7 @@ def render_workflow(username: str, settings: dict) -> None:
                     "currency": "Currency",
                     "auto_trade": "Auto Trade",
                 })
-                order = ["Opened", "Asset", "Timeframe", "Grade", "Direction", "Auto Trade", "Planned Entry", "Executed Entry", "Entry Slippage", "Planned SL", "Planned TP", "Replay Exit", "Broker Exit", "Exit Slippage", "Replay R", "Broker R", "Broker P/L", "FTMO-Equivalent P/L", "Replay Outcome", "Broker Status", "Instrument", "Environment", "Size", "Currency", "signal_id"]
+                order = ["Opened", "Asset", "Timeframe", "Grade", "Direction", "Auto Trade", "Signal Entry", "Broker Entry", "Entry Slippage", "Broker SL", "Broker TP", "Replay Exit", "Broker Exit", "Exit Slippage", "Replay R", "Broker R", "Broker P/L", "FTMO-Equivalent P/L", "Replay Outcome", "Broker Status", "Instrument", "Environment", "Size", "Currency", "signal_id"]
                 comp_display = comp_display[[c for c in order if c in comp_display.columns] + [c for c in comp_display.columns if c not in order]]
                 comp_display = apply_market_price_formatting(comp_display)
 
@@ -9637,7 +9658,7 @@ def render_workflow(username: str, settings: dict) -> None:
                     page_size=25,
                     pinned=["Opened", "Asset", "Direction", "Auto Trade"],
                     badge_cols={"Direction":"signal", "Replay Outcome":"status", "Broker Status":"status", "Auto Trade":"status"},
-                    numeric_cols_right=["Planned Entry", "Executed Entry", "Entry Slippage", "Planned SL", "Planned TP", "Replay Exit", "Broker Exit", "Exit Slippage", "Replay R", "Broker R", "Broker P/L", "FTMO-Equivalent P/L", "Size"],
+                    numeric_cols_right=["Signal Entry", "Broker Entry", "Entry Slippage", "Broker SL", "Broker TP", "Replay Exit", "Broker Exit", "Exit Slippage", "Replay R", "Broker R", "Broker P/L", "FTMO-Equivalent P/L", "Size"],
                     enable_search=True,
                     show_footer=True,
                 )
@@ -10600,7 +10621,7 @@ def render_settings(username: str, settings: dict) -> None:
 
 
     with tab_capital:
-        workflow_commentary_header("Capital.com", "Connect your own Capital.com demo account. Auto-trading uses your BENZINO watchlist, selected timeframe, selected demo grades, best session only, and max 4 demo trades per day. API credentials are stored in Supabase for the scanner to use.")
+        workflow_commentary_header("Capital.com", "Connect your own Capital.com demo account. Auto-trading uses your BENZINO watchlist, selected timeframe, selected demo grades, a daily ranked-session schedule, and a maximum of 10 demo trades per EAT day. It starts one hour after the active ranked session opens, then moves to the next remaining session if the cap has not been reached.")
         with st.expander("How to get your Capital.com API details", expanded=False):
             st.markdown(
                 """
@@ -10619,7 +10640,7 @@ def render_settings(username: str, settings: dict) -> None:
             cap_row = cap.iloc[0].to_dict() if not cap.empty else {}
             cc1, cc2, cc3, cc4 = st.columns(4)
             with cc1: metric_card("Capital.com connection", "Active" if bool(cap_row.get("enabled", False)) else "Inactive", str(cap_row.get("account_type") or "DEMO"))
-            with cc2: metric_card("Auto-trading", "ON" if bool(cap_row.get("auto_trade_enabled", False)) else "OFF", str(cap_row.get("auto_trade_grades") or "A+,A") + " · best session · max 4/day")
+            with cc2: metric_card("Auto-trading", "ON" if bool(cap_row.get("auto_trade_enabled", False)) else "OFF", str(cap_row.get("auto_trade_grades") or "A+,A") + " · ranked sessions · max 10/day")
             with cc3: metric_card("Sizing source", "BENZINO" if bool(cap_row.get("use_benzino_settings", True)) else "Capital.com", "Default keeps FTMO simulation aligned")
             with cc4: metric_card("Last updated", fmt_nairobi(cap_row.get("updated_at", "")) if cap_row else "Never")
 
