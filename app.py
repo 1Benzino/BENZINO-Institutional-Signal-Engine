@@ -2276,57 +2276,157 @@ def _prop_select_with_asset_lock(
     return selected, skipped, open_by_asset
 
 
-def classify_open_prop_candidates(open_df: pd.DataFrame, profile: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+def classify_open_prop_candidates(
+    open_df: pd.DataFrame,
+    profile: dict,
+    selected_closed_df: pd.DataFrame | None = None,
+    session_source_all: pd.DataFrame | None = None,
+    activated_at: str = "",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Classify currently-open A+/A signals as prop-selected or skipped.
 
-    This powers the Prop Firm activity tables. Only open skipped trades are
-    shown; once a trade closes it naturally disappears from this open-skipped
-    table and appears in the closed A+/A table.
+    This function must use the same real-world constraints as the deterministic
+    prop replay, but with one extra requirement: currently-open trades must be
+    considered together with already-selected closed prop trades. Otherwise the
+    UI can show impossible states such as 4 closed selected trades plus 3 still
+    open selected trades for the same entry day.
+
+    Selection is based on signal generation time. Closing time is used only to
+    release the one-open-trade-per-asset lock.
     """
     if open_df is None or open_df.empty:
         return pd.DataFrame(), pd.DataFrame()
+
     work = open_df.copy()
     work = ensure_signal_schema(work) if 'ensure_signal_schema' in globals() else work
     work = work[work.get("grade", pd.Series("", index=work.index)).astype(str).str.upper().isin({"A+", "A"})].copy()
     work = work[work.get("signal", pd.Series("", index=work.index)).astype(str).str.upper().isin({"BUY", "SELL"})].copy()
     if work.empty:
         return pd.DataFrame(), pd.DataFrame()
+
     work["prop_entry_time"] = pd.to_datetime(work.get("created_at", pd.Series(pd.NaT, index=work.index)), errors="coerce", utc=True)
     work = work.dropna(subset=["prop_entry_time"]).copy()
     if work.empty:
         return pd.DataFrame(), pd.DataFrame()
-    work["prop_day"] = work["prop_entry_time"].dt.tz_convert(NAIROBI_TZ).dt.date
-    work["prop_day_all"] = work["prop_day"]
+    work["prop_day_all"] = work["prop_entry_time"].apply(lambda ts: pd.Timestamp(ts).tz_convert(NAIROBI_TZ).date())
     work["prop_session"] = work["prop_entry_time"].apply(prop_session_from_timestamp)
 
-    best = str(profile.get("active_filter_session") or profile.get("best_session") or "All sessions") if isinstance(profile, dict) else "All sessions"
-    sample_ready = bool(profile.get("sample_ready")) if isinstance(profile, dict) else False
-    skipped_parts = []
-    eligible = work.sort_values("prop_entry_time").copy()
-    if sample_ready and best not in {"", "All sessions"}:
-        gate = eligible["prop_entry_time"].apply(lambda ts: prop_session_entry_window_status(ts, best))
-        eligible["_prop_gate_ok"] = gate.apply(lambda x: bool(x[0]))
-        eligible["_prop_gate_reason"] = gate.apply(lambda x: str(x[1] or ""))
-        gated_out = eligible[~eligible["_prop_gate_ok"]].copy()
-        if not gated_out.empty:
-            gated_out["prop_filter_session"] = best
-            gated_out["prop_skip_reason"] = gated_out["_prop_gate_reason"].replace("", f"Skipped — outside {best} prop entry window")
-            gated_out["prop_selection"] = "Skipped"
-            skipped_parts.append(gated_out)
-        eligible = eligible[eligible["_prop_gate_ok"]].copy()
+    closed_selected = selected_closed_df.copy() if selected_closed_df is not None and not selected_closed_df.empty else pd.DataFrame()
+    if not closed_selected.empty:
+        closed_selected["prop_entry_time"] = pd.to_datetime(
+            closed_selected.get("prop_entry_time", closed_selected.get("created_at", pd.Series(pd.NaT, index=closed_selected.index))),
+            errors="coerce", utc=True,
+        )
+        closed_selected["prop_event_time"] = pd.to_datetime(
+            closed_selected.get("prop_event_time", closed_selected.get("exit_at", pd.Series(pd.NaT, index=closed_selected.index))),
+            errors="coerce", utc=True,
+        )
+        closed_selected = closed_selected.dropna(subset=["prop_entry_time"]).copy()
+        if not closed_selected.empty:
+            closed_selected["prop_day_all"] = closed_selected["prop_entry_time"].apply(lambda ts: pd.Timestamp(ts).tz_convert(NAIROBI_TZ).date())
+            closed_selected["asset"] = closed_selected.get("asset", pd.Series("", index=closed_selected.index)).astype(str).str.upper()
 
-    selected, locked_skipped, _locks = _prop_select_with_asset_lock(eligible, daily_cap=PROP_MAX_TRADES_PER_DAY)
-    if not selected.empty:
-        selected["prop_filter_session"] = best if sample_ready else "All sessions"
-        selected["prop_selection"] = "Taken"
-    if not locked_skipped.empty:
-        locked_skipped["prop_filter_session"] = best if sample_ready else "All sessions"
-        skipped_parts.append(locked_skipped)
+    source = session_source_all.copy() if session_source_all is not None and not session_source_all.empty else work.copy()
+    if not source.empty:
+        if "prop_entry_time" not in source.columns:
+            source["prop_entry_time"] = pd.to_datetime(source.get("created_at", pd.Series(pd.NaT, index=source.index)), errors="coerce", utc=True)
+        if "prop_event_time" not in source.columns:
+            source_event = pd.to_datetime(source.get("exit_at", pd.Series(pd.NaT, index=source.index)), errors="coerce", utc=True)
+            source["prop_event_time"] = source_event.fillna(source["prop_entry_time"])
+        act_ts = pd.to_datetime(activated_at, errors="coerce", utc=True)
+        if pd.notna(act_ts):
+            source = source[source["prop_entry_time"] >= act_ts].copy()
 
-    skipped = pd.concat(skipped_parts, ignore_index=True, sort=False) if skipped_parts else pd.DataFrame()
-    for frame in (selected, skipped):
-        if frame is not None and not frame.empty:
-            frame.drop(columns=[c for c in ["_prop_gate_ok", "_prop_gate_reason", "_daily_rank"] if c in frame.columns], inplace=True, errors="ignore")
+    selected_rows = []
+    skipped_rows = []
+    selected_open_locks: dict[str, pd.Timestamp] = {}
+    selected_open_daily_counts: dict[object, int] = {}
+
+    for _, r in work.sort_values("prop_entry_time").iterrows():
+        row = r.copy()
+        entry_ts = pd.to_datetime(row.get("prop_entry_time"), errors="coerce", utc=True)
+        asset = str(row.get("asset", "") or "").strip().upper()
+        day = row.get("prop_day_all")
+
+        # Pick the session using only evidence available before this day starts,
+        # matching the locked-session prop replay rule.
+        best = str(profile.get("active_filter_session") or profile.get("best_session") or "All sessions") if isinstance(profile, dict) else "All sessions"
+        sample_ready = bool(profile.get("sample_ready")) if isinstance(profile, dict) else False
+        try:
+            day_start = pd.Timestamp(day).tz_localize(NAIROBI_TZ).tz_convert("UTC")
+            evidence = source[source["prop_event_time"] < day_start].copy() if source is not None and not source.empty else pd.DataFrame()
+            day_profile = prop_best_session_profile(evidence, PROP_MIN_SESSION_TRADES)
+            best = str(day_profile.get("active_filter_session") or day_profile.get("best_session") or best)
+            sample_ready = bool(day_profile.get("sample_ready"))
+        except Exception:
+            pass
+
+        if sample_ready and best not in {"", "All sessions"}:
+            gate_ok, gate_reason = prop_session_entry_window_status(entry_ts, best)
+            if not gate_ok:
+                row["prop_skip_reason"] = gate_reason or f"Skipped — outside {best} prop entry window"
+                row["prop_filter_session"] = best
+                row["prop_selection"] = "Skipped"
+                skipped_rows.append(row)
+                continue
+
+        # Count already-selected CLOSED prop trades for this entry day. This is
+        # intentionally conservative: if the day has already used its 4 selected
+        # slots in persisted/replayed closed trades, no extra open trade is shown
+        # as selected for that same prop day.
+        closed_count_for_day = 0
+        if not closed_selected.empty and "prop_day_all" in closed_selected.columns:
+            try:
+                closed_count_for_day = int((closed_selected["prop_day_all"] == day).sum())
+            except Exception:
+                closed_count_for_day = 0
+        daily_count = closed_count_for_day + int(selected_open_daily_counts.get(day, 0) or 0)
+        if daily_count >= int(PROP_MAX_TRADES_PER_DAY):
+            row["prop_skip_reason"] = "Skipped — daily trade cap reached"
+            row["prop_filter_session"] = best if sample_ready else "All sessions"
+            row["prop_selection"] = "Skipped"
+            skipped_rows.append(row)
+            continue
+
+        # Enforce one open prop trade per asset. Already-selected closed trades
+        # only block if they were entered before this signal and had not closed
+        # before this signal was generated. Open rows selected in this function
+        # block subsequent rows until they close in a later scanner run.
+        asset_locked = False
+        if asset:
+            # Open rows selected earlier in this current open classification.
+            if asset in selected_open_locks:
+                asset_locked = True
+            # Selected closed prop trades that overlap this signal's entry time.
+            if not asset_locked and not closed_selected.empty:
+                try:
+                    overlaps = closed_selected[
+                        (closed_selected.get("asset", pd.Series("", index=closed_selected.index)).astype(str).str.upper() == asset)
+                        & (pd.to_datetime(closed_selected.get("prop_entry_time"), errors="coerce", utc=True) <= entry_ts)
+                        & (
+                            pd.to_datetime(closed_selected.get("prop_event_time"), errors="coerce", utc=True).isna()
+                            | (pd.to_datetime(closed_selected.get("prop_event_time"), errors="coerce", utc=True) > entry_ts)
+                        )
+                    ]
+                    asset_locked = not overlaps.empty
+                except Exception:
+                    asset_locked = False
+        if asset_locked:
+            row["prop_skip_reason"] = "Skipped — asset already has an open prop trade"
+            row["prop_filter_session"] = best if sample_ready else "All sessions"
+            row["prop_selection"] = "Skipped"
+            skipped_rows.append(row)
+            continue
+
+        row["prop_selection"] = "Taken"
+        row["prop_filter_session"] = best if sample_ready else "All sessions"
+        selected_rows.append(row)
+        selected_open_daily_counts[day] = int(selected_open_daily_counts.get(day, 0) or 0) + 1
+        if asset:
+            selected_open_locks[asset] = pd.Timestamp.max.tz_localize("UTC")
+
+    selected = pd.DataFrame(selected_rows) if selected_rows else pd.DataFrame()
+    skipped = pd.DataFrame(skipped_rows) if skipped_rows else pd.DataFrame()
     return selected, skipped
 
 
@@ -9093,7 +9193,13 @@ def render_workflow(username: str, settings: dict) -> None:
             open_mask = open_prop_source.get("status", pd.Series("", index=open_prop_source.index)).astype(str).str.upper().eq("OPEN")
             open_prop_source = open_prop_source[open_mask].copy()
 
-        selected_open_all, skipped_open_all = classify_open_prop_candidates(open_prop_source, best_profile_today)
+        selected_open_all, skipped_open_all = classify_open_prop_candidates(
+            open_prop_source,
+            best_profile_today,
+            selected_closed_df=(prop_sim.get("all_trades", pd.DataFrame()) if isinstance(prop_sim, dict) else pd.DataFrame()),
+            session_source_all=prop_source,
+            activated_at=started_at,
+        )
 
         open_selected_source = selected_open_all.copy() if selected_open_all is not None and not selected_open_all.empty else pd.DataFrame()
         if not open_selected_source.empty:
