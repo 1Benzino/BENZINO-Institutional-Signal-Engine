@@ -2769,6 +2769,83 @@ def numeric_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     return df
 
 
+SIGNAL_SCHEMA_COLUMNS = [
+    "signal_id", "display_id", "created_at", "created_at_eat", "scan_owner",
+    "asset", "ticker", "timeframe", "signal", "grade", "confidence",
+    "edge_score", "ml_prob", "entry", "sl", "tp", "rr", "regime",
+    "rsi", "atr", "trend_1h", "trend_15m", "reason", "candle_close",
+    "strategy_votes", "mtf_score", "mtf_context", "alert_sent", "status",
+    "bars_open", "exit_price", "exit_reason", "exit_at", "r_multiple",
+    "shadow_outcome", "shadow_r_multiple", "shadow_exit_price", "shadow_closed_at",
+    "trade_notes", "replay_checked_at", "session",
+]
+
+SIGNAL_NUMERIC_COLUMNS = [
+    "confidence", "edge_score", "ml_prob", "entry", "sl", "tp", "rr",
+    "rsi", "atr", "exit_price", "r_multiple", "bars_open", "mtf_score",
+    "shadow_r_multiple",
+]
+
+SIGNAL_TEXT_DEFAULTS = {
+    "signal_id": "", "display_id": "", "scan_owner": "", "asset": "",
+    "ticker": "", "timeframe": "", "signal": "", "grade": "",
+    "regime": "", "trend_1h": "", "trend_15m": "", "reason": "",
+    "status": "", "exit_reason": "", "shadow_outcome": "", "trade_notes": "",
+    "session": "Unknown",
+}
+
+def ensure_signal_schema(df: pd.DataFrame | None) -> pd.DataFrame:
+    """Return a scanner_signals-like dataframe with stable columns.
+
+    Streamlit pages should never crash just because a query returned no rows,
+    a Supabase migration is still catching up, or a previous table view selected
+    a narrower column set. This function restores the columns the app expects
+    while preserving any real columns already present.
+    """
+    if df is None:
+        df = pd.DataFrame()
+    else:
+        df = df.copy()
+
+    # Remove duplicate column labels before AgGrid / pandas JSON serialisation.
+    if len(df.columns) != len(set(map(str, df.columns))):
+        df = df.loc[:, ~pd.Index(df.columns).duplicated()].copy()
+
+    for col in SIGNAL_SCHEMA_COLUMNS:
+        if col not in df.columns:
+            if col in SIGNAL_NUMERIC_COLUMNS:
+                df[col] = np.nan
+            elif col in {"created_at", "candle_close", "exit_at", "shadow_closed_at", "replay_checked_at"}:
+                df[col] = pd.NaT
+            elif col in {"strategy_votes", "mtf_context"}:
+                df[col] = None
+            elif col == "alert_sent":
+                df[col] = False
+            else:
+                df[col] = SIGNAL_TEXT_DEFAULTS.get(col, "")
+
+    df = numeric_cols(df, [c for c in SIGNAL_NUMERIC_COLUMNS if c in df.columns])
+
+    for col in ["created_at", "candle_close", "exit_at", "shadow_closed_at", "replay_checked_at"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce", utc=True)
+
+    if "created_at_eat" not in df.columns or df["created_at_eat"].astype(str).eq("").all():
+        df["created_at_eat"] = df["created_at"].apply(fmt_nairobi) if "created_at" in df.columns else ""
+
+    if "session" not in df.columns or df["session"].astype(str).eq("").all():
+        df["session"] = df["created_at"].apply(session_name) if "created_at" in df.columns else "Unknown"
+    else:
+        blank_session = df["session"].astype(str).str.strip().eq("")
+        if blank_session.any() and "created_at" in df.columns:
+            df.loc[blank_session, "session"] = df.loc[blank_session, "created_at"].apply(session_name)
+
+    # Keep raw scanner columns first, then any derived/extra columns added later.
+    ordered = [c for c in SIGNAL_SCHEMA_COLUMNS if c in df.columns]
+    extras = [c for c in df.columns if c not in ordered]
+    return df[ordered + extras].copy()
+
+
 def session_name(ts) -> str:
     try:
         hour = pd.to_datetime(ts, utc=True).tz_convert(NAIROBI_TZ).hour
@@ -2816,13 +2893,7 @@ def load_signals_for_user(username: str, settings: dict, include_all_admin: bool
         ORDER BY created_at DESC
         LIMIT %s
         """
-    df = read_df(sql, tuple(params))
-    if df.empty:
-        return df
-    df = numeric_cols(df, ["confidence", "edge_score", "ml_prob", "entry", "sl", "tp", "rr", "rsi", "atr", "exit_price", "r_multiple", "bars_open", "mtf_score", "shadow_r_multiple"])
-    df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce", utc=True)
-    df["created_at_eat"] = df["created_at"].apply(fmt_nairobi)
-    df["session"] = df["created_at"].apply(session_name)
+    df = ensure_signal_schema(read_df(sql, tuple(params)))
     return df
 
 
@@ -2841,12 +2912,7 @@ def load_all_system_signals(settings: dict, limit: int = APP_TABLE_MAX_ROWS) -> 
         """,
         (limit,),
     )
-    if df.empty:
-        return df
-    df = numeric_cols(df, ["confidence", "edge_score", "ml_prob", "entry", "sl", "tp", "rr", "rsi", "atr", "exit_price", "r_multiple", "bars_open", "mtf_score", "shadow_r_multiple"])
-    df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce", utc=True)
-    df["created_at_eat"] = df["created_at"].apply(fmt_nairobi)
-    df["session"] = df["created_at"].apply(session_name)
+    df = ensure_signal_schema(df)
     return enrich_position_sizing(df, settings)
 
 
@@ -7889,10 +7955,10 @@ def render_user_journal_history_page(username: str, settings: dict) -> None:
 
 def render_workflow(username: str, settings: dict) -> None:
     page_header("Workflow", "")
-    raw_df = enrich_position_sizing(load_signals_for_user(username, settings), settings)
-    system_raw_df = load_all_system_signals(settings)
-    system_df = apply_timeframe_view(system_raw_df, settings)
-    df = apply_timeframe_view(raw_df, settings)
+    raw_df = ensure_signal_schema(enrich_position_sizing(load_signals_for_user(username, settings), settings))
+    system_raw_df = ensure_signal_schema(load_all_system_signals(settings))
+    system_df = ensure_signal_schema(apply_timeframe_view(system_raw_df, settings))
+    df = ensure_signal_schema(apply_timeframe_view(raw_df, settings))
     if df.empty and (system_raw_df is None or system_raw_df.empty):
         st.info("No journal data available yet for this timeframe. Try View performance timeframe = All.")
         return
