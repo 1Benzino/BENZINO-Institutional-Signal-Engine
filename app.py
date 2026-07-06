@@ -9198,7 +9198,7 @@ def render_workflow(username: str, settings: dict) -> None:
             best_profile_today,
             selected_closed_df=(prop_sim.get("all_trades", pd.DataFrame()) if isinstance(prop_sim, dict) else pd.DataFrame()),
             session_source_all=prop_source,
-            activated_at=started_at,
+            activated_at=(settings.get("tracking_started_at") or "1970-01-01T00:00:00Z"),
         )
 
         open_selected_source = selected_open_all.copy() if selected_open_all is not None and not selected_open_all.empty else pd.DataFrame()
