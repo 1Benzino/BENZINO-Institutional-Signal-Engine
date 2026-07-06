@@ -1722,6 +1722,51 @@ def save_prop_challenge_daily_ledger(username: str, timeframe: str, daily_df: pd
         conn.close()
 
 
+
+
+def normalize_prop_daily_for_compare(daily_df: pd.DataFrame) -> pd.DataFrame:
+    """Canonical daily-ledger view used to detect stale persisted prop ledgers.
+
+    The prop closed-trades table is produced from the current deterministic replay.
+    The persisted daily ledger must match that same replay for Challenge/Phase/Day,
+    Daily P/L and Trades. If not, the saved ledger is stale and must be rebuilt.
+    """
+    if daily_df is None or daily_df.empty:
+        return pd.DataFrame(columns=["Challenge", "Phase", "Day", "Daily P/L", "Trades"])
+    df = daily_df.copy()
+    for col in ["Challenge", "Phase", "Day", "Daily P/L", "Trades"]:
+        if col not in df.columns:
+            df[col] = np.nan
+    df["Challenge"] = df["Challenge"].astype(str).str.strip().replace({"nan": "", "None": ""})
+    # Preserve #1 display labels while normalising blanks.
+    df["Challenge"] = df["Challenge"].apply(lambda x: x if x.startswith("#") else (f"#{int(float(x))}" if str(x).replace('.', '', 1).isdigit() else x))
+    df["Phase"] = df["Phase"].astype(str).str.strip()
+    df["Day"] = pd.to_datetime(df["Day"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df["Daily P/L"] = pd.to_numeric(df["Daily P/L"], errors="coerce").fillna(0.0).round(2)
+    df["Trades"] = pd.to_numeric(df["Trades"], errors="coerce").fillna(0).astype(int)
+    out = df[["Challenge", "Phase", "Day", "Daily P/L", "Trades"]].dropna(subset=["Day"])
+    if out.empty:
+        return out
+    # Multiple fills for the same key should collapse deterministically.
+    out = out.groupby(["Challenge", "Phase", "Day"], as_index=False).agg({"Daily P/L": "sum", "Trades": "sum"})
+    return out.sort_values(["Challenge", "Phase", "Day"]).reset_index(drop=True)
+
+
+def prop_daily_ledger_matches_replay(saved_daily: pd.DataFrame, replay_daily: pd.DataFrame) -> bool:
+    """Return True only when the saved prop daily ledger matches current selected prop trades."""
+    saved = normalize_prop_daily_for_compare(saved_daily)
+    replay = normalize_prop_daily_for_compare(replay_daily)
+    if saved.empty and replay.empty:
+        return True
+    if saved.empty != replay.empty:
+        return False
+    merged = saved.merge(replay, on=["Challenge", "Phase", "Day"], how="outer", suffixes=("_saved", "_replay"), indicator=True)
+    if not (merged["_merge"] == "both").all():
+        return False
+    pnl_diff = (pd.to_numeric(merged["Daily P/L_saved"], errors="coerce").fillna(0.0) - pd.to_numeric(merged["Daily P/L_replay"], errors="coerce").fillna(0.0)).abs()
+    trades_diff = (pd.to_numeric(merged["Trades_saved"], errors="coerce").fillna(0).astype(int) - pd.to_numeric(merged["Trades_replay"], errors="coerce").fillna(0).astype(int)).abs()
+    return bool((pnl_diff <= 0.01).all() and (trades_diff == 0).all())
+
 def archive_prop_challenge_attempt(
     username: str,
     timeframe: str,
@@ -8481,16 +8526,25 @@ def render_workflow(username: str, settings: dict) -> None:
             stored_history_for_tf = pd.DataFrame()
             saved_count = 0
 
-        # Do not overwrite a valid existing daily ledger on normal page load.
-        # Rebuild only when the saved ledger is missing/invalid. Refresh Data is
-        # still the explicit full-rebuild path.
-        if (stored_daily_for_tf is None or stored_daily_for_tf.empty):
-            expanded_daily_to_save = expand_prop_daily_calendar_days(prop_sim.get("all_daily", pd.DataFrame()), active_prop, starting)
-            if replay_history or (expanded_daily_to_save is not None and not expanded_daily_to_save.empty):
-                rebuild_prop_challenge_history_from_trades(username, challenge_tf, replay_history, expanded_daily_to_save)
+        # Build the current deterministic replay daily ledger from the same selected
+        # prop trades used by the closed-trades table. If the saved Supabase ledger
+        # disagrees on Day/P&L/Trades, it is stale from an older replay rule and must
+        # be replaced; otherwise the table can say 4 losses while the ledger shows a win.
+        replay_daily_expanded = expand_prop_daily_calendar_days(prop_sim.get("all_daily", pd.DataFrame()), active_prop, starting)
+        saved_missing = stored_daily_for_tf is None or stored_daily_for_tf.empty
+        saved_mismatch = False
+        if not saved_missing:
+            try:
+                saved_mismatch = not prop_daily_ledger_matches_replay(stored_daily_for_tf, replay_daily_expanded)
+            except Exception:
+                saved_mismatch = True
+
+        if saved_missing or saved_mismatch:
+            if replay_history or (replay_daily_expanded is not None and not replay_daily_expanded.empty):
+                rebuild_prop_challenge_history_from_trades(username, challenge_tf, replay_history, replay_daily_expanded)
                 stored_daily_for_tf = load_prop_challenge_daily_ledger(username, challenge_tf, limit=APP_TABLE_MAX_ROWS)
 
-        day_summary = stored_daily_for_tf if stored_daily_for_tf is not None and not stored_daily_for_tf.empty else prop_sim.get("all_daily", pd.DataFrame())
+        day_summary = stored_daily_for_tf if stored_daily_for_tf is not None and not stored_daily_for_tf.empty else replay_daily_expanded
         if day_summary is None or day_summary.empty:
             day_summary = prop_sim.get("active_daily", pd.DataFrame())
         day_summary = expand_prop_daily_calendar_days(day_summary, active_prop, starting)
