@@ -259,7 +259,7 @@ def init_tables() -> None:
             "users", "user_settings", "user_watchlists", "scanner_signals",
             "user_telegram_settings", "user_journal_history",
             "capital_execution_audit", "capital_executed_trades",
-            "prop_challenge_history",
+            "prop_challenge_history", "prop_challenge_daily_ledger",
         ]
         try:
             conn = db_connect()
@@ -2380,6 +2380,7 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
     active = {
         "phase": "Phase 1 Challenge" if phase == 1 else "Phase 2 Verification",
         "phase_number": phase,
+        "challenge_number": int(challenge_no),
         "status": "ACTIVE",
         "start_at": phase_start_ts,
         "equity": equity,
@@ -2426,6 +2427,112 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
     return {"history": histories, "active": active, "active_curve": active_curve, "active_daily": active_daily, "all_daily": all_daily, "all_trades": all_trades, "skipped_trades": skipped_prop_trades, "best_session": best_session_profile}
 
 
+def expand_prop_daily_calendar_days(daily_df: pd.DataFrame, active: dict | None, starting: float = 10000.0) -> pd.DataFrame:
+    """Ensure the active prop Daily Ledger is a true day-by-day ledger.
+
+    The saved prop ledger stores realised prop-selected trades, but users expect
+    the ledger to show every completed calendar day in the active challenge, even
+    if BENZINO took zero prop trades that day. This function adds missing
+    completed EAT days from the active phase start through yesterday. It does
+    not add the current day until it has ended.
+    """
+    if active is None:
+        active = {}
+    out = daily_df.copy() if daily_df is not None and not daily_df.empty else pd.DataFrame()
+
+    start_ts = pd.to_datetime(active.get("start_at", None), errors="coerce", utc=True)
+    if pd.isna(start_ts):
+        return out
+
+    today_eat = pd.Timestamp.now(tz=NAIROBI_TZ).date()
+    last_completed_day = today_eat - timedelta(days=1)
+    start_day = start_ts.tz_convert(NAIROBI_TZ).date()
+    if start_day > last_completed_day:
+        return out
+
+    challenge_no = int(active.get("challenge_number") or 1)
+    challenge_label = f"#{challenge_no}"
+    phase_label = "Phase 1" if int(active.get("phase_number") or 1) == 1 else "Phase 2"
+    phase_target = float(starting) * (1.0 + (CHALLENGE_PHASE1_TARGET_PCT if phase_label == "Phase 1" else CHALLENGE_PHASE2_TARGET_PCT))
+    daily_floor_gap = float(starting) * CHALLENGE_MAX_DAILY_LOSS_PCT
+
+    if out.empty:
+        out = pd.DataFrame(columns=[
+            "Challenge", "Phase", "Day", "Daily P/L", "Day Result", "Target Hit",
+            "Trades", "Opening Balance", "Closing Balance", "Intraday Low",
+            "Daily Loss Floor", "Phase Target", "Daily Breach"
+        ])
+
+    # Normalize existing row keys for lookup.
+    work = out.copy()
+    if "Challenge" not in work.columns:
+        work["Challenge"] = challenge_label
+    if "Phase" not in work.columns:
+        work["Phase"] = phase_label
+    if "Day" in work.columns:
+        work["__day_key"] = pd.to_datetime(work["Day"], errors="coerce").dt.date
+    else:
+        work["Day"] = pd.NaT
+        work["__day_key"] = pd.NaT
+
+    existing_active = work[(work["Challenge"].astype(str) == challenge_label) & (work["Phase"].astype(str) == phase_label)].copy()
+    by_day = {r["__day_key"]: r.to_dict() for _, r in existing_active.dropna(subset=["__day_key"]).iterrows()}
+
+    rows = []
+    running_balance = float(starting)
+    day = start_day
+    while day <= last_completed_day:
+        existing = by_day.get(day)
+        if existing is not None:
+            row = {k: existing.get(k) for k in out.columns if not str(k).startswith("__")}
+            daily_pnl = float(pd.to_numeric(row.get("Daily P/L"), errors="coerce") or 0.0)
+            opening = float(pd.to_numeric(row.get("Opening Balance"), errors="coerce") or running_balance)
+            closing = float(pd.to_numeric(row.get("Closing Balance"), errors="coerce") or (opening + daily_pnl))
+            intraday_low = float(pd.to_numeric(row.get("Intraday Low"), errors="coerce") or min(opening, closing))
+            trades = int(pd.to_numeric(row.get("Trades"), errors="coerce") or 0)
+            row.update({
+                "Challenge": challenge_label,
+                "Phase": phase_label,
+                "Day": day,
+                "Daily P/L": daily_pnl,
+                "Trades": trades,
+                "Opening Balance": opening,
+                "Closing Balance": closing,
+                "Intraday Low": intraday_low,
+                "Daily Loss Floor": float(row.get("Daily Loss Floor") or (opening - daily_floor_gap)),
+                "Phase Target": float(row.get("Phase Target") or phase_target),
+                "Day Result": row.get("Day Result") or ("WIN" if daily_pnl > 0 else "LOSS" if daily_pnl < 0 else "BREAKEVEN"),
+                "Target Hit": row.get("Target Hit") or ("YES" if closing >= phase_target else "NO"),
+                "Daily Breach": row.get("Daily Breach") or ("YES" if intraday_low < (opening - daily_floor_gap) else "NO"),
+            })
+            running_balance = closing
+            rows.append(row)
+        else:
+            opening = running_balance
+            closing = running_balance
+            rows.append({
+                "Challenge": challenge_label,
+                "Phase": phase_label,
+                "Day": day,
+                "Daily P/L": 0.0,
+                "Day Result": "BREAKEVEN",
+                "Target Hit": "YES" if closing >= phase_target else "NO",
+                "Trades": 0,
+                "Opening Balance": opening,
+                "Closing Balance": closing,
+                "Intraday Low": closing,
+                "Daily Loss Floor": opening - daily_floor_gap,
+                "Phase Target": phase_target,
+                "Daily Breach": "NO",
+            })
+        day = day + timedelta(days=1)
+
+    active_expanded = pd.DataFrame(rows)
+    # Keep older completed challenges from the saved ledger unchanged.
+    other = work[~((work["Challenge"].astype(str) == challenge_label) & (work["Phase"].astype(str) == phase_label))].drop(columns=["__day_key"], errors="ignore")
+    combined = pd.concat([other, active_expanded], ignore_index=True, sort=False)
+    return combined
+
 
 def rebuild_user_prop_challenge_ledger(username: str, settings: dict) -> dict:
     """Explicitly rebuild this user's persisted prop challenge ledger.
@@ -2452,7 +2559,7 @@ def rebuild_user_prop_challenge_ledger(username: str, settings: dict) -> dict:
             user_df,
         )
         histories = sim.get("history", []) or []
-        daily = sim.get("all_daily", pd.DataFrame())
+        daily = expand_prop_daily_calendar_days(sim.get("all_daily", pd.DataFrame()), sim.get("active", {}), 10000.0)
         rebuild_prop_challenge_history_from_trades(username, challenge_tf, histories, daily)
         out["rebuilt"] = True
         out["history_rows"] = int(len(histories))
@@ -8069,15 +8176,18 @@ def render_workflow(username: str, settings: dict) -> None:
         # Do not overwrite an existing daily ledger on normal page load.
         # The ledger is a persisted challenge record; recomputing it every login
         # can make prior days disappear if filters/session logic evolve.
-        if (stored_daily_for_tf is None or stored_daily_for_tf.empty) and replay_history:
-            rebuild_prop_challenge_history_from_trades(username, challenge_tf, replay_history, prop_sim.get("all_daily", pd.DataFrame()))
-            stored_daily_for_tf = load_prop_challenge_daily_ledger(username, challenge_tf, limit=APP_TABLE_MAX_ROWS)
+        if (stored_daily_for_tf is None or stored_daily_for_tf.empty):
+            expanded_daily_to_save = expand_prop_daily_calendar_days(prop_sim.get("all_daily", pd.DataFrame()), prop_sim.get("active", {}), starting)
+            if replay_history or (expanded_daily_to_save is not None and not expanded_daily_to_save.empty):
+                rebuild_prop_challenge_history_from_trades(username, challenge_tf, replay_history, expanded_daily_to_save)
+                stored_daily_for_tf = load_prop_challenge_daily_ledger(username, challenge_tf, limit=APP_TABLE_MAX_ROWS)
         active_prop = prop_sim.get("active", {})
         prop_curve = prop_sim.get("active_curve", pd.DataFrame())
         prop_all_replay = prop_sim.get("all_trades", pd.DataFrame())
         day_summary = stored_daily_for_tf if stored_daily_for_tf is not None and not stored_daily_for_tf.empty else prop_sim.get("all_daily", pd.DataFrame())
         if day_summary is None or day_summary.empty:
             day_summary = prop_sim.get("active_daily", pd.DataFrame())
+        day_summary = expand_prop_daily_calendar_days(day_summary, active_prop, starting)
 
         # If a persisted ledger exists, use its latest closing balance for the
         # displayed prop account balance. This keeps the account stable across
