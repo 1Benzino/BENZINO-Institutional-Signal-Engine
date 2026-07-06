@@ -4431,46 +4431,65 @@ def _json_dict(value) -> dict:
     return {}
 
 
-def _capital_level_from_raw(raw: dict, kind: str):
-    """Extract broker-confirmed levels from Capital.com raw order/position JSON.
 
-    kind: entry | stop | limit | exit
-    Capital.com responses are not perfectly consistent across endpoints, so this
-    checks confirm, response, payload and open-position raw JSON before falling
-    back to None. This prevents the audit from pretending that planned and broker
-    prices are identical when Capital did not return the fill in the main row.
+def _capital_level_from_raw(raw: dict, kind: str):
+    """Extract broker-confirmed levels from Capital.com raw JSON.
+
+    This function intentionally prefers broker position/deal objects and avoids
+    treating the original order payload as a broker fill. The payload contains
+    BENZINO's requested levels; the audit needs Capital.com's confirmed levels.
     """
     raw = _json_dict(raw)
-    position = raw.get("position") if isinstance(raw.get("position"), dict) else raw
+    position = raw.get("position") if isinstance(raw.get("position"), dict) else {}
     market = raw.get("market") if isinstance(raw.get("market"), dict) else {}
-    payload = _json_dict(raw.get("payload"))
     confirm = _json_dict(raw.get("confirm"))
     response = _json_dict(raw.get("response"))
     details = _json_dict(raw.get("details"))
+    deal = raw.get("deal") if isinstance(raw.get("deal"), dict) else {}
 
     if kind == "entry":
-        keys = ["level", "openLevel", "entryPrice", "price", "executedLevel", "dealLevel"]
-        paths = [["affectedDeals", 0, "level"], ["deal", "level"], ["position", "level"]]
+        keys = [
+            "level", "openLevel", "openingLevel", "entryPrice", "entryLevel",
+            "price", "executedLevel", "dealLevel", "createdDealLevel",
+        ]
+        paths = [
+            ["position", "level"], ["position", "openLevel"], ["deal", "level"],
+            ["deal", "openLevel"], ["affectedDeals", 0, "level"],
+            ["affectedDeals", 0, "dealLevel"],
+        ]
     elif kind == "exit":
-        keys = ["closeLevel", "exitPrice", "closePrice"]
-        paths = [["affectedDeals", 0, "closeLevel"], ["deal", "closeLevel"], ["position", "closeLevel"]]
+        keys = ["closeLevel", "exitPrice", "closePrice", "closingLevel"]
+        paths = [["position", "closeLevel"], ["deal", "closeLevel"], ["affectedDeals", 0, "closeLevel"]]
     elif kind == "stop":
-        keys = ["stopLevel", "stopLossLevel", "sl", "stopPrice"]
-        paths = [["position", "stopLevel"], ["deal", "stopLevel"], ["affectedDeals", 0, "stopLevel"]]
-    else:  # limit / take profit
-        keys = ["profitLevel", "limitLevel", "takeProfitLevel", "tp", "limitPrice"]
-        paths = [["position", "profitLevel"], ["position", "limitLevel"], ["deal", "limitLevel"], ["affectedDeals", 0, "limitLevel"]]
+        keys = [
+            "stopLevel", "stopLossLevel", "stopLoss", "stop", "stopPrice",
+            "sl", "stopOrderLevel",
+        ]
+        paths = [
+            ["position", "stopLevel"], ["position", "stopLossLevel"],
+            ["deal", "stopLevel"], ["affectedDeals", 0, "stopLevel"],
+        ]
+    else:
+        keys = [
+            "limitLevel", "profitLevel", "takeProfitLevel", "takeProfit",
+            "limit", "tp", "limitPrice", "profitOrderLevel",
+        ]
+        paths = [
+            ["position", "limitLevel"], ["position", "profitLevel"],
+            ["deal", "limitLevel"], ["affectedDeals", 0, "limitLevel"],
+        ]
 
-    # direct dict checks first
-    for obj in (position, confirm, response, details, payload, market):
+    # Prefer true broker objects first. These are returned by /positions, deal
+    # detail, activity/history, or /confirms. Do NOT inspect the original payload
+    # here because that only proves what we requested, not what Capital accepted.
+    for obj in (position, deal, details, confirm, response, raw, market):
         if isinstance(obj, dict):
             val = _first_value(obj, keys, None)
             parsed = _parse_float_or_none(val)
             if parsed is not None:
                 return parsed
 
-    # nested/list paths
-    for root in (raw, confirm, response):
+    for root in (raw, position, deal, details, confirm, response):
         for path in paths:
             cur = root
             ok = True
@@ -4493,6 +4512,80 @@ def _capital_level_from_raw(raw: dict, kind: str):
                     return parsed
     return None
 
+
+def capital_fetch_position_detail(deal_id: str = "", deal_reference: str = "") -> dict:
+    """Fetch the broker's current position/deal details for one Capital.com trade.
+
+    Capital.com returns the exact accepted entry/SL/TP on position/deal endpoints.
+    The exact path differs slightly between API versions, so we try the standard
+    position detail endpoint first and then fall back to confirms by reference.
+    """
+    deal_id = str(deal_id or "").strip()
+    deal_reference = str(deal_reference or "").strip()
+    candidates = []
+    if deal_id:
+        candidates.extend([f"/positions/{deal_id}", f"/positions/deal/{deal_id}"])
+    if deal_reference:
+        candidates.append(f"/confirms/{deal_reference}")
+    for path in candidates:
+        data = capital_request("GET", path, retries=1)
+        if isinstance(data, dict) and data:
+            return data
+    return {}
+
+
+def _broker_values_from_actual_and_order(actual_raw: dict, order_raw: dict, deal_id: str = "", deal_reference: str = "") -> dict:
+    """Return Capital-confirmed broker levels for audit.
+
+    Order payload values are not used as broker fills. If synced open-position
+    data is incomplete, query Capital.com again using deal_id/deal_reference.
+    """
+    actual_raw = _json_dict(actual_raw)
+    order_raw = _json_dict(order_raw)
+    detail_raw = {}
+
+    entry = _capital_level_from_raw(actual_raw, "entry")
+    stop = _capital_level_from_raw(actual_raw, "stop")
+    limit = _capital_level_from_raw(actual_raw, "limit")
+    exit_level = _capital_level_from_raw(actual_raw, "exit")
+
+    # capital_auto_orders.raw_json may already contain broker-confirmed values
+    # captured immediately after order placement. These are safe to use because
+    # they come from Capital confirm/position detail, not the submitted payload.
+    stored_broker_values = order_raw.get("broker_values") if isinstance(order_raw.get("broker_values"), dict) else {}
+    if entry is None:
+        entry = _parse_float_or_none(stored_broker_values.get("entry"))
+    if stop is None:
+        stop = _parse_float_or_none(stored_broker_values.get("stop"))
+    if limit is None:
+        limit = _parse_float_or_none(stored_broker_values.get("limit"))
+    if exit_level is None:
+        exit_level = _parse_float_or_none(stored_broker_values.get("exit"))
+
+    if (entry is None or stop is None or limit is None) and (deal_id or deal_reference):
+        detail_raw = capital_fetch_position_detail(deal_id=deal_id, deal_reference=deal_reference)
+        entry = entry if entry is not None else _capital_level_from_raw(detail_raw, "entry")
+        stop = stop if stop is not None else _capital_level_from_raw(detail_raw, "stop")
+        limit = limit if limit is not None else _capital_level_from_raw(detail_raw, "limit")
+        exit_level = exit_level if exit_level is not None else _capital_level_from_raw(detail_raw, "exit")
+
+    # Confirm can be useful for deal_id/status, but may not include actual SL/TP.
+    # Use it as a final broker-source fallback, not the original payload.
+    confirm_raw = _json_dict(order_raw.get("confirm"))
+    if entry is None:
+        entry = _capital_level_from_raw(confirm_raw, "entry")
+    if stop is None:
+        stop = _capital_level_from_raw(confirm_raw, "stop")
+    if limit is None:
+        limit = _capital_level_from_raw(confirm_raw, "limit")
+
+    return {
+        "entry": entry,
+        "stop": stop,
+        "limit": limit,
+        "exit": exit_level,
+        "detail_raw": detail_raw,
+    }
 
 def deterministic_uuid_text(seed: str) -> str:
     """Return a UUID string for comparison rows even when Supabase id is UUID.
@@ -4581,7 +4674,7 @@ def normalise_capital_position(row: dict) -> dict | None:
     name = str(_first_value(market, ["instrumentName", "name"], "") or _first_value(position, ["instrumentName", "marketName", "name"], "") or "")
     direction = str(_first_value(position, ["direction", "side"], "") or "").upper()
     opened_at = _parse_capital_time(_first_value(position, ["createdDateUTC", "createdDate", "openDate", "openedAt", "date"], None))
-    entry = _parse_float_or_none(_first_value(position, ["level", "openLevel", "entryPrice", "price"], None))
+    entry = _parse_float_or_none(_first_value(position, ["level", "openLevel", "openingLevel", "entryPrice", "entryLevel", "price", "dealLevel"], None))
     size = _parse_float_or_none(_first_value(position, ["size", "dealSize", "quantity"], None))
     pnl = _parse_float_or_none(_first_value(position, ["profit", "pnl", "upl", "realizedProfit"], None))
     if not (deal_id or deal_ref or epic):
@@ -5458,71 +5551,119 @@ def capital_confirm_deal(deal_reference: str) -> dict | None:
 
 
 
-def adjust_levels_for_capital_constraints(sig: ScanResult, market_info: dict, *, error_text: str = "") -> tuple[float, float]:
-    """Return broker-valid SL/TP while preserving the 1:2 direction.
+def _capital_distance_constraints(market_info: dict) -> tuple[float, float, float, float]:
+    """Return broker distance constraints as floats: min_stop, max_stop, min_limit, max_limit."""
+    market_info = market_info if isinstance(market_info, dict) else {}
+    def f(key: str) -> float:
+        try:
+            return float(market_info.get(key) or 0.0)
+        except Exception:
+            return 0.0
+    return f("min_stop_distance"), f("max_stop_distance"), f("min_limit_distance"), f("max_limit_distance")
 
-    Guarantees after adjustment:
-      BUY  -> SL < entry < TP
-      SELL -> TP < entry < SL
+
+def fixed_rr_levels_from_entry(entry: float, direction: str, risk_distance: float, market_info: dict | None = None) -> tuple[float, float]:
+    """Build strict 1:2 SL/TP levels from a known entry price.
+
+    This is used for Capital.com auto-orders so every broker trade is requested
+    and, after confirmation, normalised to exactly 1:2 from the broker fill.
+    The original signal TP can have another RR; execution uses this fixed 1:2
+    overlay so demo/live execution remains predictable.
     """
+    try:
+        entry = float(entry)
+        direction = str(direction or "").upper()
+        risk = abs(float(risk_distance or 0.0))
+    except Exception:
+        return 0.0, 0.0
+    if entry <= 0 or direction not in {"BUY", "SELL"}:
+        return 0.0, 0.0
+
+    min_stop, max_stop, min_limit, max_limit = _capital_distance_constraints(market_info or {})
+    # TP distance is 2R, so a minimum limit distance implies R >= min_limit/2.
+    min_risk = max(min_stop, (min_limit / 2.0) if min_limit else 0.0, abs(entry) * 0.00005, 1e-8)
+    risk = max(risk, min_risk)
+
+    # If the broker provides maximum distances, keep both SL distance and TP
+    # distance valid. If constraints conflict, caller skips cleanly.
+    max_risk_candidates = []
+    if max_stop and max_stop > 0:
+        max_risk_candidates.append(max_stop)
+    if max_limit and max_limit > 0:
+        max_risk_candidates.append(max_limit / 2.0)
+    if max_risk_candidates:
+        max_risk = min(max_risk_candidates)
+        if max_risk < min_risk:
+            return 0.0, 0.0
+        risk = min(risk, max_risk)
+
+    if direction == "BUY":
+        sl = entry - risk
+        tp = entry + (2.0 * risk)
+        valid = sl > 0 and tp > 0 and sl < entry < tp
+    else:
+        sl = entry + risk
+        tp = entry - (2.0 * risk)
+        valid = sl > 0 and tp > 0 and tp < entry < sl
+    if not valid:
+        return 0.0, 0.0
+    return float(sl), float(tp)
+
+
+def fixed_rr_levels_for_signal(sig: ScanResult, market_info: dict | None = None, *, error_text: str = "") -> tuple[float, float]:
+    """Return broker-valid SL/TP for the signal's planned entry at exactly 1:2."""
     entry = float(sig.entry)
-    sl = float(sig.sl)
-    direction = str(sig.signal or "").upper()
+    planned_sl = float(sig.sl)
+    risk_distance = abs(entry - planned_sl)
+
+    # If Capital returns a boundary for the stop level, respect it by deriving
+    # the risk distance from that boundary, then rebuild TP as exactly 2R.
     text = str(error_text or "")
     nums = re.findall(r"[-+]?\d+(?:\.\d+)?", text)
     boundary = float(nums[-1]) if nums else None
-    min_stop = float(market_info.get("min_stop_distance") or market_info.get("min_limit_distance") or 0)
-    max_stop = float(market_info.get("max_stop_distance") or market_info.get("max_limit_distance") or 0)
-    if min_stop <= 0:
-        min_stop = max(abs(entry) * 0.00005, 1e-8)
+    direction = str(sig.signal or "").upper()
+    if boundary is not None and "invalid.stoploss" in text.lower():
+        if direction == "BUY" and boundary < entry:
+            risk_distance = abs(entry - boundary)
+        elif direction == "SELL" and boundary > entry:
+            risk_distance = abs(boundary - entry)
 
-    # Use broker-provided boundary when Capital tells us the exact valid level.
-    if "invalid.stoploss.maxvalue" in text and boundary is not None:
-        sl = min(sl, boundary)
-    elif "invalid.stoploss.minvalue" in text and boundary is not None:
-        sl = max(sl, boundary)
+    return fixed_rr_levels_from_entry(entry, direction, risk_distance, market_info or {})
 
-    dist = abs(entry - sl)
-    if dist <= 0:
-        dist = min_stop
-    if min_stop and dist < min_stop:
-        dist = min_stop
-    if max_stop and max_stop > 0 and dist > max_stop:
-        dist = max_stop
 
-    if direction == "BUY":
-        sl = min(entry - dist, entry - min_stop)
-        risk = abs(entry - sl)
-        tp = entry + (2.0 * risk)
-        if min_stop and (tp - entry) < min_stop:
-            tp = entry + min_stop
-    else:
-        sl = max(entry + dist, entry + min_stop)
-        risk = abs(sl - entry)
-        tp = entry - (2.0 * risk)
-        if min_stop and (entry - tp) < min_stop:
-            tp = entry - min_stop
+def adjust_levels_for_capital_constraints(sig: ScanResult, market_info: dict, *, error_text: str = "") -> tuple[float, float]:
+    """Backward-compatible wrapper: Capital auto-trading uses fixed 1:2 levels."""
+    return fixed_rr_levels_for_signal(sig, market_info, error_text=error_text)
 
-    # Final safety guard for Capital profitLevel validation.
-    if direction == "BUY" and not (sl < entry < tp):
-        sl = entry - max(min_stop, abs(entry - sl) or min_stop)
-        tp = entry + 2.0 * abs(entry - sl)
-    if direction == "SELL" and not (tp < entry < sl):
-        sl = entry + max(min_stop, abs(entry - sl) or min_stop)
-        tp = entry - 2.0 * abs(sl - entry)
 
-    # Capital rejects non-positive stop/profit levels. Low-priced instruments
-    # such as NATGAS can produce an invalid TP if broker distances are larger
-    # than the current price. Return zeros so the caller can skip cleanly rather
-    # than sending an invalid order repeatedly.
-    if entry <= 0 or sl <= 0 or tp <= 0:
-        return 0.0, 0.0
-    if direction == "BUY" and not (sl < entry < tp):
-        return 0.0, 0.0
-    if direction == "SELL" and not (tp < entry < sl):
-        return 0.0, 0.0
+def capital_update_position_levels(deal_id: str, stop_level: float, profit_level: float) -> dict:
+    """Best-effort update of broker SL/TP to the post-fill fixed 1:2 levels."""
+    deal_id = str(deal_id or "").strip()
+    if not deal_id:
+        return {"ok": False, "error": "missing_deal_id"}
+    try:
+        stop_level = float(stop_level)
+        profit_level = float(profit_level)
+    except Exception:
+        return {"ok": False, "error": "invalid_levels"}
+    if stop_level <= 0 or profit_level <= 0:
+        return {"ok": False, "error": "non_positive_levels"}
 
-    return float(sl), float(tp)
+    payloads = [
+        {"guaranteedStop": False, "stopLevel": stop_level, "profitLevel": profit_level},
+        {"stopLevel": stop_level, "profitLevel": profit_level},
+    ]
+    paths = [f"/positions/{deal_id}"]
+    last_error = ""
+    for payload in payloads:
+        for method in ("PUT", "PATCH"):
+            for path in paths:
+                _CAPITAL_LAST_ERROR["text"] = ""
+                res = capital_request(method, path, json_body=payload, retries=1)
+                if isinstance(res, dict):
+                    return {"ok": True, "method": method, "path": path, "payload": payload, "response": res}
+                last_error = str(_CAPITAL_LAST_ERROR.get("text") or "")[:500]
+    return {"ok": False, "error": last_error or "position_update_failed", "payload": payloads[0]}
 
 def build_capital_size_attempts(base_size: float, market_info: dict) -> list[float]:
     min_size = float(market_info.get("min_size") or CAPITAL_AUTO_TRADE_MIN_SIZE or 0.01)
@@ -5702,7 +5843,59 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
     ok = bool(deal_reference) and (not confirm_status or confirm_status in {"ACCEPTED", "OPEN", "SUCCESS", "CONFIRMED"})
     status = "OPENED" if ok else "REJECTED"
     error = "" if ok else last_error
-    _auto_raw = {"payload": last_payload, "original_size": trade_size, "adjusted_sl": adj_sl, "adjusted_tp": adj_tp, "broker_constraints": market_info, "sizing": sizing, "response": response or {}, "confirm": confirm or {}, "ftmo_leverage": FTMO_COMPARISON_LEVERAGE, "capital_leverage": capital_effective_leverage_for_asset(sig.asset, market_info), "ftmo_normalization_factor": ftmo_normalization_factor(sig.asset, market_info)}
+
+    # Broker truth: after Capital accepts the order, fetch the confirmed fill
+    # and normalise the broker SL/TP to a strict 1:2 RR from that actual fill.
+    # If the broker detail is briefly unavailable, do not invent it. The audit
+    # row will stay pending and the next Capital sync/audit pass will retry.
+    broker_detail = {}
+    broker_values = {}
+    fixed_rr_update = {"attempted": False, "ok": False}
+    broker_truth_pending = False
+    if ok:
+        broker_detail = capital_fetch_position_detail(deal_id=deal_id, deal_reference=deal_reference)
+        broker_values = _broker_values_from_actual_and_order(
+            broker_detail,
+            {"confirm": confirm or {}, "response": response or {}},
+            deal_id=deal_id,
+            deal_reference=deal_reference,
+        )
+        broker_entry = broker_values.get("entry")
+        if broker_entry is not None:
+            planned_risk = abs(float(sig.entry) - float(adj_sl or sig.sl))
+            broker_sl_target, broker_tp_target = fixed_rr_levels_from_entry(
+                float(broker_entry),
+                direction,
+                planned_risk,
+                market_info,
+            )
+            if broker_sl_target > 0 and broker_tp_target > 0:
+                fixed_rr_update = capital_update_position_levels(deal_id, broker_sl_target, broker_tp_target)
+                fixed_rr_update.update({
+                    "target_stop": broker_sl_target,
+                    "target_profit": broker_tp_target,
+                    "broker_entry": float(broker_entry),
+                    "target_rr": 2.0,
+                })
+                if fixed_rr_update.get("ok"):
+                    # Re-fetch so the audit stores the broker-confirmed levels
+                    # after the update rather than the requested payload.
+                    refreshed_detail = capital_fetch_position_detail(deal_id=deal_id, deal_reference=deal_reference)
+                    if refreshed_detail:
+                        broker_detail = refreshed_detail
+                        broker_values = _broker_values_from_actual_and_order(
+                            broker_detail,
+                            {"confirm": confirm or {}, "response": response or {}},
+                            deal_id=deal_id,
+                            deal_reference=deal_reference,
+                        )
+            else:
+                fixed_rr_update = {"attempted": True, "ok": False, "error": "fixed_rr_levels_invalid"}
+        else:
+            broker_truth_pending = True
+            fixed_rr_update = {"attempted": False, "ok": False, "error": "broker_entry_unavailable_pending_sync"}
+
+    _auto_raw = {"payload": last_payload, "original_size": trade_size, "adjusted_sl": adj_sl, "adjusted_tp": adj_tp, "broker_constraints": market_info, "sizing": sizing, "response": response or {}, "confirm": confirm or {}, "broker_detail": broker_detail or {}, "broker_values": broker_values or {}, "broker_truth_pending": broker_truth_pending, "fixed_rr_update": fixed_rr_update, "execution_rr_policy": "broker_fill_fixed_1_to_2", "ftmo_leverage": FTMO_COMPARISON_LEVERAGE, "capital_leverage": capital_effective_leverage_for_asset(sig.asset, market_info), "ftmo_normalization_factor": ftmo_normalization_factor(sig.asset, market_info)}
     record_capital_auto_order(sig, status=status, deal_reference=deal_reference, deal_id=deal_id, epic=epic, size=confirmed_size, error=error, raw=_auto_raw)
     record_capital_auto_trade_diagnostic(sig, username=str(sizing.get("username") or SCAN_OWNER), eligible=ok, order_sent=ok, status="EXECUTED" if ok else "REJECTED", skip_reason=error, deal_reference=deal_reference, deal_id=deal_id, prop_selected=ok, capital_executed=ok, api_response=_auto_raw)
     user_label = str(sizing.get("username") or SCAN_OWNER)
@@ -5768,35 +5961,61 @@ def rebuild_capital_execution_audit(limit: int = 500) -> int:
                     order_raw = _json_dict(row.get("raw_json"))
                     actual_raw = _json_dict(actual.get("raw_json")) if actual else {}
 
-                    # Signal plan stays as the reference price. Broker levels come
-                    # from Capital.com open-position/confirm data where available.
+                    # Signal plan stays as the reference. Broker levels must come from
+                    # Capital.com position/deal data, not from the submitted payload.
                     planned_entry = _parse_float_or_none(row.get("entry"))
-                    executed_entry = (
-                        _parse_float_or_none(actual.get("entry_price"))
-                        or _capital_level_from_raw(actual_raw, "entry")
-                        or _capital_level_from_raw(order_raw, "entry")
+                    planned_signal_sl = _parse_float_or_none(row.get("sl"))
+                    planned_signal_tp = _parse_float_or_none(row.get("tp"))
+                    broker_values = _broker_values_from_actual_and_order(
+                        actual_raw,
+                        order_raw,
+                        deal_id=str(actual.get("deal_id") or row.get("deal_id") or ""),
+                        deal_reference=str(actual.get("deal_reference") or row.get("deal_reference") or ""),
                     )
+                    # If immediate broker detail was unavailable when the order was
+                    # placed, try once more during audit and, if possible, enforce
+                    # the broker-fill 1:2 RR now. Never use the submitted payload
+                    # as a fake fill.
+                    rr_update = order_raw.get("fixed_rr_update") if isinstance(order_raw.get("fixed_rr_update"), dict) else {}
+                    deal_id_for_update = str(actual.get("deal_id") or row.get("deal_id") or "")
+                    broker_entry_for_rr = _parse_float_or_none(broker_values.get("entry"))
+                    if broker_entry_for_rr is not None and deal_id_for_update and not bool(rr_update.get("ok")):
+                        try:
+                            initial_sl = _parse_float_or_none(order_raw.get("adjusted_sl")) or planned_signal_sl
+                            planned_risk = abs(float(planned_entry or broker_entry_for_rr) - float(initial_sl or planned_signal_sl or broker_entry_for_rr))
+                            target_sl, target_tp = fixed_rr_levels_from_entry(
+                                float(broker_entry_for_rr),
+                                str(row.get("direction")),
+                                planned_risk,
+                                order_raw.get("broker_constraints") if isinstance(order_raw.get("broker_constraints"), dict) else {},
+                            )
+                            if target_sl > 0 and target_tp > 0:
+                                retry_update = capital_update_position_levels(deal_id_for_update, target_sl, target_tp)
+                                if retry_update.get("ok"):
+                                    refreshed = capital_fetch_position_detail(deal_id=deal_id_for_update, deal_reference=str(actual.get("deal_reference") or row.get("deal_reference") or ""))
+                                    broker_values = _broker_values_from_actual_and_order(refreshed, order_raw, deal_id=deal_id_for_update, deal_reference=str(actual.get("deal_reference") or row.get("deal_reference") or ""))
+                                    order_raw["fixed_rr_update"] = dict(retry_update, target_stop=target_sl, target_profit=target_tp, broker_entry=float(broker_entry_for_rr), target_rr=2.0, retried_during_audit=True)
+                                    order_raw["broker_values"] = broker_values
+                                    order_raw["broker_detail"] = refreshed or order_raw.get("broker_detail") or {}
+                                    order_raw["broker_truth_pending"] = False
+                                    try:
+                                        cur.execute("UPDATE capital_auto_orders SET raw_json = %s, updated_at = NOW() WHERE signal_id = %s", (jsonb_dumps(order_raw), row.get("signal_id")))
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+
+                    executed_entry = _parse_float_or_none(actual.get("entry_price")) or broker_values.get("entry")
                     planned_exit = _parse_float_or_none(row.get("replay_exit"))
-                    actual_exit = (
-                        _parse_float_or_none(actual.get("exit_price"))
-                        or _capital_level_from_raw(actual_raw, "exit")
-                    )
-                    broker_sl = (
-                        _capital_level_from_raw(actual_raw, "stop")
-                        or _capital_level_from_raw(order_raw, "stop")
-                        or _parse_float_or_none(row.get("sl"))
-                    )
-                    broker_tp = (
-                        _capital_level_from_raw(actual_raw, "limit")
-                        or _capital_level_from_raw(order_raw, "limit")
-                        or _parse_float_or_none(row.get("tp"))
-                    )
+                    actual_exit = _parse_float_or_none(actual.get("exit_price")) or broker_values.get("exit")
+                    broker_sl = broker_values.get("stop")
+                    broker_tp = broker_values.get("limit")
                     entry_slippage = (executed_entry - planned_entry) if executed_entry is not None and planned_entry is not None else None
                     exit_slippage = (actual_exit - planned_exit) if actual_exit is not None and planned_exit is not None else None
 
                     actual_r = None
                     try:
-                        sl = float(row.get("sl") or 0)
+                        sl = float(planned_signal_sl or 0)
                         if actual_exit is not None and planned_entry is not None and abs(planned_entry - sl) > 0:
                             actual_r = r_multiple_for_exit(str(row.get("direction")), planned_entry, sl, actual_exit, "ACTUAL")
                     except Exception:
@@ -5878,6 +6097,23 @@ def sync_capital_actual_executions() -> int:
     for pos in capital_fetch_open_positions():
         normalised = normalise_capital_position(pos)
         if normalised:
+            # Enrich open positions with per-deal detail when the list endpoint omits
+            # stop/limit or exact execution fields. This makes the audit broker-truth.
+            raw = _json_dict(normalised.get("raw_json"))
+            need_detail = (
+                _capital_level_from_raw(raw, "entry") is None
+                or _capital_level_from_raw(raw, "stop") is None
+                or _capital_level_from_raw(raw, "limit") is None
+            )
+            if need_detail:
+                detail = capital_fetch_position_detail(normalised.get("deal_id", ""), normalised.get("deal_reference", ""))
+                if detail:
+                    raw["details"] = detail
+                    normalised["raw_json"] = raw
+                    # Re-read entry from enriched broker data if the list row was empty.
+                    broker_entry = _capital_level_from_raw(raw, "entry")
+                    if broker_entry is not None:
+                        normalised["entry_price"] = broker_entry
             rows.append(normalised)
     for activity in capital_fetch_activity_history():
         normalised = normalise_capital_activity(activity)
