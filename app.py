@@ -8987,10 +8987,9 @@ def render_workflow(username: str, settings: dict) -> None:
         )
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-        st.subheader("Today’s Prop Firm activity")
-        st.caption("These tables make it easy to see which Prop Firm v2 trades are currently selected today and which currently-open A+/A signals were skipped by the best-session, entry-time, or daily-cap rules.")
+        st.subheader("Open Prop Firm activity")
+        st.caption("These tables show currently-open A+/A signals only. Selected prop trades remain visible until they close, even if they were opened on a previous day. Once a trade closes, it drops from these open tables and appears in the closed A+/A table.")
 
-        today_eat = datetime.now(NAIROBI_TZ).date()
         best_profile_today = prop_sim.get("best_session", {}) if isinstance(prop_sim, dict) else {}
 
         open_prop_source = prop_source.copy() if prop_source is not None and not prop_source.empty else pd.DataFrame()
@@ -9000,47 +8999,47 @@ def render_workflow(username: str, settings: dict) -> None:
 
         selected_open_all, skipped_open_all = classify_open_prop_candidates(open_prop_source, best_profile_today)
 
-        today_open_source = selected_open_all.copy() if selected_open_all is not None and not selected_open_all.empty else pd.DataFrame()
-        if not today_open_source.empty:
-            today_open_source["prop_created_time"] = pd.to_datetime(today_open_source.get("prop_entry_time", today_open_source.get("created_at", pd.Series(pd.NaT, index=today_open_source.index))), errors="coerce", utc=True)
-            today_open_source = today_open_source.dropna(subset=["prop_created_time"]).copy()
-            today_open_source["prop_day"] = today_open_source["prop_created_time"].dt.tz_convert(NAIROBI_TZ).dt.date
-            today_open_source = today_open_source[today_open_source["prop_day"].eq(today_eat)].copy()
-            today_open_source = today_open_source.sort_values("prop_created_time", ascending=True).copy()
+        open_selected_source = selected_open_all.copy() if selected_open_all is not None and not selected_open_all.empty else pd.DataFrame()
+        if not open_selected_source.empty:
+            open_selected_source["prop_created_time"] = pd.to_datetime(open_selected_source.get("prop_entry_time", open_selected_source.get("created_at", pd.Series(pd.NaT, index=open_selected_source.index))), errors="coerce", utc=True)
+            open_selected_source = open_selected_source.dropna(subset=["prop_created_time"]).sort_values("prop_created_time", ascending=False).copy()
 
-        today_skipped_source = skipped_open_all.copy() if skipped_open_all is not None and not skipped_open_all.empty else pd.DataFrame()
-        if not today_skipped_source.empty:
-            today_skipped_source["prop_event_time"] = pd.to_datetime(today_skipped_source.get("prop_entry_time", today_skipped_source.get("created_at", pd.Series(pd.NaT, index=today_skipped_source.index))), errors="coerce", utc=True)
-            today_skipped_source = today_skipped_source.dropna(subset=["prop_event_time"]).sort_values("prop_event_time", ascending=False).copy()
+        open_skipped_source = skipped_open_all.copy() if skipped_open_all is not None and not skipped_open_all.empty else pd.DataFrame()
+        if not open_skipped_source.empty:
+            open_skipped_source["prop_event_time"] = pd.to_datetime(open_skipped_source.get("prop_entry_time", open_skipped_source.get("created_at", pd.Series(pd.NaT, index=open_skipped_source.index))), errors="coerce", utc=True)
+            open_skipped_source = open_skipped_source.dropna(subset=["prop_event_time"]).sort_values("prop_event_time", ascending=False).copy()
 
         copen, cskip = st.columns(2)
         with copen:
-            st.markdown("**Open prop trades today**")
-            if today_open_source.empty:
-                st.info("No open A+/A prop trades taken today for the selected timeframe/session.")
+            st.markdown("**Open prop trades**")
+            if open_selected_source.empty:
+                st.info("No open A+/A prop trades currently selected for the selected timeframe/session.")
             else:
-                ov = today_open_source.copy()
+                ov = open_selected_source.copy()
                 ov["Opened At"] = ov["prop_created_time"].apply(fmt_nairobi)
-                open_cols_today = ["Opened At", "asset", "timeframe", "signal", "grade", "entry", "sl", "tp", "rr", "prop_session"]
+                open_cols_today = ["asset", "signal", "grade", "entry", "sl", "tp", "rr", "timeframe", "prop_session", "Opened At"]
                 open_table = prepare_signal_table(ov[[c for c in open_cols_today if c in ov.columns]]).rename(columns={"prop_session": "Session"})
+                open_order = ["Asset", "Signal", "Grade", "Entry", "SL", "TP", "RR", "Timeframe", "Session", "Opened At"]
+                open_table = open_table[[c for c in open_order if c in open_table.columns] + [c for c in open_table.columns if c not in open_order]]
                 render_benzino_aggrid(
                     open_table,
-                    key="prop_open_trades_today",
-                    height=300,
-                    page_size=4,
+                    key="prop_open_trades_all",
+                    height=360,
+                    page_size=10,
                     pinned=["Asset", "Signal", "Grade"],
                     badge_cols={"Signal": "signal", "Grade": "grade"},
                     numeric_cols_right=["Entry", "SL", "TP", "RR"],
-                    enable_search=False,
-                    show_footer=False,
-                    use_pagination=False,
+                    enable_search=True,
+                    show_footer=True,
+                    use_pagination=True,
+                    show_status_filter=False,
                 )
         with cskip:
             st.markdown("**Open skipped prop signals**")
-            if today_skipped_source.empty:
+            if open_skipped_source.empty:
                 st.info("No currently-open A+/A prop signals are being skipped by best-session, entry-time, or daily-cap rules.")
             else:
-                sv = today_skipped_source.copy()
+                sv = open_skipped_source.copy()
                 sv["Skipped At"] = sv["prop_event_time"].apply(fmt_nairobi)
                 skipped_cols_today = [
                     "asset", "timeframe", "signal", "grade", "prop_skip_reason",
