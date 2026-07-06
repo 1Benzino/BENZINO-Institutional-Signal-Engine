@@ -8316,17 +8316,56 @@ def render_workflow(username: str, settings: dict) -> None:
         saved_count = int(len(stored_history_for_tf)) if stored_history_for_tf is not None and not stored_history_for_tf.empty else 0
         replay_history = prop_sim.get("history", []) or []
         stored_daily_for_tf = load_prop_challenge_daily_ledger(username, challenge_tf, limit=APP_TABLE_MAX_ROWS)
-        # Do not overwrite an existing daily ledger on normal page load.
-        # The ledger is a persisted challenge record; recomputing it every login
-        # can make prior days disappear if filters/session logic evolve.
-        if (stored_daily_for_tf is None or stored_daily_for_tf.empty):
-            expanded_daily_to_save = expand_prop_daily_calendar_days(prop_sim.get("all_daily", pd.DataFrame()), prop_sim.get("active", {}), starting)
-            if replay_history or (expanded_daily_to_save is not None and not expanded_daily_to_save.empty):
-                rebuild_prop_challenge_history_from_trades(username, challenge_tf, replay_history, expanded_daily_to_save)
-                stored_daily_for_tf = load_prop_challenge_daily_ledger(username, challenge_tf, limit=APP_TABLE_MAX_ROWS)
         active_prop = prop_sim.get("active", {})
         prop_curve = prop_sim.get("active_curve", pd.DataFrame())
         prop_all_replay = prop_sim.get("all_trades", pd.DataFrame())
+
+        # Persisted ledgers are useful only when they belong to the current
+        # challenge scope. If the user changed tracking/challenge start or if a
+        # prior replay bug wrote Phase 2 rows before the current Phase 1 passed,
+        # the saved ledger must be invalidated and rebuilt from the current
+        # source-of-truth replay. Otherwise stale rows can show Phase 2 even
+        # while the current challenge is still in Phase 1.
+        ledger_invalid = False
+        stored_daily_check = stored_daily_for_tf.copy() if stored_daily_for_tf is not None and not stored_daily_for_tf.empty else pd.DataFrame()
+        start_check_ts = pd.to_datetime(prop_started_at_raw, errors="coerce", utc=True)
+        if not stored_daily_check.empty:
+            try:
+                stored_days = pd.to_datetime(stored_daily_check.get("Day"), errors="coerce")
+                if pd.notna(start_check_ts) and stored_days.notna().any():
+                    start_day = pd.Timestamp(start_check_ts).tz_convert(NAIROBI_TZ).date()
+                    min_stored_day = stored_days.dropna().dt.date.min()
+                    if min_stored_day is not None and min_stored_day < start_day:
+                        ledger_invalid = True
+            except Exception:
+                pass
+            try:
+                has_phase2_rows = stored_daily_check.get("Phase", pd.Series(dtype=str)).astype(str).str.contains("2", case=False, na=False).any()
+                current_phase_number = int(active_prop.get("phase_number", 1) or 1)
+                if current_phase_number == 1 and not replay_history and has_phase2_rows:
+                    ledger_invalid = True
+            except Exception:
+                pass
+
+        if ledger_invalid:
+            try:
+                execute("DELETE FROM prop_challenge_daily_ledger WHERE scan_owner = %s", (prop_challenge_scan_owner(username, challenge_tf),))
+                execute("DELETE FROM prop_challenge_history WHERE scan_owner = %s", (prop_challenge_scan_owner(username, challenge_tf),))
+            except Exception:
+                pass
+            stored_daily_for_tf = pd.DataFrame()
+            stored_history_for_tf = pd.DataFrame()
+            saved_count = 0
+
+        # Do not overwrite a valid existing daily ledger on normal page load.
+        # Rebuild only when the saved ledger is missing/invalid. Refresh Data is
+        # still the explicit full-rebuild path.
+        if (stored_daily_for_tf is None or stored_daily_for_tf.empty):
+            expanded_daily_to_save = expand_prop_daily_calendar_days(prop_sim.get("all_daily", pd.DataFrame()), active_prop, starting)
+            if replay_history or (expanded_daily_to_save is not None and not expanded_daily_to_save.empty):
+                rebuild_prop_challenge_history_from_trades(username, challenge_tf, replay_history, expanded_daily_to_save)
+                stored_daily_for_tf = load_prop_challenge_daily_ledger(username, challenge_tf, limit=APP_TABLE_MAX_ROWS)
+
         day_summary = stored_daily_for_tf if stored_daily_for_tf is not None and not stored_daily_for_tf.empty else prop_sim.get("all_daily", pd.DataFrame())
         if day_summary is None or day_summary.empty:
             day_summary = prop_sim.get("active_daily", pd.DataFrame())
