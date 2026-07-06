@@ -1631,6 +1631,48 @@ def load_capital_auto_trade_diagnostics(username: str, limit: int = 500) -> pd.D
         df["Checked At"] = df["Checked At"].apply(fmt_nairobi)
     return df
 
+
+
+def humanize_capital_skip_reason(reason: str) -> str:
+    """Convert scanner/internal auto-trade skip codes into user-facing text."""
+    raw = str(reason or "").strip()
+    if not raw or raw in {"—", "None", "nan"}:
+        return "—"
+    low = raw.lower()
+    mapping = {
+        "demo_trading_disabled": "Demo trading disabled",
+        "connection_disabled": "Capital.com connection disabled",
+        "no_capital_connection": "No Capital.com connection",
+        "capital_credentials_missing": "Capital.com credentials missing",
+        "market_closed": "Market closed",
+        "duplicate_signal": "Duplicate signal",
+        "duplicate_open_position": "Asset already has an open trade",
+        "asset_already_open": "Asset already has an open trade",
+        "daily_limit_reached": "Daily limit reached",
+        "max_daily_trades_reached": "Daily limit reached",
+        "size_below_minimum": "Position size below Capital.com minimum",
+        "invalid_size": "Position size not accepted",
+        "capital_rejected": "Capital.com rejected order",
+        "api_rejected": "Capital.com rejected order",
+        "order_rejected": "Capital.com rejected order",
+        "timeframe_not_enabled": "Timeframe not enabled",
+        "not_in_watchlist": "Asset not in your watchlist",
+        "outside_best_session": "Before or outside the active prop session window",
+        "before_session_entry_window": "Before session entry window",
+        "before_best_session_plus_1h": "Before session entry window",
+        "session_gate": "Before session entry window",
+    }
+    for key, label in mapping.items():
+        if low == key or low.startswith(key + ":") or key in low:
+            if key == "grade_not_selected":
+                return "Grade not enabled"
+            return label
+    if low.startswith("grade_not_selected"):
+        return "Grade not enabled"
+    # Make remaining technical reasons readable without exposing raw API noise.
+    cleaned = raw.replace("_", " ").replace(":", ": ")
+    return cleaned[:1].upper() + cleaned[1:]
+
 def load_capital_trade_comparisons(limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFrame:
     """Backward-compatible alias: the app now reads the Execution Audit table."""
     return load_capital_execution_audit(limit=limit)
@@ -2077,7 +2119,7 @@ def prop_session_open_hour(session: str) -> int | None:
     if session in {"london", "london am"}:
         return 7
     if session in {"london/ny overlap", "london ny overlap", "overlap"}:
-        return 12
+        return 16
     if session in {"new york", "new york pm", "newyork", "ny"}:
         return 17
     if session in {"late / rollover", "late/rollover", "rollover", "late"}:
@@ -2086,15 +2128,112 @@ def prop_session_open_hour(session: str) -> int | None:
 
 
 def prop_is_one_hour_after_session_open(ts, session: str) -> bool:
-    """True once the session has been open for at least one hour."""
-    open_hour = prop_session_open_hour(session)
-    if open_hour is None:
-        return True
+    """Backward-compatible wrapper for the prop entry gate."""
+    ok, _reason = prop_session_entry_window_status(ts, session)
+    return bool(ok)
+
+
+def prop_session_entry_window_status(ts, session: str) -> tuple[bool, str]:
+    """Return whether a signal is eligible for the selected prop session.
+
+    Prop selection is based on the signal generation time, not close time.
+    The user-facing rule is: take trades from one hour after the selected
+    session opens. For London/NY Overlap, BENZINO treats the execution window
+    as opening at 16:00 EAT, so prop selection begins at 17:00 EAT.
+    
+    This function intentionally uses clock windows instead of the broad
+    journal session label. That prevents trades generated at 12:17/13:21 EAT
+    from being accepted merely because the journal bucket is labelled
+    London/NY Overlap.
+    """
+    session_label = str(session or "").strip()
+    if not session_label or session_label == "All sessions":
+        return True, ""
     try:
         dt = pd.to_datetime(ts, utc=True).tz_convert(NAIROBI_TZ)
     except Exception:
-        return False
-    return dt.hour >= open_hour + 1
+        return False, "Skipped — missing signal generation time"
+
+    key = session_label.lower()
+    # (session_open_hour, execution_start_hour, execution_end_hour_exclusive) in EAT.
+    # Execution starts one hour after the session opens.
+    windows = {
+        "asia": (0, 1, 7),
+        "london": (7, 8, 12),
+        "london am": (7, 8, 12),
+        "london/ny overlap": (16, 17, 22),
+        "london ny overlap": (16, 17, 22),
+        "overlap": (16, 17, 22),
+        "new york": (17, 18, 22),
+        "new york pm": (17, 18, 22),
+        "newyork": (17, 18, 22),
+        "ny": (17, 18, 22),
+        "late / rollover": (22, 23, 24),
+        "late/rollover": (22, 23, 24),
+        "rollover": (22, 23, 24),
+        "late": (22, 23, 24),
+    }
+    if key not in windows:
+        return True, ""
+    open_hour, eligible_hour, end_hour = windows[key]
+    hour_float = dt.hour + (dt.minute / 60.0) + (dt.second / 3600.0)
+    if hour_float < eligible_hour:
+        return False, f"Skipped — before {session_label} prop entry window ({eligible_hour:02d}:00 EAT)"
+    if hour_float >= end_hour:
+        return False, f"Skipped — outside {session_label} prop entry window"
+    return True, ""
+
+
+def classify_open_prop_candidates(open_df: pd.DataFrame, profile: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Classify currently-open A+/A signals as prop-selected or skipped.
+
+    This powers the Prop Firm activity tables. Only open skipped trades are
+    shown; once a trade closes it naturally disappears from this open-skipped
+    table and appears in the closed A+/A table.
+    """
+    if open_df is None or open_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    work = open_df.copy()
+    work = ensure_signal_schema(work) if 'ensure_signal_schema' in globals() else work
+    work = work[work.get("grade", pd.Series("", index=work.index)).astype(str).str.upper().isin({"A+", "A"})].copy()
+    work = work[work.get("signal", pd.Series("", index=work.index)).astype(str).str.upper().isin({"BUY", "SELL"})].copy()
+    if work.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    work["prop_entry_time"] = pd.to_datetime(work.get("created_at", pd.Series(pd.NaT, index=work.index)), errors="coerce", utc=True)
+    work = work.dropna(subset=["prop_entry_time"]).copy()
+    if work.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    work["prop_day"] = work["prop_entry_time"].dt.tz_convert(NAIROBI_TZ).dt.date
+    work["prop_session"] = work["prop_entry_time"].apply(prop_session_from_timestamp)
+
+    best = str(profile.get("active_filter_session") or profile.get("best_session") or "All sessions") if isinstance(profile, dict) else "All sessions"
+    sample_ready = bool(profile.get("sample_ready")) if isinstance(profile, dict) else False
+    skipped_parts = []
+    eligible = work.sort_values("prop_entry_time").copy()
+    if sample_ready and best not in {"", "All sessions"}:
+        gate = eligible["prop_entry_time"].apply(lambda ts: prop_session_entry_window_status(ts, best))
+        eligible["_prop_gate_ok"] = gate.apply(lambda x: bool(x[0]))
+        eligible["_prop_gate_reason"] = gate.apply(lambda x: str(x[1] or ""))
+        gated_out = eligible[~eligible["_prop_gate_ok"]].copy()
+        if not gated_out.empty:
+            gated_out["prop_filter_session"] = best
+            gated_out["prop_skip_reason"] = gated_out["_prop_gate_reason"].replace("", f"Skipped — outside {best} prop entry window")
+            skipped_parts.append(gated_out)
+        eligible = eligible[eligible["_prop_gate_ok"]].copy()
+    eligible["_daily_rank"] = eligible.groupby("prop_day").cumcount() + 1
+    selected = eligible[eligible["_daily_rank"] <= PROP_MAX_TRADES_PER_DAY].copy()
+    capped = eligible[eligible["_daily_rank"] > PROP_MAX_TRADES_PER_DAY].copy()
+    if not capped.empty:
+        capped["prop_filter_session"] = best if sample_ready else "All sessions"
+        capped["prop_skip_reason"] = "Skipped — daily trade cap reached"
+        skipped_parts.append(capped)
+    selected["prop_filter_session"] = best if sample_ready else "All sessions"
+    selected["prop_selection"] = "Taken"
+    skipped = pd.concat(skipped_parts, ignore_index=True, sort=False) if skipped_parts else pd.DataFrame()
+    for frame in (selected, skipped):
+        if frame is not None and not frame.empty:
+            frame.drop(columns=[c for c in ["_prop_gate_ok", "_prop_gate_reason", "_daily_rank"] if c in frame.columns], inplace=True, errors="ignore")
+    return selected, skipped
 
 
 def prop_best_session_profile(df: pd.DataFrame, min_trades: int = PROP_MIN_SESSION_TRADES) -> dict:
@@ -2210,18 +2349,14 @@ def apply_prop_best_session_trade_filter(df: pd.DataFrame, profile: dict) -> tup
     skipped_parts = []
     eligible = work.copy()
     if sample_ready and best not in {"", "All sessions"}:
-        outside = eligible[eligible["prop_session"] != best].copy()
-        if not outside.empty:
-            outside["prop_skip_reason"] = "Skipped — outside best session"
-            skipped_parts.append(outside)
-        eligible = eligible[eligible["prop_session"] == best].copy()
-
-        first_hour_mask = ~eligible["prop_entry_time"].apply(lambda ts: prop_is_one_hour_after_session_open(ts, best))
-        first_hour = eligible[first_hour_mask].copy()
-        if not first_hour.empty:
-            first_hour["prop_skip_reason"] = "Skipped — first hour after best-session open"
-            skipped_parts.append(first_hour)
-        eligible = eligible[~first_hour_mask].copy()
+        gate = eligible["prop_entry_time"].apply(lambda ts: prop_session_entry_window_status(ts, best))
+        eligible["_prop_gate_ok"] = gate.apply(lambda x: bool(x[0]))
+        eligible["_prop_gate_reason"] = gate.apply(lambda x: str(x[1] or ""))
+        gated_out = eligible[~eligible["_prop_gate_ok"]].copy()
+        if not gated_out.empty:
+            gated_out["prop_skip_reason"] = gated_out["_prop_gate_reason"].replace("", f"Skipped — outside {best} prop entry window")
+            skipped_parts.append(gated_out)
+        eligible = eligible[eligible["_prop_gate_ok"]].copy()
     eligible["_daily_rank"] = eligible.groupby("prop_day_all").cumcount() + 1
     taken = eligible[eligible["_daily_rank"] <= PROP_MAX_TRADES_PER_DAY].copy()
     capped = eligible[eligible["_daily_rank"] > PROP_MAX_TRADES_PER_DAY].copy()
@@ -2229,7 +2364,7 @@ def apply_prop_best_session_trade_filter(df: pd.DataFrame, profile: dict) -> tup
         capped["prop_skip_reason"] = "Skipped — daily trade cap reached"
         skipped_parts.append(capped)
     skipped = pd.concat(skipped_parts, ignore_index=True) if skipped_parts else pd.DataFrame()
-    return taken.drop(columns=[c for c in ["_daily_rank", "prop_day_all"] if c in taken.columns]), skipped
+    return taken.drop(columns=[c for c in ["_daily_rank", "prop_day_all", "_prop_gate_ok", "_prop_gate_reason"] if c in taken.columns]), skipped.drop(columns=[c for c in ["_daily_rank", "prop_day_all", "_prop_gate_ok", "_prop_gate_reason"] if c in skipped.columns], errors="ignore") if not skipped.empty else skipped
 
 
 def apply_prop_rolling_best_session_trade_filter(
@@ -2294,20 +2429,15 @@ def apply_prop_rolling_best_session_trade_filter(
 
         eligible = day_rows.copy()
         if sample_ready and best not in {"", "All sessions"}:
-            outside = eligible[eligible["prop_session"] != best].copy()
-            if not outside.empty:
-                outside["prop_skip_reason"] = f"Skipped — outside locked best session for {day}: {best}"
-                outside["prop_filter_session"] = best
-                skipped_parts.append(outside)
-            eligible = eligible[eligible["prop_session"] == best].copy()
-
-            first_hour_mask = ~eligible["prop_entry_time"].apply(lambda ts: prop_is_one_hour_after_session_open(ts, best))
-            first_hour = eligible[first_hour_mask].copy()
-            if not first_hour.empty:
-                first_hour["prop_skip_reason"] = f"Skipped — first hour after locked best-session open: {best}"
-                first_hour["prop_filter_session"] = best
-                skipped_parts.append(first_hour)
-            eligible = eligible[~first_hour_mask].copy()
+            gate = eligible["prop_entry_time"].apply(lambda ts: prop_session_entry_window_status(ts, best))
+            eligible["_prop_gate_ok"] = gate.apply(lambda x: bool(x[0]))
+            eligible["_prop_gate_reason"] = gate.apply(lambda x: str(x[1] or ""))
+            gated_out = eligible[~eligible["_prop_gate_ok"]].copy()
+            if not gated_out.empty:
+                gated_out["prop_skip_reason"] = gated_out["_prop_gate_reason"].replace("", f"Skipped — outside locked {best} prop entry window")
+                gated_out["prop_filter_session"] = best
+                skipped_parts.append(gated_out)
+            eligible = eligible[eligible["_prop_gate_ok"]].copy()
 
         eligible["_daily_rank"] = range(1, len(eligible) + 1)
         selected = eligible[eligible["_daily_rank"] <= PROP_MAX_TRADES_PER_DAY].copy()
@@ -8858,38 +8988,30 @@ def render_workflow(username: str, settings: dict) -> None:
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
         st.subheader("Today’s Prop Firm activity")
-        st.caption("These tables make it easy to see which Prop Firm v2 trades are currently open today and which qualifying signals were skipped by the best-session or daily-cap rules.")
+        st.caption("These tables make it easy to see which Prop Firm v2 trades are currently selected today and which currently-open A+/A signals were skipped by the best-session, entry-time, or daily-cap rules.")
 
         today_eat = datetime.now(NAIROBI_TZ).date()
         best_profile_today = prop_sim.get("best_session", {}) if isinstance(prop_sim, dict) else {}
-        best_session_today = str(best_profile_today.get("best_session") or "All sessions")
-        sample_ready_today = bool(best_profile_today.get("sample_ready"))
 
-        today_open_source = prop_source.copy() if prop_source is not None and not prop_source.empty else pd.DataFrame()
+        open_prop_source = prop_source.copy() if prop_source is not None and not prop_source.empty else pd.DataFrame()
+        if not open_prop_source.empty:
+            open_mask = open_prop_source.get("status", pd.Series("", index=open_prop_source.index)).astype(str).str.upper().eq("OPEN")
+            open_prop_source = open_prop_source[open_mask].copy()
+
+        selected_open_all, skipped_open_all = classify_open_prop_candidates(open_prop_source, best_profile_today)
+
+        today_open_source = selected_open_all.copy() if selected_open_all is not None and not selected_open_all.empty else pd.DataFrame()
         if not today_open_source.empty:
-            open_mask = today_open_source.get("status", pd.Series("", index=today_open_source.index)).astype(str).str.upper().eq("OPEN")
-            today_open_source = today_open_source[open_mask].copy()
-        if not today_open_source.empty:
-            created_ts = pd.to_datetime(today_open_source.get("created_at", pd.Series(pd.NaT, index=today_open_source.index)), errors="coerce", utc=True)
-            today_open_source["prop_created_time"] = created_ts
+            today_open_source["prop_created_time"] = pd.to_datetime(today_open_source.get("prop_entry_time", today_open_source.get("created_at", pd.Series(pd.NaT, index=today_open_source.index))), errors="coerce", utc=True)
             today_open_source = today_open_source.dropna(subset=["prop_created_time"]).copy()
             today_open_source["prop_day"] = today_open_source["prop_created_time"].dt.tz_convert(NAIROBI_TZ).dt.date
-            today_open_source["prop_session"] = today_open_source["prop_created_time"].apply(prop_session_from_timestamp)
             today_open_source = today_open_source[today_open_source["prop_day"].eq(today_eat)].copy()
-            if sample_ready_today and best_session_today not in {"", "All sessions"}:
-                today_open_source = today_open_source[today_open_source["prop_session"].eq(best_session_today)].copy()
-            today_open_source = today_open_source.sort_values("prop_created_time").head(PROP_MAX_TRADES_PER_DAY).copy()
+            today_open_source = today_open_source.sort_values("prop_created_time", ascending=True).copy()
 
-        today_skipped_source = prop_sim.get("skipped_trades", pd.DataFrame()) if isinstance(prop_sim, dict) else pd.DataFrame()
-        if today_skipped_source is None:
-            today_skipped_source = pd.DataFrame()
-        today_skipped_source = today_skipped_source.copy() if not today_skipped_source.empty else pd.DataFrame()
+        today_skipped_source = skipped_open_all.copy() if skipped_open_all is not None and not skipped_open_all.empty else pd.DataFrame()
         if not today_skipped_source.empty:
-            skip_time = pd.to_datetime(today_skipped_source.get("prop_event_time", today_skipped_source.get("exit_at", pd.Series(pd.NaT, index=today_skipped_source.index))), errors="coerce", utc=True)
-            today_skipped_source["prop_event_time"] = skip_time
-            today_skipped_source = today_skipped_source.dropna(subset=["prop_event_time"]).copy()
-            today_skipped_source["prop_day"] = today_skipped_source["prop_event_time"].dt.tz_convert(NAIROBI_TZ).dt.date
-            today_skipped_source = today_skipped_source[today_skipped_source["prop_day"].eq(today_eat)].copy()
+            today_skipped_source["prop_event_time"] = pd.to_datetime(today_skipped_source.get("prop_entry_time", today_skipped_source.get("created_at", pd.Series(pd.NaT, index=today_skipped_source.index))), errors="coerce", utc=True)
+            today_skipped_source = today_skipped_source.dropna(subset=["prop_event_time"]).sort_values("prop_event_time", ascending=False).copy()
 
         copen, cskip = st.columns(2)
         with copen:
@@ -8914,9 +9036,9 @@ def render_workflow(username: str, settings: dict) -> None:
                     use_pagination=False,
                 )
         with cskip:
-            st.markdown("**Skipped prop signals today**")
+            st.markdown("**Open skipped prop signals**")
             if today_skipped_source.empty:
-                st.info("No A+/A prop signals were skipped today by best-session or daily-cap rules.")
+                st.info("No currently-open A+/A prop signals are being skipped by best-session, entry-time, or daily-cap rules.")
             else:
                 sv = today_skipped_source.copy()
                 sv["Skipped At"] = sv["prop_event_time"].apply(fmt_nairobi)
@@ -9316,27 +9438,87 @@ def render_workflow(username: str, settings: dict) -> None:
 
         st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
         st.subheader("Auto-Trade Diagnostics")
-        workflow_commentary("Every generated signal checked for Capital.com demo execution is recorded here. Use this to see whether BENZINO sent the order, skipped it, or Capital.com rejected it, with the exact reason.")
-        diag_df = load_capital_auto_trade_diagnostics(username, limit=500)
+        selected_demo_grades = [g.strip().upper() for g in str(cap_row.get("auto_trade_grades") or "A+,A").split(",") if g.strip()]
+        selected_demo_grades = [g for g in selected_demo_grades if g in {"A+", "A", "B", "C"}] or ["A+", "A"]
+        workflow_commentary(
+            "This table focuses on the signals you actually enabled for Capital.com demo execution. "
+            "Use it to see whether BENZINO sent the order, skipped it, or Capital.com rejected it."
+        )
+        diag_df = load_capital_auto_trade_diagnostics(username, limit=1000)
         if diag_df.empty:
             st.info("No auto-trade diagnostics have been recorded yet. They will appear after the scanner checks new signals for Capital.com demo execution.")
         else:
-            render_benzino_aggrid(
-                diag_df,
-                key="capital_auto_trade_diagnostics_grid",
-                height=430,
-                page_size=50,
-                pinned=["Signal ID", "Asset"],
-                badge_cols={
-                    "Signal": "signal",
-                    "Grade": "grade",
-                    "Eligible": "status",
-                    "Order Sent": "status",
-                    "Status": "status",
-                    "Prop Selected": "status",
-                    "Capital Executed": "status",
-                },
+            diag_df = diag_df.copy()
+            if "Skip Reason" in diag_df.columns:
+                diag_df["Skip Reason"] = diag_df["Skip Reason"].apply(humanize_capital_skip_reason)
+
+            include_all_grades = st.checkbox(
+                "Show all generated grades for debugging",
+                value=False,
+                key="capital_diag_show_all_grades",
+                help="Default keeps the table focused on the grades you selected for demo trading."
             )
+            if not include_all_grades and "Grade" in diag_df.columns:
+                diag_df = diag_df[diag_df["Grade"].astype(str).str.upper().isin(selected_demo_grades)].copy()
+
+            fc1, fc2, fc3 = st.columns([0.22, 0.22, 0.56], vertical_alignment="center")
+            with fc1:
+                status_choice = st.selectbox(
+                    "Diagnostics status",
+                    ["All selected grades", "Eligible", "Executed", "Skipped", "Rejected"],
+                    label_visibility="collapsed",
+                    key="capital_diag_status_filter",
+                )
+            with fc2:
+                asset_options = ["All assets"] + sorted([x for x in diag_df.get("Asset", pd.Series(dtype=str)).dropna().astype(str).unique() if x])
+                asset_choice = st.selectbox("Diagnostics asset", asset_options, label_visibility="collapsed", key="capital_diag_asset_filter")
+            with fc3:
+                diag_search = st.text_input("Diagnostics search", placeholder="Search diagnostics...", label_visibility="collapsed", key="capital_diag_manual_search")
+
+            if status_choice == "Eligible" and "Eligible" in diag_df.columns:
+                diag_df = diag_df[diag_df["Eligible"].astype(str).str.upper().eq("YES")].copy()
+            elif status_choice == "Executed" and "Order Sent" in diag_df.columns:
+                diag_df = diag_df[diag_df["Order Sent"].astype(str).str.upper().eq("YES")].copy()
+            elif status_choice == "Skipped" and "Status" in diag_df.columns:
+                diag_df = diag_df[diag_df["Status"].astype(str).str.upper().str.contains("SKIP", na=False)].copy()
+            elif status_choice == "Rejected" and "Status" in diag_df.columns:
+                diag_df = diag_df[diag_df["Status"].astype(str).str.upper().str.contains("REJECT|ERROR|FAIL", regex=True, na=False)].copy()
+
+            if asset_choice != "All assets" and "Asset" in diag_df.columns:
+                diag_df = diag_df[diag_df["Asset"].astype(str).eq(asset_choice)].copy()
+            if diag_search:
+                mask = diag_df.astype(str).apply(lambda col: col.str.contains(diag_search, case=False, na=False)).any(axis=1)
+                diag_df = diag_df[mask].copy()
+
+            # Keep technical database identifiers at the end and keep the default view focused.
+            default_cols = [
+                "Signal ID", "Asset", "Signal", "Grade", "Timeframe", "Eligible",
+                "Order Sent", "Status", "Skip Reason", "Capital Deal Ref",
+                "Prop Selected", "Capital Executed", "Checked At", "Internal ID"
+            ]
+            diag_df = diag_df[[c for c in default_cols if c in diag_df.columns] + [c for c in diag_df.columns if c not in default_cols]]
+
+            if diag_df.empty:
+                st.info("No diagnostics match the selected filters.")
+            else:
+                render_benzino_aggrid(
+                    diag_df,
+                    key="capital_auto_trade_diagnostics_grid",
+                    height=430,
+                    page_size=50,
+                    pinned=["Signal ID", "Asset"],
+                    badge_cols={
+                        "Signal": "signal",
+                        "Grade": "grade",
+                        "Eligible": "status",
+                        "Order Sent": "status",
+                        "Status": "status",
+                        "Prop Selected": "status",
+                        "Capital Executed": "status",
+                    },
+                    enable_search=False,
+                    show_status_filter=False,
+                )
 
 
 
