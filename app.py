@@ -9042,19 +9042,31 @@ def render_workflow(username: str, settings: dict) -> None:
             else:
                 sv = today_skipped_source.copy()
                 sv["Skipped At"] = sv["prop_event_time"].apply(fmt_nairobi)
-                skipped_cols_today = ["Skipped At", "asset", "timeframe", "signal", "grade", "prop_session", "prop_skip_reason", "r_multiple"]
-                skipped_table = prepare_signal_table(sv[[c for c in skipped_cols_today if c in sv.columns]]).rename(columns={"prop_session": "Session", "prop_skip_reason": "Skip Reason"})
+                skipped_cols_today = [
+                    "asset", "timeframe", "signal", "grade", "prop_skip_reason",
+                    "entry", "sl", "tp", "rr", "prop_session", "Skipped At", "r_multiple"
+                ]
+                skipped_table = prepare_signal_table(sv[[c for c in skipped_cols_today if c in sv.columns]]).rename(columns={
+                    "prop_session": "Session",
+                    "prop_skip_reason": "Skip Reason"
+                })
+                skipped_order = [
+                    "Asset", "Signal", "Grade", "Skip Reason", "Entry", "SL", "TP",
+                    "RR", "Timeframe", "Session", "Skipped At", "R Multiple"
+                ]
+                skipped_table = skipped_table[[c for c in skipped_order if c in skipped_table.columns] + [c for c in skipped_table.columns if c not in skipped_order]]
                 render_benzino_aggrid(
                     skipped_table,
                     key="prop_skipped_signals_today",
-                    height=300,
-                    page_size=4,
+                    height=360,
+                    page_size=10,
                     pinned=["Asset", "Signal", "Grade"],
                     badge_cols={"Signal": "signal", "Grade": "grade", "Skip Reason": "status"},
-                    numeric_cols_right=["R Multiple"],
-                    enable_search=False,
-                    show_footer=False,
-                    use_pagination=False,
+                    numeric_cols_right=["Entry", "SL", "TP", "RR", "R Multiple"],
+                    enable_search=True,
+                    show_footer=True,
+                    use_pagination=True,
+                    show_status_filter=False,
                 )
 
         st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
@@ -9438,7 +9450,16 @@ def render_workflow(username: str, settings: dict) -> None:
 
         st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
         st.subheader("Auto-Trade Diagnostics")
-        selected_demo_grades = [g.strip().upper() for g in str(cap_row.get("auto_trade_grades") or "A+,A").split(",") if g.strip()]
+        cap_settings = read_df(
+            "SELECT auto_trade_grades FROM user_capital_connections WHERE username = %s",
+            (username,),
+        )
+        cap_settings_row = cap_settings.iloc[0].to_dict() if not cap_settings.empty else {}
+        selected_demo_grades = [
+            g.strip().upper()
+            for g in str(cap_settings_row.get("auto_trade_grades") or "A+,A").split(",")
+            if g.strip()
+        ]
         selected_demo_grades = [g for g in selected_demo_grades if g in {"A+", "A", "B", "C"}] or ["A+", "A"]
         workflow_commentary(
             "This table focuses on the signals you actually enabled for Capital.com demo execution. "
