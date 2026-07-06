@@ -7997,7 +7997,14 @@ def render_workflow(username: str, settings: dict) -> None:
                     ["Entry", "SL", "TP", "RR", "risk_cash", "potential_tp_cash", "potential_sl_cash"],
                 )
                 closed_view = add_trade_pnl_columns(closed_trades, settings)
-                closed_cols = ["created_at", "created_at_eat", "asset", "timeframe", "signal", "grade", "status", "outcome", "r_multiple", "pnl_cash", "balance_after", "exit_reason", "session", "entry", "sl", "tp"]
+                if not closed_view.empty:
+                    _entered_ts = pd.to_datetime(closed_view.get("created_at", pd.Series(pd.NaT, index=closed_view.index)), errors="coerce", utc=True)
+                    _closed_ts = pd.to_datetime(closed_view.get("exit_at", pd.Series(pd.NaT, index=closed_view.index)), errors="coerce", utc=True)
+                    if "shadow_closed_at" in closed_view.columns:
+                        _closed_ts = _closed_ts.fillna(pd.to_datetime(closed_view.get("shadow_closed_at"), errors="coerce", utc=True))
+                    closed_view["Entered At"] = _entered_ts.apply(lambda x: fmt_nairobi(x) if pd.notna(x) else "—")
+                    closed_view["Closed At"] = _closed_ts.apply(lambda x: fmt_nairobi(x) if pd.notna(x) else "—")
+                closed_cols = ["Entered At", "Closed At", "asset", "timeframe", "signal", "grade", "status", "outcome", "r_multiple", "pnl_cash", "balance_after", "exit_reason", "session", "entry", "sl", "tp"]
                 _render_journal_signal_grid(
                     closed_view,
                     "Closed trades",
@@ -8752,12 +8759,46 @@ def render_workflow(username: str, settings: dict) -> None:
                 view["__closed_at_sort"] = pd.NaT
                 view["closed_at"] = "—"
 
-            cols = ["closed_at", "asset", "timeframe", "signal", "grade", "status", "outcome", "r_multiple", "pnl_cash", "balance_after", "exit_reason", "entry", "sl", "tp"]
+            # Add user-facing audit fields: when a trade was entered, when it
+            # closed, and whether it was actually selected into the prop-firm
+            # challenge ledger. This lets the Daily Ledger be traced back to
+            # the exact closed trades that changed the balance.
+            entered_ts = pd.to_datetime(view.get("created_at", pd.Series(pd.NaT, index=view.index)), errors="coerce", utc=True)
+            view["entered_at"] = entered_ts.apply(lambda x: fmt_nairobi(x) if pd.notna(x) else "—")
+
+            taken_ids = set()
+            try:
+                _taken_df = prop_sim.get("all_trades", pd.DataFrame()) if isinstance(prop_sim, dict) else pd.DataFrame()
+                if _taken_df is not None and not _taken_df.empty and "signal_id" in _taken_df.columns:
+                    taken_ids = set(_taken_df["signal_id"].astype(str))
+            except Exception:
+                taken_ids = set()
+
+            skipped_reason_map = {}
+            try:
+                _skipped_df = prop_sim.get("skipped_trades", pd.DataFrame()) if isinstance(prop_sim, dict) else pd.DataFrame()
+                if _skipped_df is not None and not _skipped_df.empty and "signal_id" in _skipped_df.columns:
+                    skipped_reason_map = dict(zip(_skipped_df["signal_id"].astype(str), _skipped_df.get("prop_skip_reason", pd.Series("Skipped", index=_skipped_df.index)).astype(str)))
+            except Exception:
+                skipped_reason_map = {}
+
+            if "signal_id" in view.columns:
+                _sid = view["signal_id"].astype(str)
+                view["prop_challenge_status"] = _sid.apply(lambda x: "YES" if x in taken_ids else "NO")
+                view["prop_challenge_note"] = _sid.apply(lambda x: "Taken in prop ledger" if x in taken_ids else skipped_reason_map.get(x, "Not selected into prop ledger"))
+            else:
+                view["prop_challenge_status"] = "NO"
+                view["prop_challenge_note"] = "No signal id available"
+
+            cols = ["entered_at", "closed_at", "asset", "timeframe", "signal", "grade", "status", "outcome", "prop_challenge_status", "prop_challenge_note", "r_multiple", "pnl_cash", "balance_after", "exit_reason", "entry", "sl", "tp"]
             sort_cols = [c for c in cols if c in view.columns]
             closed_base = view.sort_values("__closed_at_sort", ascending=False, na_position="last")
             closed_trade_table = prepare_signal_table(closed_base[sort_cols])
             closed_trade_table = closed_trade_table.rename(columns={
+                "entered_at": "Entered At",
                 "closed_at": "Closed At",
+                "prop_challenge_status": "Prop Challenge",
+                "prop_challenge_note": "Prop Note",
                 "pnl_cash": "P/L Cash",
                 "balance_after": "Balance After",
             })
@@ -8769,8 +8810,8 @@ def render_workflow(username: str, settings: dict) -> None:
                     )
 
             closed_trade_order = [
-                "Asset", "Signal", "Grade", "Status", "Outcome", "R Multiple", "Timeframe",
-                "Closed At", "P/L Cash", "Balance After", "Exit Reason", "Entry", "SL", "TP"
+                "Asset", "Signal", "Grade", "Status", "Outcome", "Prop Challenge", "R Multiple", "Timeframe",
+                "Entered At", "Closed At", "P/L Cash", "Balance After", "Prop Note", "Exit Reason", "Entry", "SL", "TP"
             ]
             closed_trade_table = closed_trade_table[[c for c in closed_trade_order if c in closed_trade_table.columns] + [c for c in closed_trade_table.columns if c not in closed_trade_order]]
 
@@ -8780,7 +8821,7 @@ def render_workflow(username: str, settings: dict) -> None:
                 height=420,
                 page_size=10,
                 pinned=["Asset", "Signal", "Grade"],
-                badge_cols={"Signal":"signal", "Grade":"grade", "Status":"status", "Outcome":"outcome"},
+                badge_cols={"Signal":"signal", "Grade":"grade", "Status":"status", "Outcome":"outcome", "Prop Challenge":"status"},
                 numeric_cols_right=["R Multiple", "Entry", "SL", "TP"],
                 show_status_filter=False,
             )
