@@ -559,6 +559,12 @@ def init_tables() -> None:
         epic TEXT,
         deal_reference TEXT,
         deal_id TEXT,
+        target_risk_cash NUMERIC,
+        planned_risk_cash NUMERIC,
+        broker_risk_cash NUMERIC,
+        broker_risk_pct NUMERIC,
+        risk_status TEXT,
+        risk_note TEXT,
         opened_at TIMESTAMPTZ,
         closed_at TIMESTAMPTZ,
         updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -711,6 +717,12 @@ def init_tables() -> None:
                 cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS planned_tp NUMERIC")
                 cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS broker_pnl_ftmo_equiv NUMERIC")
                 cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ")
+                cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS target_risk_cash NUMERIC")
+                cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS planned_risk_cash NUMERIC")
+                cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS broker_risk_cash NUMERIC")
+                cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS broker_risk_pct NUMERIC")
+                cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS risk_status TEXT")
+                cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS risk_note TEXT")
                 cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS pnl_ftmo_equiv NUMERIC")
                 cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS ftmo_leverage NUMERIC DEFAULT 100")
                 cur.execute("ALTER TABLE capital_executed_trades ADD COLUMN IF NOT EXISTS capital_leverage NUMERIC")
@@ -1589,6 +1601,8 @@ def load_capital_execution_audit(limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFram
             a.planned_entry, a.executed_entry, a.entry_slippage,
             a.planned_sl, a.planned_tp, a.planned_exit, a.actual_exit, a.exit_slippage,
             a.planned_r, a.actual_r, a.broker_pnl, a.broker_pnl_ftmo_equiv,
+            a.target_risk_cash, a.planned_risk_cash, a.broker_risk_cash, a.broker_risk_pct,
+            a.risk_status, a.risk_note,
             a.replay_outcome, a.broker_status, a.signal_id, a.capital_trade_id,
             a.size, a.currency, a.environment, a.epic, a.deal_reference, a.deal_id, a.updated_at,
             ce.instrument_name, ce.status AS execution_status
@@ -1605,7 +1619,8 @@ def load_capital_execution_audit(limit: int = APP_TABLE_MAX_ROWS) -> pd.DataFram
     return numeric_cols(df, [
         "planned_entry", "executed_entry", "entry_slippage", "planned_sl", "planned_tp",
         "planned_exit", "actual_exit", "exit_slippage", "planned_r", "actual_r",
-        "broker_pnl", "broker_pnl_ftmo_equiv", "size"
+        "broker_pnl", "broker_pnl_ftmo_equiv", "target_risk_cash", "planned_risk_cash",
+        "broker_risk_cash", "broker_risk_pct", "size"
     ])
 
 
@@ -9629,6 +9644,12 @@ def render_workflow(username: str, settings: dict) -> None:
                     "actual_r": "Broker R",
                     "broker_pnl": "Broker P/L",
                     "broker_pnl_ftmo_equiv": "FTMO-Equivalent P/L",
+                    "target_risk_cash": "Target Risk",
+                    "planned_risk_cash": "Planned Risk",
+                    "broker_risk_cash": "Broker Risk",
+                    "broker_risk_pct": "Risk Multiple",
+                    "risk_status": "Risk Status",
+                    "risk_note": "Risk Note",
                     "replay_outcome": "Replay Outcome",
                     "broker_status": "Broker Status",
                     "instrument_name": "Instrument",
@@ -9637,7 +9658,7 @@ def render_workflow(username: str, settings: dict) -> None:
                     "currency": "Currency",
                     "auto_trade": "Auto Trade",
                 })
-                order = ["Opened", "Asset", "Timeframe", "Grade", "Direction", "Auto Trade", "Signal Entry", "Broker Entry", "Entry Slippage", "Broker SL", "Broker TP", "Replay Exit", "Broker Exit", "Exit Slippage", "Replay R", "Broker R", "Broker P/L", "FTMO-Equivalent P/L", "Replay Outcome", "Broker Status", "Instrument", "Environment", "Size", "Currency", "signal_id"]
+                order = ["Opened", "Asset", "Timeframe", "Grade", "Direction", "Auto Trade", "Signal Entry", "Broker Entry", "Entry Slippage", "Broker SL", "Broker TP", "Target Risk", "Planned Risk", "Broker Risk", "Risk Multiple", "Risk Status", "Risk Note", "Replay Exit", "Broker Exit", "Exit Slippage", "Replay R", "Broker R", "Broker P/L", "FTMO-Equivalent P/L", "Replay Outcome", "Broker Status", "Instrument", "Environment", "Size", "Currency"]
                 comp_display = comp_display[[c for c in order if c in comp_display.columns] + [c for c in comp_display.columns if c not in order]]
                 comp_display = apply_market_price_formatting(comp_display)
 
@@ -9657,8 +9678,8 @@ def render_workflow(username: str, settings: dict) -> None:
                     height=420,
                     page_size=25,
                     pinned=["Opened", "Asset", "Direction", "Auto Trade"],
-                    badge_cols={"Direction":"signal", "Replay Outcome":"status", "Broker Status":"status", "Auto Trade":"status"},
-                    numeric_cols_right=["Signal Entry", "Broker Entry", "Entry Slippage", "Broker SL", "Broker TP", "Replay Exit", "Broker Exit", "Exit Slippage", "Replay R", "Broker R", "Broker P/L", "FTMO-Equivalent P/L", "Size"],
+                    badge_cols={"Direction":"signal", "Replay Outcome":"status", "Broker Status":"status", "Auto Trade":"status", "Risk Status":"status"},
+                    numeric_cols_right=["Signal Entry", "Broker Entry", "Entry Slippage", "Broker SL", "Broker TP", "Target Risk", "Planned Risk", "Broker Risk", "Risk Multiple", "Replay Exit", "Broker Exit", "Exit Slippage", "Replay R", "Broker R", "Broker P/L", "FTMO-Equivalent P/L", "Size"],
                     enable_search=True,
                     show_footer=True,
                 )

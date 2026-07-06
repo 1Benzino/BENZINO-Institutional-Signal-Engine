@@ -608,6 +608,7 @@ CAPITAL_AUTO_TRADE_TIMEFRAMES = {t.strip().lower() for t in os.environ.get("CAPI
 CAPITAL_AUTO_TRADE_OWNER = os.environ.get("CAPITAL_AUTO_TRADE_OWNER", "").strip()
 CAPITAL_AUTO_TRADE_MIN_SIZE = float(os.environ.get("CAPITAL_AUTO_TRADE_MIN_SIZE", "0.01"))
 CAPITAL_AUTO_TRADE_MAX_SIZE = float(os.environ.get("CAPITAL_AUTO_TRADE_MAX_SIZE", "0"))  # 0 means no cap
+CAPITAL_AUTO_TRADE_RISK_TOLERANCE_PCT = float(os.environ.get("CAPITAL_AUTO_TRADE_RISK_TOLERANCE_PCT", "0.05"))  # 5% tolerance around intended cash risk
 CAPITAL_AUTO_TRADE_USE_STOPS = os.environ.get("CAPITAL_AUTO_TRADE_USE_STOPS", "true").strip().lower() in {"1", "true", "yes", "y"}
 CAPITAL_AUTO_TRADE_SIZE_RETRY = os.environ.get("CAPITAL_AUTO_TRADE_SIZE_RETRY", "true").strip().lower() in {"1", "true", "yes", "y"}
 CAPITAL_STRICT_1M_REPLAY_ONLY = os.environ.get("CAPITAL_STRICT_1M_REPLAY_ONLY", "true").strip().lower() in {"1", "true", "yes", "y"}
@@ -1059,6 +1060,12 @@ def init_tables() -> None:
         epic TEXT,
         deal_reference TEXT,
         deal_id TEXT,
+        target_risk_cash NUMERIC,
+        planned_risk_cash NUMERIC,
+        broker_risk_cash NUMERIC,
+        broker_risk_pct NUMERIC,
+        risk_status TEXT,
+        risk_note TEXT,
         opened_at TIMESTAMPTZ,
         closed_at TIMESTAMPTZ,
         updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -1105,6 +1112,12 @@ def init_tables() -> None:
                 cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS actual_r NUMERIC")
                 cur.execute("ALTER TABLE capital_trade_comparisons ADD COLUMN IF NOT EXISTS auto_trade BOOLEAN DEFAULT FALSE")
                 cur.execute("ALTER TABLE capital_auto_orders ADD COLUMN IF NOT EXISTS deal_id TEXT")
+                cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS target_risk_cash NUMERIC")
+                cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS planned_risk_cash NUMERIC")
+                cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS broker_risk_cash NUMERIC")
+                cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS broker_risk_pct NUMERIC")
+                cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS risk_status TEXT")
+                cur.execute("ALTER TABLE capital_execution_audit ADD COLUMN IF NOT EXISTS risk_note TEXT")
                 cur.execute("ALTER TABLE capital_auto_orders ADD COLUMN IF NOT EXISTS raw_json JSONB")
                 cur.execute("ALTER TABLE capital_auto_orders ADD COLUMN IF NOT EXISTS ftmo_leverage NUMERIC DEFAULT 100")
                 cur.execute("ALTER TABLE capital_auto_orders ADD COLUMN IF NOT EXISTS capital_leverage NUMERIC")
@@ -2242,21 +2255,86 @@ def capital_load_market_info(symbol: str) -> dict:
         return {}
 
 
-def capital_available_margin() -> float | None:
-    """Best-effort available funds/margin check. Returns None if endpoint shape differs."""
+def capital_account_snapshot() -> dict:
+    """Fetch the live Capital.com account snapshot before an order decision.
+
+    Account balance/equity changes continuously, so auto-trade sizing must not
+    rely on a saved Streamlit account size.  Instrument constraints still come
+    from capital_epic_map, but the cash risk budget comes from live broker
+    equity where Capital exposes it, then balance as a fallback.
+    """
     data = capital_request("GET", "/accounts", retries=1)
+    out = {
+        "balance": None,
+        "equity": None,
+        "available": None,
+        "currency": "",
+        "source": "capital_accounts",
+        "raw": data if isinstance(data, dict) else {},
+    }
     try:
         accounts = data.get("accounts") if isinstance(data, dict) else None
-        if isinstance(accounts, list) and accounts:
-            acc = accounts[0]
-            bal = acc.get("balance") or acc.get("accountBalance") or {}
-            for key in ("available", "availableToDeal", "deposit", "cash", "balance"):
-                val = bal.get(key) if isinstance(bal, dict) else acc.get(key)
+        if not isinstance(accounts, list) or not accounts:
+            return out
+        acc = accounts[0] or {}
+        bal = acc.get("balance") or acc.get("accountBalance") or {}
+
+        def pick(*keys):
+            for key in keys:
+                val = bal.get(key) if isinstance(bal, dict) else None
+                if val in (None, ""):
+                    val = acc.get(key)
                 if val not in (None, ""):
-                    return float(val)
+                    try:
+                        return float(val)
+                    except Exception:
+                        continue
+            return None
+
+        out["balance"] = pick("balance", "deposit", "cash", "accountBalance")
+        out["equity"] = pick("equity", "accountValue", "netEquity", "balance")
+        out["available"] = pick("available", "availableToDeal", "availableCash", "availableFunds", "deposit", "cash", "balance")
+        for k in ("currency", "baseCurrency", "accountCurrency"):
+            v = bal.get(k) if isinstance(bal, dict) else acc.get(k)
+            if v:
+                out["currency"] = str(v)
+                break
+    except Exception:
+        pass
+    return out
+
+
+def capital_available_margin() -> float | None:
+    """Best-effort available funds/margin check. Returns None if endpoint shape differs."""
+    snap = capital_account_snapshot()
+    try:
+        return float(snap.get("available")) if snap.get("available") is not None else None
     except Exception:
         return None
-    return None
+
+
+def enrich_sizing_with_live_capital_account(sizing: dict) -> dict:
+    """Attach live broker balance/equity and use equity as the sizing base.
+
+    Equity is preferred over balance so drawdowns reduce new trade size
+    automatically.  If Capital does not expose equity, balance is used.  If the
+    endpoint is unavailable, the existing saved account_size remains as a safe
+    fallback and the raw reason is preserved for diagnostics.
+    """
+    sizing = dict(sizing or {})
+    snap = capital_account_snapshot()
+    equity = snap.get("equity")
+    balance = snap.get("balance")
+    base = equity if equity is not None and float(equity) > 0 else balance
+    sizing["broker_account_snapshot"] = snap
+    sizing["sizing_account_balance"] = balance
+    sizing["sizing_account_equity"] = equity
+    if base is not None and float(base) > 0:
+        sizing["account_size"] = float(base)
+        sizing["account_size_source"] = "capital_live_equity" if equity is not None and float(equity) > 0 else "capital_live_balance"
+    else:
+        sizing["account_size_source"] = sizing.get("account_size_source") or "saved_user_setting_fallback"
+    return sizing
 
 
 def estimate_margin_required(sig, size: float, leverage: float) -> float:
@@ -5508,9 +5586,10 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
         account_size = _safe_float_setting(settings, ["account_size", "account_balance", "starting_balance"], ACCOUNT_SIZE)
         risk_pct = _safe_float_setting(settings, ["risk_pct", "risk_per_trade_pct"], float(RISK_PER_TRADE) * 100.0)
         leverage = _safe_float_setting(settings, ["leverage"], LEVERAGE)
-        return {
+        return enrich_sizing_with_live_capital_account({
             "username": username,
             "account_size": max(0.0, float(account_size)),
+            "account_size_source": "saved_user_setting_fallback",
             "risk_pct": max(0.0, float(risk_pct)),
             "leverage": max(1.0, float(leverage)),
             "source": "user_settings",
@@ -5522,8 +5601,8 @@ def load_auto_trade_user_settings_for_signal(sig: ScanResult) -> dict:
             "daily_state": session_gate.get("daily_state") or {},
             "auto_trades_taken_today": taken_today,
             "selected_grades": sorted(allowed_user_grades),
-        }
-    return fallback
+        })
+    return enrich_sizing_with_live_capital_account(fallback)
 
 def calculate_capital_position_size(sig: ScanResult, sizing: dict) -> float:
     """Calculate Capital.com order size from the user's risk settings.
@@ -5787,30 +5866,174 @@ def capital_update_position_levels(deal_id: str, stop_level: float, profit_level
         last_error = str(_CAPITAL_LAST_ERROR.get("text") or "")[:500]
     return {"ok": False, "error": last_error or "position_update_failed", "payload": payloads[0]}
 
+
+def capital_target_risk_cash(sizing: dict) -> float:
+    """Return intended cash risk for a user auto-trade."""
+    try:
+        account_size = float(sizing.get("account_size") or ACCOUNT_SIZE)
+        risk_pct = float(sizing.get("risk_pct") or (RISK_PER_TRADE * 100.0))
+        return max(0.0, account_size * (risk_pct / 100.0))
+    except Exception:
+        return max(0.0, float(ACCOUNT_SIZE) * float(RISK_PER_TRADE))
+
+
+def capital_contract_risk_multiplier(asset: str = "", market_info: dict | None = None) -> float:
+    """Return the broker cash multiplier for one unit of size.
+
+    Capital.com size/risk is instrument-specific. For many FX/CFD epics the
+    cash risk is approximately ``abs(entry-stop) * size``. Some markets expose
+    contract/lot/value-per-point fields in ``market_info``; when present we use
+    them so the 1% risk check is based on broker constraints instead of a
+    one-size-fits-all assumption.
+
+    The function is intentionally conservative: if no reliable multiplier is
+    found it returns 1.0 rather than inventing a value. The post-fill broker
+    risk verifier then validates the actual Capital.com fill/SL/size.
+    """
+    market_info = market_info if isinstance(market_info, dict) else {}
+    candidate_paths = [
+        ["valuePerPoint"], ["value", "per", "point"],
+        ["contractSize"], ["contract", "size"],
+        ["lotSize"], ["lot", "size"],
+        ["unitAmount"], ["unit", "amount"],
+        ["sizeMultiplier"], ["multiplier"],
+    ]
+    for path in candidate_paths:
+        try:
+            v = _deep_find_number(market_info, path, None)
+            if v is not None and float(v) > 0:
+                # Avoid accidentally treating very large minDealSize-style
+                # fields as a contract multiplier. True point-value/contract
+                # multipliers are normally modest for these epics.
+                fv = float(v)
+                if fv <= 1000000:
+                    return fv
+        except Exception:
+            pass
+    return 1.0
+
+
+def capital_cash_risk(entry: float | None, stop: float | None, size: float | None, market_info: dict | None = None, asset: str = "") -> float | None:
+    """Cash-risk estimate from broker entry, stop and size.
+
+    Uses ``capital_epic_map.market_info``/constraint data where available so
+    minimum size, step size and broker contract semantics are respected.
+    """
+    try:
+        if entry is None or stop is None or size is None:
+            return None
+        entry_f = float(entry); stop_f = float(stop); size_f = float(size)
+        if size_f <= 0:
+            return None
+        mult = capital_contract_risk_multiplier(asset, market_info)
+        return abs(entry_f - stop_f) * size_f * float(mult or 1.0)
+    except Exception:
+        return None
+
+
+def capital_risk_status(target_cash: float | None, actual_cash: float | None) -> tuple[str, str, float | None]:
+    """Classify broker risk after execution."""
+    try:
+        if target_cash is None or float(target_cash) <= 0:
+            return "UNKNOWN", "Target risk unavailable", None
+        if actual_cash is None:
+            return "PENDING", "Broker entry/SL/size unavailable; will retry on next sync", None
+        pct = float(actual_cash) / float(target_cash)
+        tol = 1.0 + float(CAPITAL_AUTO_TRADE_RISK_TOLERANCE_PCT)
+        if pct <= tol:
+            return "VERIFIED", "Broker risk is within tolerance", pct
+        return "RISK HIGH", f"Broker risk exceeds target by {(pct - 1.0) * 100.0:.1f}%", pct
+    except Exception:
+        return "UNKNOWN", "Risk verification failed", None
+
+
+def capital_size_from_cash_risk(entry: float, stop: float, sizing: dict, market_info: dict) -> float:
+    """Calculate a Capital.com size that does not exceed target risk.
+
+    Source of truth for broker constraints is ``capital_epic_map``:
+      - min_size
+      - max_size
+      - step_size
+      - min/max SL/TP distances
+      - market_info contract/point multiplier, where available
+
+    Important: we round DOWN to the broker step so sizing never increases above
+    the configured risk. If the rounded size is below Capital.com's minimum, the
+    caller performs a minimum-size risk check and skips the trade if it would
+    exceed the user's risk budget.
+    """
+    try:
+        stop_distance = abs(float(entry) - float(stop))
+        if stop_distance <= 0:
+            return 0.0
+        risk_cash = capital_target_risk_cash(sizing)
+        mult = capital_contract_risk_multiplier(str(sizing.get("asset") or ""), market_info)
+        denom = stop_distance * float(mult or 1.0)
+        if denom <= 0:
+            return 0.0
+
+        raw_size = risk_cash / denom
+        min_size = float(market_info.get("min_size") or CAPITAL_AUTO_TRADE_MIN_SIZE or 0)
+        max_size = float(market_info.get("max_size") or CAPITAL_AUTO_TRADE_MAX_SIZE or 0)
+        step_size = float(market_info.get("step_size") or 0)
+
+        if max_size and max_size > 0:
+            raw_size = min(raw_size, max_size)
+
+        # Round DOWN first. This protects the 1% risk budget.
+        size = round_to_broker_step(raw_size, step_size, direction="down")
+
+        # If step rounding collapses to zero but the raw size is positive, try
+        # the broker minimum. The risk guard below will decide if it is safe.
+        if size <= 0 and min_size > 0:
+            size = round_to_broker_step(min_size, step_size, direction="up")
+
+        # If the safe rounded size is below minimum, return the minimum so the
+        # caller can explicitly compare minimum-size risk to target risk and
+        # skip with a clear diagnostic instead of silently oversizing.
+        if min_size and size < min_size:
+            size = round_to_broker_step(min_size, step_size, direction="up")
+
+        return round(float(size), 6)
+    except Exception:
+        return 0.0
+
 def build_capital_size_attempts(base_size: float, market_info: dict) -> list[float]:
+    """Build broker-valid size attempts without intentionally increasing risk.
+
+    Attempts are ordered from the requested broker-valid size downward. The
+    minimum size is included only as a final fallback; the caller filters every
+    candidate through the 1% cash-risk guard before any order is sent.
+    """
     min_size = float(market_info.get("min_size") or CAPITAL_AUTO_TRADE_MIN_SIZE or 0.01)
     max_size = float(market_info.get("max_size") or CAPITAL_AUTO_TRADE_MAX_SIZE or 0)
     step = float(market_info.get("step_size") or 0)
-    attempts = []
-    def add(x, direction="nearest"):
+    attempts: list[float] = []
+
+    def add(x, direction="down"):
         try:
             x = float(x)
+            if x <= 0:
+                return
             if max_size and x > max_size:
                 x = max_size
-            x = max(min_size, x)
             x = round_to_broker_step(x, step, direction=direction)
+            if min_size and x < min_size:
+                return
             if x > 0 and x not in attempts:
-                attempts.append(x)
+                attempts.append(float(x))
         except Exception:
             pass
-    add(base_size)
-    add(min_size, "up")
-    for mult in (2, 5, 10):
-        add(min_size * mult, "up")
-    for div in (2, 5, 10, 25, 50, 100):
-        add(base_size / div, "down")
-    return attempts[:10]
 
+    add(base_size, "down")
+    for div in (2, 3, 5, 10, 25, 50, 100):
+        add(float(base_size) / div, "down")
+    if min_size > 0:
+        # Candidate only; caller's cash-risk guard may reject it.
+        ms = round_to_broker_step(min_size, step, direction="up")
+        if ms > 0 and ms not in attempts:
+            attempts.append(float(ms))
+    return attempts[:10]
 
 def load_enabled_auto_trade_users_for_signal_fallback(sig) -> list[dict]:
     """Load enabled user-owned Capital accounts without tying them to SCAN_OWNER."""
@@ -5878,16 +6101,45 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
         record_capital_auto_trade_diagnostic(sig, username=str(sizing.get("username") or SCAN_OWNER), eligible=False, order_sent=False, status="SKIPPED", skip_reason=reason, prop_selected=False, capital_executed=False, api_response={"sizing": sizing})
         print(f"[CapitalAuto] {sig.asset} {timeframe} {direction} {grade}: skipped · {reason}.")
         return False
-    trade_size = calculate_capital_position_size(sig, sizing)
+    market_info = capital_load_market_info(sig.asset)
+    try:
+        sizing["asset"] = sig.asset
+    except Exception:
+        pass
+    adj_sl, adj_tp = adjust_levels_for_capital_constraints(sig, market_info)
+    if CAPITAL_AUTO_TRADE_USE_STOPS and (adj_sl <= 0 or adj_tp <= 0):
+        record_capital_auto_order(sig, status="SKIPPED", epic=epic, size=0, error="Broker stop/TP constraints make a valid positive SL/TP impossible", raw={"sizing": sizing, "broker_constraints": market_info})
+        record_capital_auto_trade_diagnostic(sig, username=str(sizing.get("username") or SCAN_OWNER), eligible=False, order_sent=False, status="SKIPPED", skip_reason="invalid_broker_sl_tp_constraints", prop_selected=False, capital_executed=False, api_response={"sizing": sizing, "broker_constraints": market_info})
+        print(f"[CapitalAuto] {sig.asset} {timeframe} {direction} {grade}: skipped · invalid broker SL/TP constraints.")
+        return False
+
+    # Size from the stop level that will actually be sent to Capital, not from
+    # the original signal stop if broker constraints adjusted it. This keeps
+    # the intended 1% cash risk aligned with the real order payload.
+    trade_size = capital_size_from_cash_risk(float(sig.entry), float(adj_sl), sizing, market_info)
     if trade_size <= 0:
-        record_capital_auto_order(sig, status="FAILED", epic=epic, size=0, error="Dynamic size calculation returned 0", raw={"sizing": sizing})
+        record_capital_auto_order(sig, status="FAILED", epic=epic, size=0, error="Dynamic size calculation returned 0", raw={"sizing": sizing, "broker_constraints": market_info, "adjusted_sl": adj_sl, "adjusted_tp": adj_tp})
         record_capital_auto_trade_diagnostic(sig, username=str(sizing.get("username") or SCAN_OWNER), eligible=False, order_sent=False, status="FAILED", skip_reason="dynamic_size_calculation_returned_0", prop_selected=False, capital_executed=False, api_response={"sizing": sizing})
         print(f"[CapitalAuto] {sig.asset} {timeframe}: size calculation failed; order skipped.")
         return False
 
-    market_info = capital_load_market_info(sig.asset)
-    size_attempts = build_capital_size_attempts(float(trade_size), market_info) if CAPITAL_AUTO_TRADE_SIZE_RETRY else [float(trade_size)]
-    available_margin = capital_available_margin()
+    target_risk_cash = capital_target_risk_cash(sizing)
+    max_allowed_risk_cash = target_risk_cash * (1.0 + float(CAPITAL_AUTO_TRADE_RISK_TOLERANCE_PCT)) if target_risk_cash else None
+    raw_attempts = build_capital_size_attempts(float(trade_size), market_info) if CAPITAL_AUTO_TRADE_SIZE_RETRY else [float(trade_size)]
+    size_attempts = []
+    for attempt in raw_attempts:
+        attempt_risk = capital_cash_risk(float(sig.entry), float(adj_sl), float(attempt), market_info, sig.asset)
+        if max_allowed_risk_cash is None or attempt_risk is None or attempt_risk <= max_allowed_risk_cash:
+            size_attempts.append(float(attempt))
+    if not size_attempts:
+        min_size = float(market_info.get("min_size") or CAPITAL_AUTO_TRADE_MIN_SIZE or 0)
+        min_risk = capital_cash_risk(float(sig.entry), float(adj_sl), min_size, market_info, sig.asset)
+        record_capital_auto_order(sig, status="SKIPPED", epic=epic, size=min_size, error="Minimum broker size would exceed target risk", raw={"sizing": sizing, "broker_constraints": market_info, "target_risk_cash": target_risk_cash, "minimum_size_risk_cash": min_risk, "adjusted_sl": adj_sl, "adjusted_tp": adj_tp})
+        record_capital_auto_trade_diagnostic(sig, username=str(sizing.get("username") or SCAN_OWNER), eligible=False, order_sent=False, status="SKIPPED", skip_reason="minimum_size_exceeds_target_risk", prop_selected=False, capital_executed=False, api_response={"target_risk_cash": target_risk_cash, "minimum_size_risk_cash": min_risk})
+        print(f"[CapitalAuto] {sig.asset} {timeframe}: skipped · minimum size risk exceeds target risk.")
+        return False
+    acct_snap = sizing.get("broker_account_snapshot") if isinstance(sizing.get("broker_account_snapshot"), dict) else {}
+    available_margin = acct_snap.get("available") if acct_snap.get("available") is not None else capital_available_margin()
     if available_margin is not None:
         # Use Capital's effective leverage for the real margin check. FTMO stays 1:100 for simulation.
         lev = capital_effective_leverage_for_asset(sig.asset, market_info)
@@ -5909,12 +6161,6 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
     confirmed_size = float(trade_size)
     last_payload = {}
     last_error = "POST /positions failed"
-    adj_sl, adj_tp = adjust_levels_for_capital_constraints(sig, market_info)
-    if CAPITAL_AUTO_TRADE_USE_STOPS and (adj_sl <= 0 or adj_tp <= 0):
-        record_capital_auto_order(sig, status="SKIPPED", epic=epic, size=trade_size, error="Broker stop/TP constraints make a valid positive SL/TP impossible", raw={"sizing": sizing, "broker_constraints": market_info})
-        record_capital_auto_trade_diagnostic(sig, username=str(sizing.get("username") or SCAN_OWNER), eligible=False, order_sent=False, status="SKIPPED", skip_reason="invalid_broker_sl_tp_constraints", prop_selected=False, capital_executed=False, api_response={"sizing": sizing, "broker_constraints": market_info})
-        print(f"[CapitalAuto] {sig.asset} {timeframe} {direction} {grade}: skipped · invalid broker SL/TP constraints.")
-        return False
 
     for attempt_size in size_attempts:
         payload = {
@@ -5987,11 +6233,15 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
         )
         broker_entry = broker_values.get("entry")
         if broker_entry is not None:
-            planned_risk = abs(float(sig.entry) - float(adj_sl or sig.sl))
+            # Rebuild SL/TP from the actual broker fill and the user's target cash risk.
+            # This keeps both RR=1:2 and cash risk near the configured 1% even after
+            # broker fill slippage or size rounding.
+            target_risk_cash = capital_target_risk_cash(sizing)
+            risk_distance_from_fill = (target_risk_cash / float(confirmed_size)) if target_risk_cash and confirmed_size else abs(float(sig.entry) - float(adj_sl or sig.sl))
             broker_sl_target, broker_tp_target = fixed_rr_levels_from_entry(
                 float(broker_entry),
                 direction,
-                planned_risk,
+                risk_distance_from_fill,
                 market_info,
             )
             if broker_sl_target > 0 and broker_tp_target > 0:
@@ -6020,7 +6270,7 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
             broker_truth_pending = True
             fixed_rr_update = {"attempted": False, "ok": False, "error": "broker_entry_unavailable_pending_sync"}
 
-    _auto_raw = {"payload": last_payload, "original_size": trade_size, "adjusted_sl": adj_sl, "adjusted_tp": adj_tp, "broker_constraints": market_info, "sizing": sizing, "response": response or {}, "confirm": confirm or {}, "broker_detail": broker_detail or {}, "broker_values": broker_values or {}, "broker_truth_pending": broker_truth_pending, "fixed_rr_update": fixed_rr_update, "execution_rr_policy": "broker_fill_fixed_1_to_2", "ftmo_leverage": FTMO_COMPARISON_LEVERAGE, "capital_leverage": capital_effective_leverage_for_asset(sig.asset, market_info), "ftmo_normalization_factor": ftmo_normalization_factor(sig.asset, market_info)}
+    _auto_raw = {"payload": last_payload, "original_size": trade_size, "adjusted_sl": adj_sl, "adjusted_tp": adj_tp, "broker_constraints": market_info, "sizing": sizing, "response": response or {}, "confirm": confirm or {}, "broker_detail": broker_detail or {}, "broker_values": broker_values or {}, "broker_truth_pending": broker_truth_pending, "fixed_rr_update": fixed_rr_update, "target_risk_cash": capital_target_risk_cash(sizing), "planned_risk_cash": capital_cash_risk(float(sig.entry), float(adj_sl), float(confirmed_size), market_info, sig.asset), "execution_rr_policy": "broker_fill_fixed_1_to_2", "ftmo_leverage": FTMO_COMPARISON_LEVERAGE, "capital_leverage": capital_effective_leverage_for_asset(sig.asset, market_info), "ftmo_normalization_factor": ftmo_normalization_factor(sig.asset, market_info)}
     record_capital_auto_order(sig, status=status, deal_reference=deal_reference, deal_id=deal_id, epic=epic, size=confirmed_size, error=error, raw=_auto_raw)
     record_capital_auto_trade_diagnostic(sig, username=str(sizing.get("username") or SCAN_OWNER), eligible=ok, order_sent=ok, status="EXECUTED" if ok else "REJECTED", skip_reason=error, deal_reference=deal_reference, deal_id=deal_id, prop_selected=ok, capital_executed=ok, api_response=_auto_raw)
     user_label = str(sizing.get("username") or SCAN_OWNER)
@@ -6135,6 +6385,12 @@ def rebuild_capital_execution_audit(limit: int = 500) -> int:
                     actual_exit = _parse_float_or_none(actual.get("exit_price")) or broker_values.get("exit")
                     broker_sl = broker_values.get("stop")
                     broker_tp = broker_values.get("limit")
+                    order_sizing = order_raw.get("sizing") if isinstance(order_raw.get("sizing"), dict) else {}
+                    target_risk_cash = _parse_float_or_none(order_raw.get("target_risk_cash")) or capital_target_risk_cash(order_sizing)
+                    actual_size_for_risk = _parse_float_or_none(actual.get("size")) or _parse_float_or_none(row.get("size"))
+                    planned_risk_cash = _parse_float_or_none(order_raw.get("planned_risk_cash")) or capital_cash_risk(planned_entry, broker_sl or planned_signal_sl, actual_size_for_risk)
+                    broker_risk_cash = capital_cash_risk(executed_entry, broker_sl, actual_size_for_risk, (order_raw.get("broker_constraints") or {}), str(row.get("asset") or order_raw.get("asset") or ""))
+                    risk_status, risk_note, broker_risk_pct = capital_risk_status(target_risk_cash, broker_risk_cash)
                     entry_slippage = (executed_entry - planned_entry) if executed_entry is not None and planned_entry is not None else None
                     exit_slippage = (actual_exit - planned_exit) if actual_exit is not None and planned_exit is not None else None
 
@@ -6157,8 +6413,10 @@ def rebuild_capital_execution_audit(limit: int = 500) -> int:
                             planned_r, actual_r, broker_pnl, broker_pnl_ftmo_equiv,
                             ftmo_leverage, capital_leverage, ftmo_normalization_factor,
                             replay_outcome, broker_status, size, currency, environment, epic,
-                            deal_reference, deal_id, opened_at, closed_at, updated_at
-                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                            deal_reference, deal_id, target_risk_cash, planned_risk_cash,
+                            broker_risk_cash, broker_risk_pct, risk_status, risk_note,
+                            opened_at, closed_at, updated_at
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
                         ON CONFLICT (id) DO UPDATE SET
                             capital_trade_id = EXCLUDED.capital_trade_id,
                             executed_entry = EXCLUDED.executed_entry,
@@ -6179,6 +6437,12 @@ def rebuild_capital_execution_audit(limit: int = 500) -> int:
                             environment = EXCLUDED.environment,
                             deal_reference = EXCLUDED.deal_reference,
                             deal_id = EXCLUDED.deal_id,
+                            target_risk_cash = EXCLUDED.target_risk_cash,
+                            planned_risk_cash = EXCLUDED.planned_risk_cash,
+                            broker_risk_cash = EXCLUDED.broker_risk_cash,
+                            broker_risk_pct = EXCLUDED.broker_risk_pct,
+                            risk_status = EXCLUDED.risk_status,
+                            risk_note = EXCLUDED.risk_note,
                             opened_at = EXCLUDED.opened_at,
                             closed_at = EXCLUDED.closed_at,
                             updated_at = NOW()
@@ -6193,7 +6457,9 @@ def rebuild_capital_execution_audit(limit: int = 500) -> int:
                             _parse_float_or_none(row.get("ftmo_leverage")), _parse_float_or_none(row.get("capital_leverage")), _parse_float_or_none(row.get("ftmo_normalization_factor")),
                             row.get("replay_status") or row.get("replay_exit_reason"), actual.get("status") or row.get("status"),
                             _parse_float_or_none(actual.get("size")) or _parse_float_or_none(row.get("size")), actual.get("currency"), actual.get("environment") or row.get("environment"), row.get("epic"),
-                            row.get("deal_reference"), row.get("deal_id"), actual.get("opened_at") or row.get("created_at"), actual.get("closed_at"),
+                            row.get("deal_reference"), row.get("deal_id"),
+                            target_risk_cash, planned_risk_cash, broker_risk_cash, broker_risk_pct, risk_status, risk_note,
+                            actual.get("opened_at") or row.get("created_at"), actual.get("closed_at"),
                         ),
                     )
                     upserted += 1
