@@ -2081,10 +2081,10 @@ def journal_session_win_rate_for_session(df: pd.DataFrame, session: str) -> tupl
         return 0.0, 0
 
 def apply_prop_best_session_trade_filter(df: pd.DataFrame, profile: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Apply Prop Firm v2: best session only, max 4 trades/day.
+    """Legacy static prop filter retained for compatibility.
 
-    If no session has the minimum sample yet, the profile is marked not ready
-    and we do not restrict by session. We still apply the 4-trades/day cap.
+    New prop challenge replay uses apply_prop_rolling_best_session_trade_filter()
+    so historical days stay locked to the best session known at that time.
     """
     if df is None or df.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -2105,9 +2105,6 @@ def apply_prop_best_session_trade_filter(df: pd.DataFrame, profile: dict) -> tup
             skipped_parts.append(outside)
         eligible = eligible[eligible["prop_session"] == best].copy()
 
-        # Do not take the first trades immediately at session open.
-        # The prop model waits until the best session has been open for one hour,
-        # then takes the first eligible A+/A trades up to the daily cap.
         first_hour_mask = ~eligible["prop_entry_time"].apply(lambda ts: prop_is_one_hour_after_session_open(ts, best))
         first_hour = eligible[first_hour_mask].copy()
         if not first_hour.empty:
@@ -2122,6 +2119,106 @@ def apply_prop_best_session_trade_filter(df: pd.DataFrame, profile: dict) -> tup
         skipped_parts.append(capped)
     skipped = pd.concat(skipped_parts, ignore_index=True) if skipped_parts else pd.DataFrame()
     return taken.drop(columns=[c for c in ["_daily_rank", "prop_day_all"] if c in taken.columns]), skipped
+
+
+def apply_prop_rolling_best_session_trade_filter(
+    df: pd.DataFrame,
+    session_source_all: pd.DataFrame | None = None,
+    activated_at: str = "",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Apply prop trade selection day-by-day using the evidence available then.
+
+    This prevents historical prop trades from being rewritten when the user's
+    best session changes later. For each Nairobi trading day, the filter is
+    chosen from closed User Journal outcomes available before that day starts.
+    Past days therefore remain locked to the session that was best at that time;
+    only future days can use a newly learned best session.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    work = df.copy()
+    if "prop_entry_time" not in work.columns:
+        work["prop_entry_time"] = pd.to_datetime(work.get("created_at", pd.Series(pd.NaT, index=work.index)), errors="coerce", utc=True)
+    if "prop_event_time" not in work.columns:
+        event_time = pd.to_datetime(work.get("exit_at", pd.Series(pd.NaT, index=work.index)), errors="coerce", utc=True)
+        work["prop_event_time"] = event_time.fillna(work["prop_entry_time"])
+    work = work.dropna(subset=["prop_entry_time", "prop_event_time"]).sort_values("prop_entry_time").reset_index(drop=True)
+    if work.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    work["prop_session"] = work["prop_entry_time"].apply(prop_session_from_timestamp)
+    work["prop_day_all"] = work["prop_entry_time"].apply(lambda ts: pd.Timestamp(ts).tz_convert(NAIROBI_TZ).date())
+
+    source = session_source_all.copy() if session_source_all is not None and not session_source_all.empty else work.copy()
+    if "prop_entry_time" not in source.columns:
+        source["prop_entry_time"] = pd.to_datetime(source.get("created_at", pd.Series(pd.NaT, index=source.index)), errors="coerce", utc=True)
+    if "prop_event_time" not in source.columns:
+        source_event = pd.to_datetime(source.get("exit_at", pd.Series(pd.NaT, index=source.index)), errors="coerce", utc=True)
+        source["prop_event_time"] = source_event.fillna(source["prop_entry_time"])
+    source = source.dropna(subset=["prop_entry_time", "prop_event_time"]).copy()
+
+    act_ts = pd.to_datetime(activated_at, errors="coerce", utc=True)
+    if pd.notna(act_ts):
+        source = source[source["prop_entry_time"] >= act_ts].copy()
+
+    taken_parts: list[pd.DataFrame] = []
+    skipped_parts: list[pd.DataFrame] = []
+
+    for day in sorted(work["prop_day_all"].dropna().unique()):
+        day_rows = work[work["prop_day_all"] == day].copy().sort_values("prop_entry_time")
+        try:
+            day_start_eat = pd.Timestamp(day).tz_localize(NAIROBI_TZ)
+        except Exception:
+            day_start_eat = pd.Timestamp(str(day)).tz_localize(NAIROBI_TZ)
+        day_start_utc = day_start_eat.tz_convert("UTC")
+
+        # Only outcomes closed before the day starts are allowed to influence
+        # that day's best-session decision. This is the lock that stops future
+        # learning from rewriting yesterday's prop trades.
+        evidence = source[source["prop_event_time"] < day_start_utc].copy()
+        profile = prop_best_session_profile(evidence, PROP_MIN_SESSION_TRADES)
+        best = str(profile.get("active_filter_session") or profile.get("best_session") or "All sessions")
+        sample_ready = bool(profile.get("sample_ready"))
+
+        eligible = day_rows.copy()
+        if sample_ready and best not in {"", "All sessions"}:
+            outside = eligible[eligible["prop_session"] != best].copy()
+            if not outside.empty:
+                outside["prop_skip_reason"] = f"Skipped — outside locked best session for {day}: {best}"
+                outside["prop_filter_session"] = best
+                skipped_parts.append(outside)
+            eligible = eligible[eligible["prop_session"] == best].copy()
+
+            first_hour_mask = ~eligible["prop_entry_time"].apply(lambda ts: prop_is_one_hour_after_session_open(ts, best))
+            first_hour = eligible[first_hour_mask].copy()
+            if not first_hour.empty:
+                first_hour["prop_skip_reason"] = f"Skipped — first hour after locked best-session open: {best}"
+                first_hour["prop_filter_session"] = best
+                skipped_parts.append(first_hour)
+            eligible = eligible[~first_hour_mask].copy()
+
+        eligible["_daily_rank"] = range(1, len(eligible) + 1)
+        selected = eligible[eligible["_daily_rank"] <= PROP_MAX_TRADES_PER_DAY].copy()
+        capped = eligible[eligible["_daily_rank"] > PROP_MAX_TRADES_PER_DAY].copy()
+        if not capped.empty:
+            capped["prop_skip_reason"] = "Skipped — daily trade cap reached"
+            capped["prop_filter_session"] = best if sample_ready else "All sessions"
+            skipped_parts.append(capped)
+
+        if not selected.empty:
+            selected["prop_filter_session"] = best if sample_ready else "All sessions"
+            selected["prop_filter_sample_ready"] = bool(sample_ready)
+            selected["prop_filter_trade_count"] = int(profile.get("trade_count", 0) or 0)
+            selected["prop_filter_win_rate"] = float(profile.get("win_rate", 0.0) or 0.0)
+            taken_parts.append(selected)
+
+    taken = pd.concat(taken_parts, ignore_index=True) if taken_parts else pd.DataFrame()
+    skipped = pd.concat(skipped_parts, ignore_index=True) if skipped_parts else pd.DataFrame()
+    for frame in (taken, skipped):
+        if not frame.empty and "_daily_rank" in frame.columns:
+            frame.drop(columns=["_daily_rank"], inplace=True)
+    return taken, skipped
 
 def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: str = "", starting: float = 10000.0, session_source_all: pd.DataFrame | None = None) -> dict:
     """Replay scoped A+/A closed trades using the exact FTMO 2-step model.
@@ -2201,7 +2298,12 @@ def simulate_prop_challenge_cycles(prop_closed_all: pd.DataFrame, activated_at: 
             session_source = session_source[pd.to_datetime(session_source.get("created_at", pd.Series(pd.NaT, index=session_source.index)), errors="coerce", utc=True) >= act_ts_for_session].copy()
     best_session_profile = prop_best_session_profile(session_source, PROP_MIN_SESSION_TRADES)
     skipped_prop_trades = pd.DataFrame()
-    df, skipped_prop_trades = apply_prop_best_session_trade_filter(df, best_session_profile)
+    # Use a rolling daily filter for the actual challenge replay. The card can
+    # still show the current best session, but past ledger days are selected
+    # using only the evidence available before each day started.
+    df, skipped_prop_trades = apply_prop_rolling_best_session_trade_filter(
+        df, session_source_all=session_source, activated_at=activated_at
+    )
     if df.empty:
         return {"history": [], "active": empty_active, "active_curve": pd.DataFrame(), "active_daily": pd.DataFrame(), "all_daily": pd.DataFrame(), "all_trades": pd.DataFrame(), "skipped_trades": skipped_prop_trades, "best_session": best_session_profile}
 
