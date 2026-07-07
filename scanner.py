@@ -741,14 +741,59 @@ def _clean_db_url(url: str) -> str:
         return url
 
 
+DB_CONNECT_RETRIES = int(os.environ.get("DB_CONNECT_RETRIES", "3"))
+DB_CONNECT_RETRY_SLEEP = float(os.environ.get("DB_CONNECT_RETRY_SLEEP", "1.5"))
+OPEN_TRADE_EVAL_LIMIT = int(os.environ.get("OPEN_TRADE_EVAL_LIMIT", "120"))
+EXECUTION_AUDIT_SYNC_LIMIT = int(os.environ.get("EXECUTION_AUDIT_SYNC_LIMIT", "120"))
+
+
 def db_connect():
+    """Open a fresh Supabase connection with small transient retry support.
+
+    The scanner runs for a long time and Supabase pooler/DNS can occasionally
+    drop a connection. Every DB stage should use a fresh connection and close it
+    promptly; this helper retries the connection open instead of letting one
+    transient failure corrupt scanner state.
+    """
     url = os.environ.get("DATABASE_URL", "").strip()
     if not url:
         raise RuntimeError("DATABASE_URL is not set.")
     if psycopg2 is None:
         raise RuntimeError("psycopg2 is not installed — add psycopg2-binary to requirements_scanner.txt.")
-    return psycopg2.connect(_clean_db_url(url), cursor_factory=RealDictCursor)
+    cleaned = _clean_db_url(url)
+    last_exc = None
+    for attempt in range(1, max(1, DB_CONNECT_RETRIES) + 1):
+        try:
+            return psycopg2.connect(
+                cleaned,
+                cursor_factory=RealDictCursor,
+                connect_timeout=15,
+                application_name="benzino_scanner",
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=5,
+            )
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max(1, DB_CONNECT_RETRIES):
+                print(f"[DB] connect attempt {attempt} failed: {exc}; retrying...")
+                time.sleep(DB_CONNECT_RETRY_SLEEP * attempt)
+    raise last_exc
 
+
+def execute(sql: str, params: tuple = ()) -> None:
+    """Small standalone execute helper for scanner stages."""
+    conn = db_connect()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def hydrate_capital_env_from_user_connection_if_missing() -> dict:
@@ -1490,7 +1535,11 @@ def fetch_open_trades(assets: set[str] | None = None, timeframes: set[str] | Non
                         END
                     )
                 """
-            sql += " ORDER BY created_at ASC"
+            if due_only and OPEN_TRADE_EVAL_LIMIT > 0:
+                sql += " ORDER BY created_at ASC LIMIT %s"
+                params.append(int(OPEN_TRADE_EVAL_LIMIT))
+            else:
+                sql += " ORDER BY created_at ASC"
             cur.execute(sql, tuple(params))
             rows = [dict(r) for r in cur.fetchall()]
         conn.close()
@@ -5342,7 +5391,6 @@ def load_or_create_capital_auto_daily_state(username: str, timeframe: str, asset
                         try: so = json.loads(so)
                         except Exception: so = []
                     state["session_order"] = so
-                    conn.close()
                     return state
                 ranking = capital_session_order_for_user(username, timeframe, assets)
                 session_order = ranking.get("session_order") or []
@@ -6282,7 +6330,7 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
     return ok
 
 
-def rebuild_capital_execution_audit(limit: int = 500) -> int:
+def rebuild_capital_execution_audit(limit: int = EXECUTION_AUDIT_SYNC_LIMIT) -> int:
     """Build the Capital.com Execution Audit from BENZINO-created broker orders.
 
     This is no longer a simulated-vs-actual matching engine. Because Capital.com is
@@ -6416,7 +6464,7 @@ def rebuild_capital_execution_audit(limit: int = 500) -> int:
                             deal_reference, deal_id, target_risk_cash, planned_risk_cash,
                             broker_risk_cash, broker_risk_pct, risk_status, risk_note,
                             opened_at, closed_at, updated_at
-                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
                         ON CONFLICT (id) DO UPDATE SET
                             capital_trade_id = EXCLUDED.capital_trade_id,
                             executed_entry = EXCLUDED.executed_entry,
