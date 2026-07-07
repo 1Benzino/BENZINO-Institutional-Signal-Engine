@@ -29,7 +29,6 @@ import hashlib
 import secrets
 import smtplib
 import ssl
-import time
 from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -212,34 +211,12 @@ def clean_database_url(url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(pairs), parts.fragment))
 
 
-DB_CONNECT_RETRIES = int(os.getenv("DB_CONNECT_RETRIES", "3") or 3)
-DB_CONNECT_RETRY_SLEEP = float(os.getenv("DB_CONNECT_RETRY_SLEEP", "1.5") or 1.5)
-
-
 def db_connect():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL / CLOUD_DATABASE_URL is not configured.")
     if psycopg2 is None:
         raise RuntimeError("psycopg2-binary is not installed.")
-    cleaned = clean_database_url(DATABASE_URL)
-    last_exc = None
-    for attempt in range(1, max(1, DB_CONNECT_RETRIES) + 1):
-        try:
-            return psycopg2.connect(
-                cleaned,
-                cursor_factory=RealDictCursor,
-                connect_timeout=15,
-                application_name="benzino_app",
-                keepalives=1,
-                keepalives_idle=30,
-                keepalives_interval=10,
-                keepalives_count=5,
-            )
-        except Exception as exc:
-            last_exc = exc
-            if attempt < max(1, DB_CONNECT_RETRIES):
-                time.sleep(DB_CONNECT_RETRY_SLEEP * attempt)
-    raise last_exc
+    return psycopg2.connect(clean_database_url(DATABASE_URL), cursor_factory=RealDictCursor)
 
 
 def execute(sql: str, params: tuple = ()) -> None:
@@ -5666,54 +5643,6 @@ def render_system_health_panel() -> None:
     with c4: metric_card("Average run", f"{summary['avg_seconds']:.2f}s", f"Last TFs: {summary['last_timeframes']}")
 
     st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-
-    # Operational scanner health checks. These are lightweight read-only checks
-    # so the Settings page can show whether the scanner, Capital execution audit,
-    # and replay queues are healthy without triggering any rebuilds or migrations.
-    try:
-        audit_df = read_df(
-            """
-            SELECT
-                COUNT(*) AS rows,
-                COUNT(*) FILTER (WHERE COALESCE(deal_id,'') = '') AS missing_deal_id,
-                COUNT(*) FILTER (WHERE COALESCE(risk_status,'') ILIKE '%%mismatch%%' OR COALESCE(risk_status,'') ILIKE '%%breach%%') AS risk_issues,
-                COUNT(*) FILTER (WHERE executed_entry IS NULL AND COALESCE(broker_status,'') NOT ILIKE '%%closed%%') AS pending_broker_fill
-            FROM capital_execution_audit
-            WHERE updated_at >= NOW() - INTERVAL '7 days'
-            """
-        )
-        open_df = read_df(
-            """
-            SELECT
-                COUNT(*) AS open_rows,
-                COUNT(*) FILTER (WHERE replay_checked_at IS NULL) AS never_checked,
-                COUNT(*) FILTER (WHERE replay_checked_at < NOW() - INTERVAL '1 day') AS stale_checked
-            FROM scanner_signals
-            WHERE status = 'OPEN'
-            """
-        )
-        diag_df = read_df(
-            """
-            SELECT
-                COUNT(*) AS checks,
-                COUNT(*) FILTER (WHERE status IN ('rejected','REJECTED')) AS rejected,
-                COUNT(*) FILTER (WHERE order_sent IS TRUE) AS sent
-            FROM capital_auto_trade_diagnostics
-            WHERE checked_at >= NOW() - INTERVAL '24 hours'
-            """
-        )
-        a = audit_df.iloc[0].to_dict() if not audit_df.empty else {}
-        o = open_df.iloc[0].to_dict() if not open_df.empty else {}
-        d = diag_df.iloc[0].to_dict() if not diag_df.empty else {}
-        h1, h2, h3, h4 = st.columns(4)
-        with h1: metric_card("Replay queue", f"{int(o.get('open_rows') or 0):,}", f"stale: {int(o.get('stale_checked') or 0):,}")
-        with h2: metric_card("Broker audit", f"{int(a.get('rows') or 0):,}", f"pending fills: {int(a.get('pending_broker_fill') or 0):,}")
-        with h3: metric_card("Risk checks", f"{int(a.get('risk_issues') or 0):,} issue(s)", "last 7 days")
-        with h4: metric_card("Auto-trade checks", f"{int(d.get('checks') or 0):,}", f"sent: {int(d.get('sent') or 0):,} · rejected: {int(d.get('rejected') or 0):,}")
-        st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-    except Exception:
-        pass
-
     view_source = runtime_df.copy()
     if "started_at" in view_source.columns:
         started_series = pd.to_datetime(view_source["started_at"], errors="coerce", utc=True)

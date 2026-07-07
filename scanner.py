@@ -41,6 +41,8 @@ import warnings
 import traceback
 import math
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -489,11 +491,13 @@ _TF_CACHE: dict[tuple[str, str], pd.DataFrame | None] = {}
 _CAPITAL_PRICE_CACHE: dict[tuple[str, str, int], pd.DataFrame | None] = {}
 _CAPITAL_RANGE_PRICE_CACHE: dict[tuple[str, str, str, str], pd.DataFrame | None] = {}
 _RUNTIME_BREAKDOWN: dict[str, float] = {}
+_RUNTIME_LOCK = threading.Lock()
 
 
 def _runtime_add(name: str, seconds: float) -> None:
     try:
-        _RUNTIME_BREAKDOWN[name] = float(_RUNTIME_BREAKDOWN.get(name, 0.0)) + float(seconds)
+        with _RUNTIME_LOCK:
+            _RUNTIME_BREAKDOWN[name] = float(_RUNTIME_BREAKDOWN.get(name, 0.0)) + float(seconds)
     except Exception:
         pass
 
@@ -616,6 +620,67 @@ CAPITAL_MARGIN_BUFFER_PCT = float(os.environ.get("CAPITAL_MARGIN_BUFFER_PCT", "0
 CAPITAL_FTMO_NORMALIZE_PNL = os.environ.get("CAPITAL_FTMO_NORMALIZE_PNL", "true").strip().lower() in {"1", "true", "yes", "y"}
 FTMO_COMPARISON_LEVERAGE = float(os.environ.get("FTMO_COMPARISON_LEVERAGE", "100"))
 CAPITAL_AUTO_TRADE_MAX_PER_DAY = int(os.environ.get("CAPITAL_AUTO_TRADE_MAX_PER_DAY", "10"))
+
+# Scanner pipeline mode.
+# - all: legacy monolithic run (default, safest backward compatibility)
+# - signal: generate/journal signals only
+# - replay: resolve open/shadow outcomes only
+# - capital: sync Capital.com executions + rebuild execution audit only
+# - maintenance: broker mapping/constraints health checks only
+SCANNER_ENGINE = os.environ.get("SCANNER_ENGINE", "all").strip().lower()
+if SCANNER_ENGINE not in {"all", "signal", "replay", "capital", "maintenance"}:
+    SCANNER_ENGINE = "all"
+# Immediate execution is enabled for the signal engine.
+# New eligible signals are sent to Capital.com during the signal-generation run.
+# This deliberately does not defer execution to a future pending-order worker.
+CAPITAL_EXECUTE_IN_SIGNAL_ENGINE = True
+CAPITAL_SYNC_IN_SIGNAL_ENGINE = os.environ.get("CAPITAL_SYNC_IN_SIGNAL_ENGINE", "false").strip().lower() in {"1", "true", "yes", "y"}
+REPLAY_IN_SIGNAL_ENGINE = os.environ.get("REPLAY_IN_SIGNAL_ENGINE", "false").strip().lower() in {"1", "true", "yes", "y"}
+# Hard cap per replay-worker run. This prevents a single scanner cycle from
+# attempting to replay hundreds/thousands of open trades and blocking signal generation.
+# Rows not processed remain OPEN and are picked up by the next replay engine run.
+OPEN_TRADE_REPLAY_LIMIT = int(os.environ.get("OPEN_TRADE_REPLAY_LIMIT", "120"))
+# Keep shadow research bounded independently from live/journal replay.
+SHADOW_REPLAY_LIMIT = int(os.environ.get("SHADOW_REPLAY_LIMIT", str(SHADOW_EVAL_LIMIT)))
+
+# Scanner v2.5 performance controls. Trading rules are unchanged; this only
+# parallelises signal calculation and keeps expensive sync/replay work bounded.
+SCANNER_SIGNAL_WORKERS = max(1, int(os.environ.get("SCANNER_SIGNAL_WORKERS", "6")))
+EXECUTION_AUDIT_LIMIT = max(25, int(os.environ.get("EXECUTION_AUDIT_LIMIT", "120")))
+PERF_BUDGETS_SECONDS = {
+    "open_trade_replay": float(os.environ.get("PERF_BUDGET_REPLAY_SECONDS", "300")),
+    "signal_generation_loop": float(os.environ.get("PERF_BUDGET_SIGNAL_SECONDS", "900")),
+    "execution_audit_sync": float(os.environ.get("PERF_BUDGET_AUDIT_SECONDS", "120")),
+    "capital_api": float(os.environ.get("PERF_BUDGET_CAPITAL_API_SECONDS", "300")),
+    "capital_candle_fetch": float(os.environ.get("PERF_BUDGET_CANDLE_SECONDS", "300")),
+}
+
+# Scanner v2.6 candle cache. This keeps Capital.com OHLC candles on disk between
+# scanner runs, then refreshes only when the cached data is stale for that
+# timeframe. The cache is deliberately local and disposable: if the folder is
+# missing or corrupt, the scanner simply falls back to Capital.com.
+CAPITAL_CANDLE_DISK_CACHE_ENABLED = os.environ.get("CAPITAL_CANDLE_DISK_CACHE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y"}
+CAPITAL_CANDLE_CACHE_DIR = os.environ.get("CAPITAL_CANDLE_CACHE_DIR", ".benzino_candle_cache").strip() or ".benzino_candle_cache"
+CAPITAL_CANDLE_CACHE_MAX_ROWS = max(1000, int(os.environ.get("CAPITAL_CANDLE_CACHE_MAX_ROWS", "5000")))
+CAPITAL_CANDLE_CACHE_STALE_SECONDS = {
+    "1m": int(os.environ.get("CAPITAL_CANDLE_CACHE_STALE_1M_SECONDS", "75")),
+    "15m": int(os.environ.get("CAPITAL_CANDLE_CACHE_STALE_15M_SECONDS", "780")),
+    "30m": int(os.environ.get("CAPITAL_CANDLE_CACHE_STALE_30M_SECONDS", "1500")),
+    "1h": int(os.environ.get("CAPITAL_CANDLE_CACHE_STALE_1H_SECONDS", "3300")),
+    "4h": int(os.environ.get("CAPITAL_CANDLE_CACHE_STALE_4H_SECONDS", "13800")),
+    "1d": int(os.environ.get("CAPITAL_CANDLE_CACHE_STALE_1D_SECONDS", "82800")),
+}
+_CANDLE_DISK_CACHE_LOCK = threading.RLock()
+
+# Scanner v2.7: avoid expensive full analysis for asset/timeframe/candle
+# combinations already stored in Supabase. This still fetches the latest candle
+# timestamp, but skips indicators, ML, MTF confirmation, DB writes, and Capital
+# execution checks for duplicates.
+EARLY_PROCESSED_CANDLE_GATE = os.environ.get("EARLY_PROCESSED_CANDLE_GATE", "true").strip().lower() in {"1", "true", "yes", "y"}
+_PROCESSED_CANDLE_CACHE: dict[tuple[str, str, str], bool] = {}
+
+def _engine_runs(*names: str) -> bool:
+    return SCANNER_ENGINE == "all" or SCANNER_ENGINE in {str(n).lower() for n in names}
 CAPITAL_AUTO_TRADE_MIN_SESSION_TRADES = int(os.environ.get("CAPITAL_AUTO_TRADE_MIN_SESSION_TRADES", "20"))
 NAIROBI_TZ = ZoneInfo("Africa/Nairobi")
 
@@ -741,59 +806,14 @@ def _clean_db_url(url: str) -> str:
         return url
 
 
-DB_CONNECT_RETRIES = int(os.environ.get("DB_CONNECT_RETRIES", "3"))
-DB_CONNECT_RETRY_SLEEP = float(os.environ.get("DB_CONNECT_RETRY_SLEEP", "1.5"))
-OPEN_TRADE_EVAL_LIMIT = int(os.environ.get("OPEN_TRADE_EVAL_LIMIT", "120"))
-EXECUTION_AUDIT_SYNC_LIMIT = int(os.environ.get("EXECUTION_AUDIT_SYNC_LIMIT", "120"))
-
-
 def db_connect():
-    """Open a fresh Supabase connection with small transient retry support.
-
-    The scanner runs for a long time and Supabase pooler/DNS can occasionally
-    drop a connection. Every DB stage should use a fresh connection and close it
-    promptly; this helper retries the connection open instead of letting one
-    transient failure corrupt scanner state.
-    """
     url = os.environ.get("DATABASE_URL", "").strip()
     if not url:
         raise RuntimeError("DATABASE_URL is not set.")
     if psycopg2 is None:
         raise RuntimeError("psycopg2 is not installed — add psycopg2-binary to requirements_scanner.txt.")
-    cleaned = _clean_db_url(url)
-    last_exc = None
-    for attempt in range(1, max(1, DB_CONNECT_RETRIES) + 1):
-        try:
-            return psycopg2.connect(
-                cleaned,
-                cursor_factory=RealDictCursor,
-                connect_timeout=15,
-                application_name="benzino_scanner",
-                keepalives=1,
-                keepalives_idle=30,
-                keepalives_interval=10,
-                keepalives_count=5,
-            )
-        except Exception as exc:
-            last_exc = exc
-            if attempt < max(1, DB_CONNECT_RETRIES):
-                print(f"[DB] connect attempt {attempt} failed: {exc}; retrying...")
-                time.sleep(DB_CONNECT_RETRY_SLEEP * attempt)
-    raise last_exc
+    return psycopg2.connect(_clean_db_url(url), cursor_factory=RealDictCursor)
 
-
-def execute(sql: str, params: tuple = ()) -> None:
-    """Small standalone execute helper for scanner stages."""
-    conn = db_connect()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, params)
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
 
 
 def hydrate_capital_env_from_user_connection_if_missing() -> dict:
@@ -1419,6 +1439,53 @@ def duplicate_setup_exists(asset: str, timeframe: str, signal: str, candle_close
         return False
 
 
+def processed_candle_exists(asset: str, timeframe: str, candle_close: str) -> bool:
+    """Return True when any setup for this asset/timeframe/candle already exists.
+
+    This is intentionally signal-agnostic and is used before expensive analysis.
+    The scheduled scanner should only process a candle once per asset/timeframe;
+    later runs for the same candle should be a cheap no-op.
+    """
+    asset = str(asset or "").strip().upper()
+    timeframe = str(timeframe or "").strip().lower()
+    candle_close = str(candle_close or "").strip()
+    if not asset or not timeframe or not candle_close:
+        return False
+    key = (asset, timeframe, candle_close)
+    if key in _PROCESSED_CANDLE_CACHE:
+        return bool(_PROCESSED_CANDLE_CACHE[key])
+    sql = """
+    SELECT 1 FROM scanner_signals
+    WHERE asset = %s AND timeframe = %s AND candle_close = %s
+    LIMIT 1;
+    """
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute(sql, (asset, timeframe, candle_close))
+            row = cur.fetchone()
+        conn.close()
+        exists = row is not None
+        _PROCESSED_CANDLE_CACHE[key] = exists
+        return exists
+    except Exception as e:
+        print(f"[DB] processed_candle_exists check failed: {e}")
+        return False
+
+
+def latest_candle_close_for_gate(asset: str, ticker: str, timeframe: str) -> str:
+    """Cheaply resolve the latest candle close for early duplicate gating."""
+    if not EARLY_PROCESSED_CANDLE_GATE:
+        return ""
+    try:
+        df = get_timeframe_df(ticker, timeframe)
+        if df is None or df.empty or "Date" not in df.columns:
+            return ""
+        return str(df["Date"].iloc[-1])
+    except Exception:
+        return ""
+
+
 def open_trade_for_slot(asset: str, timeframe: str) -> dict | None:
     """
     A new alert cannot fire for (asset, timeframe) while a previous trade in
@@ -1535,11 +1602,10 @@ def fetch_open_trades(assets: set[str] | None = None, timeframes: set[str] | Non
                         END
                     )
                 """
-            if due_only and OPEN_TRADE_EVAL_LIMIT > 0:
-                sql += " ORDER BY created_at ASC LIMIT %s"
-                params.append(int(OPEN_TRADE_EVAL_LIMIT))
-            else:
-                sql += " ORDER BY created_at ASC"
+            sql += " ORDER BY COALESCE(replay_checked_at, created_at) ASC, created_at ASC"
+            if due_only:
+                sql += " LIMIT %s"
+                params.append(int(OPEN_TRADE_REPLAY_LIMIT))
             cur.execute(sql, tuple(params))
             rows = [dict(r) for r in cur.fetchall()]
         conn.close()
@@ -1846,6 +1912,54 @@ CAPITAL_RESOLUTION_MAP = {
 _CAPITAL_SESSION: dict = {"cst": "", "security_token": "", "ts": 0.0}
 _CAPITAL_EPIC_CACHE: dict[str, str | None] = {}
 _CAPITAL_MARKET_CACHE: dict[str, dict] = {}
+_CAPITAL_CONSTRAINT_CACHE: dict[str, dict] = {}
+_CAPITAL_EPIC_MAP_PRELOADED = False
+
+def preload_capital_epic_map() -> None:
+    """Load all saved Capital.com epics/constraints once per scanner process.
+
+    This avoids one Supabase read per asset during sizing, replay, and execution.
+    Live refresh still happens only for missing/stale rows.
+    """
+    global _CAPITAL_EPIC_MAP_PRELOADED
+    if _CAPITAL_EPIC_MAP_PRELOADED:
+        return
+    _CAPITAL_EPIC_MAP_PRELOADED = True
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT asset, epic, market_info, min_size, max_size, step_size,
+                       min_stop_distance, max_stop_distance, min_limit_distance, max_limit_distance
+                FROM capital_epic_map
+            """)
+            rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        for row in rows:
+            asset = str(row.get("asset") or "").strip().upper()
+            epic = str(row.get("epic") or "").strip()
+            if not asset:
+                continue
+            if epic:
+                _CAPITAL_EPIC_CACHE[asset] = epic
+            mi = row.get("market_info")
+            if isinstance(mi, dict):
+                _CAPITAL_MARKET_CACHE[asset] = mi
+            _CAPITAL_CONSTRAINT_CACHE[asset] = {
+                "min_size": safe_number(row.get("min_size"), 0.0),
+                "max_size": safe_number(row.get("max_size"), 0.0),
+                "step_size": safe_number(row.get("step_size"), 0.0),
+                "min_stop_distance": safe_number(row.get("min_stop_distance"), 0.0),
+                "max_stop_distance": safe_number(row.get("max_stop_distance"), 0.0),
+                "min_limit_distance": safe_number(row.get("min_limit_distance"), 0.0),
+                "max_limit_distance": safe_number(row.get("max_limit_distance"), 0.0),
+                "epic": epic,
+                "market_info": mi if isinstance(mi, dict) else {},
+            }
+        if rows:
+            print(f"[CapitalMapping] Preloaded {len(rows)} saved epic/constraint row(s).")
+    except Exception as exc:
+        print(f"[CapitalMapping] Epic map preload skipped: {exc}")
 
 _CAPITAL_UNRESOLVED_EPIC_CACHE: set[str] = set()
 _CAPITAL_EPIC_VALIDATION_CACHE: dict[str, bool] = {}
@@ -2438,6 +2552,8 @@ def capital_load_saved_epic(symbol: str) -> str | None:
     symbol = str(symbol or "").strip().upper()
     if not symbol:
         return None
+    if symbol in _CAPITAL_EPIC_CACHE:
+        return _CAPITAL_EPIC_CACHE.get(symbol)
     try:
         conn = db_connect()
         with conn.cursor() as cur:
@@ -2651,8 +2767,163 @@ def capital_prices_to_df(data: dict) -> pd.DataFrame | None:
     return df.reset_index(drop=True)
 
 
+
+def _safe_cache_component(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip())[:80]
+
+
+def _candle_cache_path(symbol: str, timeframe: str) -> str:
+    return os.path.join(CAPITAL_CANDLE_CACHE_DIR, f"{_safe_cache_component(symbol)}_{_safe_cache_component(timeframe)}.pkl")
+
+
+def _normalise_candle_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    if df is None or df.empty:
+        return None
+    try:
+        out = df.copy()
+        if "Date" not in out.columns:
+            out = out.reset_index()
+            out = out.rename(columns={out.columns[0]: "Date"})
+        out["Date"] = pd.to_datetime(out["Date"], utc=True, errors="coerce")
+        out = out.dropna(subset=["Date"]).copy()
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            if col in out.columns:
+                out[col] = pd.to_numeric(out[col], errors="coerce")
+        needed = ["Date", "Open", "High", "Low", "Close"]
+        if not set(needed).issubset(set(out.columns)):
+            return None
+        out = out.dropna(subset=["Open", "High", "Low", "Close"])
+        out = out.sort_values("Date").drop_duplicates("Date").reset_index(drop=True)
+        if "Volume" not in out.columns:
+            out["Volume"] = 0.0
+        return out[["Date", "Open", "High", "Low", "Close", "Volume"]].copy()
+    except Exception:
+        return None
+
+
+def _load_disk_candle_cache(symbol: str, timeframe: str) -> pd.DataFrame | None:
+    if not CAPITAL_CANDLE_DISK_CACHE_ENABLED:
+        return None
+    path = _candle_cache_path(symbol, timeframe)
+    if not os.path.exists(path):
+        return None
+    try:
+        with _CANDLE_DISK_CACHE_LOCK:
+            df = pd.read_pickle(path)
+        return _normalise_candle_df(df)
+    except Exception:
+        return None
+
+
+def _save_disk_candle_cache(symbol: str, timeframe: str, df: pd.DataFrame | None) -> None:
+    if not CAPITAL_CANDLE_DISK_CACHE_ENABLED:
+        return
+    out = _normalise_candle_df(df)
+    if out is None or out.empty:
+        return
+    try:
+        out = out.tail(int(CAPITAL_CANDLE_CACHE_MAX_ROWS)).reset_index(drop=True)
+        os.makedirs(CAPITAL_CANDLE_CACHE_DIR, exist_ok=True)
+        path = _candle_cache_path(symbol, timeframe)
+        tmp = path + ".tmp"
+        with _CANDLE_DISK_CACHE_LOCK:
+            out.to_pickle(tmp)
+            os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _merge_candle_frames(old: pd.DataFrame | None, new: pd.DataFrame | None) -> pd.DataFrame | None:
+    old_n = _normalise_candle_df(old)
+    new_n = _normalise_candle_df(new)
+    frames = [x for x in [old_n, new_n] if x is not None and not x.empty]
+    if not frames:
+        return None
+    out = pd.concat(frames, ignore_index=True)
+    out = _normalise_candle_df(out)
+    if out is None or out.empty:
+        return None
+    return out.tail(int(CAPITAL_CANDLE_CACHE_MAX_ROWS)).reset_index(drop=True)
+
+
+def _candle_cache_is_fresh(df: pd.DataFrame | None, timeframe: str, min_rows: int = 50) -> bool:
+    out = _normalise_candle_df(df)
+    if out is None or len(out) < int(min_rows):
+        return False
+    try:
+        latest = pd.to_datetime(out["Date"].max(), utc=True, errors="coerce")
+        if pd.isna(latest):
+            return False
+        age_seconds = (pd.Timestamp.now(tz="UTC") - latest).total_seconds()
+        ttl = CAPITAL_CANDLE_CACHE_STALE_SECONDS.get(str(timeframe).lower(), 900)
+        return age_seconds <= ttl
+    except Exception:
+        return False
+
+def _timeframe_to_timedelta(timeframe: str) -> pd.Timedelta:
+    tf = str(timeframe or "15m").strip().lower()
+    if tf == "1m":
+        return pd.Timedelta(minutes=1)
+    if tf == "15m":
+        return pd.Timedelta(minutes=15)
+    if tf == "30m":
+        return pd.Timedelta(minutes=30)
+    if tf == "1h":
+        return pd.Timedelta(hours=1)
+    if tf == "4h":
+        return pd.Timedelta(hours=4)
+    if tf == "1d":
+        return pd.Timedelta(days=1)
+    return pd.Timedelta(minutes=15)
+
+
+def _capital_download_incremental(symbol: str, timeframe: str, disk_df: pd.DataFrame | None, max_rows_i: int, epic: str) -> pd.DataFrame | None:
+    """Fetch only candles newer than the disk cache's latest candle.
+
+    Falls back to None if the cache is unusable or the API returns nothing.
+    Caller can then decide whether stale cache is acceptable or whether to do a
+    full refresh. This keeps v2.7 conservative while preventing full-history
+    refreshes on every scheduled run.
+    """
+    disk_n = _normalise_candle_df(disk_df)
+    if disk_n is None or disk_n.empty or "Date" not in disk_n.columns:
+        return None
+    latest = pd.to_datetime(disk_n["Date"].max(), utc=True, errors="coerce")
+    if pd.isna(latest):
+        return None
+    now = pd.Timestamp.now(tz="UTC")
+    tf_delta = _timeframe_to_timedelta(timeframe)
+    # If the next candle cannot yet be complete, use the cache without calling Capital.
+    if latest + tf_delta > now - pd.Timedelta(seconds=10):
+        return disk_n.tail(max_rows_i).copy()
+    start = latest - tf_delta
+    end = now
+    resolution = CAPITAL_RESOLUTION_MAP.get(timeframe, "MINUTE_15")
+    params = {
+        "resolution": resolution,
+        "from": _capital_time_param(start),
+        "to": _capital_time_param(end),
+        "max": int(min(200, max_rows_i)),
+    }
+    data = capital_request("GET", f"/prices/{epic}", params=params, retries=1)
+    fresh_df = capital_prices_to_df(data or {})
+    if fresh_df is None or fresh_df.empty:
+        # Nothing new available yet; keep the old cache. This avoids repeatedly
+        # downloading full history just because the broker has not published the
+        # next candle at this exact moment.
+        return disk_n.tail(max_rows_i).copy()
+    merged = _merge_candle_frames(disk_n, fresh_df)
+    return merged.tail(max_rows_i).copy() if merged is not None and not merged.empty else disk_n.tail(max_rows_i).copy()
+
+
 def capital_download(symbol: str, timeframe: str, max_rows: int = 1000) -> pd.DataFrame | None:
-    """Download/cache OHLCV from Capital.com for a BENZINO asset key."""
+    """Download/cache OHLCV from Capital.com for a BENZINO asset key.
+
+    v2.6 behaviour:
+    - Use in-memory cache first for this run.
+    - Use local disk candle cache if it is still fresh for the timeframe.
+    - If stale, fetch Capital.com once, merge with disk cache, and persist it.
+    """
     if not capital_configured():
         return None
     symbol = str(symbol or "").strip().upper()
@@ -2662,24 +2933,64 @@ def capital_download(symbol: str, timeframe: str, max_rows: int = 1000) -> pd.Da
     if cache_key in _CAPITAL_PRICE_CACHE:
         cached = _CAPITAL_PRICE_CACHE[cache_key]
         return cached.copy() if cached is not None else None
+
+    min_rows = 5 if timeframe == "1m" else 50
+    disk_df = _load_disk_candle_cache(symbol, timeframe)
+    if _candle_cache_is_fresh(disk_df, timeframe, min_rows=min_rows):
+        out = _normalise_candle_df(disk_df)
+        if out is not None and not out.empty:
+            _CAPITAL_PRICE_CACHE[cache_key] = out.tail(max_rows_i).copy()
+            return _CAPITAL_PRICE_CACHE[cache_key].copy()
+
     _t0 = _runtime_start()
     resolution = CAPITAL_RESOLUTION_MAP.get(timeframe, "MINUTE_15")
     epic = capital_find_epic(symbol)
     if not epic:
+        # Keep stale disk data as a last resort only for replay/signals where it
+        # still has enough rows; otherwise return None and let the caller skip.
+        stale = _normalise_candle_df(disk_df)
+        if stale is not None and len(stale) >= min_rows:
+            _CAPITAL_PRICE_CACHE[cache_key] = stale.tail(max_rows_i).copy()
+            _runtime_stop("capital_candle_fetch", _t0)
+            return _CAPITAL_PRICE_CACHE[cache_key].copy()
         _CAPITAL_PRICE_CACHE[cache_key] = None
         _runtime_stop("capital_candle_fetch", _t0)
         return None
-    params = {"resolution": resolution, "max": max_rows_i}
-    data = capital_request("GET", f"/prices/{epic}", params=params, retries=1)
-    df = capital_prices_to_df(data or {})
+
+    # Prefer a true incremental refresh when a disk cache already exists.
+    # This should fetch only the candles since the latest cached candle, not the
+    # entire historical window.
+    incremental = _capital_download_incremental(symbol, timeframe, disk_df, max_rows_i, epic)
+    if incremental is not None and not incremental.empty:
+        merged = _merge_candle_frames(disk_df, incremental)
+    else:
+        params = {"resolution": resolution, "max": max_rows_i}
+        data = capital_request("GET", f"/prices/{epic}", params=params, retries=1)
+        fresh_df = capital_prices_to_df(data or {})
+        merged = _merge_candle_frames(disk_df, fresh_df)
     ok = False
-    if df is not None and len(df) >= 50:
+    if merged is not None and len(merged) >= 50:
         ok = True
-    if df is not None and timeframe == "1m" and len(df) >= 5:
+    if merged is not None and timeframe == "1m" and len(merged) >= 5:
         ok = True
-    _CAPITAL_PRICE_CACHE[cache_key] = df.copy() if ok else None
+    if ok:
+        _save_disk_candle_cache(symbol, timeframe, merged)
+        _CAPITAL_PRICE_CACHE[cache_key] = merged.tail(max_rows_i).copy()
+        _runtime_stop("capital_candle_fetch", _t0)
+        return _CAPITAL_PRICE_CACHE[cache_key].copy()
+
+    # If Capital returns nothing but disk has enough stale rows, return the stale
+    # rows instead of hammering other fallbacks. The replay window coverage check
+    # still prevents using stale 1m data for trades outside the cached range.
+    stale = _normalise_candle_df(disk_df)
+    if stale is not None and len(stale) >= min_rows:
+        _CAPITAL_PRICE_CACHE[cache_key] = stale.tail(max_rows_i).copy()
+        _runtime_stop("capital_candle_fetch", _t0)
+        return _CAPITAL_PRICE_CACHE[cache_key].copy()
+
+    _CAPITAL_PRICE_CACHE[cache_key] = None
     _runtime_stop("capital_candle_fetch", _t0)
-    return df.copy() if ok else None
+    return None
 
 
 
@@ -5113,7 +5424,7 @@ def rebuild_capital_trade_comparisons(limit: int = 500) -> int:
                             simulated_exit, actual_exit, exit_diff,
                             simulated_r, actual_pnl, simulated_outcome, actual_status,
                             match_quality, opened_at, updated_at
-                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
                         ON CONFLICT (id) DO NOTHING
                         """,
                         (
@@ -5345,17 +5656,21 @@ def capital_auto_trading_day_eat(ts=None):
 def load_or_create_capital_auto_daily_state(username: str, timeframe: str, assets: set[str], ts=None) -> dict:
     """Freeze the user's session ranking for one EAT trading day.
 
-    The state makes auto-trading restart-safe. It does not force 10 trades; the
-    cap is a maximum. If the app/scanner restarts, the same session order is
-    reused for the rest of the day.
+    Uses a self-contained DB connection and never returns from inside an open
+    transaction block. This avoids the intermittent "connection already closed"
+    error that happened when the old function closed/reused a connection inside
+    the context manager.
     """
     username = str(username or "").strip().lower()
     timeframe = _normalize_timeframe(timeframe)
     trading_day, dt_eat = capital_auto_trading_day_eat(ts)
+    conn = None
     try:
         conn = db_connect()
         with conn:
             with conn.cursor() as cur:
+                # Schema should already exist from the one-time migration. Keep this
+                # CREATE for local/dev compatibility only; it is cheap and scoped.
                 cur.execute(
                     """
                     CREATE TABLE IF NOT EXISTS capital_auto_daily_state (
@@ -5384,42 +5699,52 @@ def load_or_create_capital_auto_daily_state(username: str, timeframe: str, asset
                     (username, trading_day, timeframe),
                 )
                 row = cur.fetchone()
-                if row:
-                    state = dict(row)
-                    so = state.get("session_order") or []
-                    if isinstance(so, str):
-                        try: so = json.loads(so)
-                        except Exception: so = []
-                    state["session_order"] = so
-                    return state
-                ranking = capital_session_order_for_user(username, timeframe, assets)
-                session_order = ranking.get("session_order") or []
-                if not session_order:
-                    session_order = [{"session": name, "profit_factor": 0, "win_rate": 0, "net_r": 0, "trade_count": 0, "sample_ready": False} for name in capital_session_windows_scanner().keys()]
-                cur.execute(
-                    """
-                    INSERT INTO capital_auto_daily_state(username, trading_day, timeframe, session_order, daily_trade_cap, trades_taken, completed, updated_at)
-                    VALUES (%s,%s,%s,%s::jsonb,%s,0,FALSE,NOW())
-                    ON CONFLICT (username, trading_day, timeframe) DO UPDATE SET
-                        updated_at = NOW()
-                    RETURNING *
-                    """,
-                    (username, trading_day, timeframe, json.dumps(session_order), int(CAPITAL_AUTO_TRADE_MAX_PER_DAY)),
-                )
-                row = cur.fetchone() or {}
-        conn.close()
-        state = dict(row)
+                if not row:
+                    ranking = capital_session_order_for_user(username, timeframe, assets)
+                    session_order = ranking.get("session_order") or []
+                    if not session_order:
+                        session_order = [
+                            {"session": name, "profit_factor": 0, "win_rate": 0, "net_r": 0, "trade_count": 0, "sample_ready": False}
+                            for name in capital_session_windows_scanner().keys()
+                        ]
+                    cur.execute(
+                        """
+                        INSERT INTO capital_auto_daily_state(username, trading_day, timeframe, session_order, daily_trade_cap, trades_taken, completed, updated_at)
+                        VALUES (%s,%s,%s,%s::jsonb,%s,0,FALSE,NOW())
+                        ON CONFLICT (username, trading_day, timeframe) DO UPDATE SET
+                            updated_at = NOW()
+                        RETURNING *
+                        """,
+                        (username, trading_day, timeframe, json.dumps(session_order), int(CAPITAL_AUTO_TRADE_MAX_PER_DAY)),
+                    )
+                    row = cur.fetchone()
+        state = dict(row or {})
         so = state.get("session_order") or []
         if isinstance(so, str):
-            try: so = json.loads(so)
-            except Exception: so = []
+            try:
+                so = json.loads(so)
+            except Exception:
+                so = []
         state["session_order"] = so
         return state
     except Exception as exc:
         print(f"[CapitalAuto] Daily state failed for {username}: {exc}")
         ranking = capital_session_order_for_user(username, timeframe, assets)
-        return {"username": username, "trading_day": trading_day, "timeframe": timeframe, "session_order": ranking.get("session_order") or [], "daily_trade_cap": int(CAPITAL_AUTO_TRADE_MAX_PER_DAY), "trades_taken": 0, "fallback_state": True}
-
+        return {
+            "username": username,
+            "trading_day": trading_day,
+            "timeframe": timeframe,
+            "session_order": ranking.get("session_order") or [],
+            "daily_trade_cap": int(CAPITAL_AUTO_TRADE_MAX_PER_DAY),
+            "trades_taken": 0,
+            "fallback_state": True,
+        }
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
 
 def capital_auto_session_gate_for_signal(sig: ScanResult, username: str, timeframe: str, assets: set[str]) -> dict:
     """Capital.com daily session gate.
@@ -6330,7 +6655,7 @@ def place_capital_auto_trade(sig: ScanResult) -> bool:
     return ok
 
 
-def rebuild_capital_execution_audit(limit: int = EXECUTION_AUDIT_SYNC_LIMIT) -> int:
+def rebuild_capital_execution_audit(limit: int = EXECUTION_AUDIT_LIMIT) -> int:
     """Build the Capital.com Execution Audit from BENZINO-created broker orders.
 
     This is no longer a simulated-vs-actual matching engine. Because Capital.com is
@@ -6353,8 +6678,17 @@ def rebuild_capital_execution_audit(limit: int = EXECUTION_AUDIT_SYNC_LIMIT) -> 
                         ss.exit_reason AS replay_exit_reason
                     FROM capital_auto_orders ao
                     LEFT JOIN scanner_signals ss ON ss.signal_id = ao.signal_id
+                    LEFT JOIN capital_execution_audit cea ON cea.signal_id = ao.signal_id
                     WHERE ao.status IN ('OPENED','CLOSED','ACCEPTED')
-                    ORDER BY ao.created_at DESC
+                      AND (
+                          cea.id IS NULL
+                          OR cea.executed_entry IS NULL
+                          OR cea.risk_status IS NULL
+                          OR COALESCE(cea.deal_id, '') = ''
+                          OR ao.updated_at > COALESCE(cea.updated_at, TIMESTAMPTZ '1970-01-01')
+                          OR COALESCE(ao.status, '') <> COALESCE(cea.broker_status, '')
+                      )
+                    ORDER BY ao.updated_at DESC NULLS LAST, ao.created_at DESC
                     LIMIT %s
                     """,
                     (int(limit),),
@@ -6625,7 +6959,7 @@ def run_scan() -> None:
     scan_assets, active_tfs, scan_mode = build_scan_plan(started)
     print(f"\n{'='*70}")
     print(f"  BENZINO INSTITUTIONAL SCANNER — {started.strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"  Mode: {scan_mode} | Assets: {len(scan_assets)} | Active TFs: {', '.join(active_tfs)} | Configured TFs: {', '.join(SCAN_TIMEFRAMES)}")
+    print(f"  Mode: {scan_mode} | Engine: {SCANNER_ENGINE.upper()} | Assets: {len(scan_assets)} | Active TFs: {', '.join(active_tfs)} | Configured TFs: {', '.join(SCAN_TIMEFRAMES)}")
     print(f"  Account: ${ACCOUNT_SIZE:,.0f} | Risk: {RISK_PER_TRADE*100:.2f}% | Leverage: 1:{LEVERAGE:g}")
     if set(active_tfs) != set(SCAN_TIMEFRAMES):
         skipped = [tf for tf in SCAN_TIMEFRAMES if tf not in active_tfs]
@@ -6640,48 +6974,116 @@ def run_scan() -> None:
     _MINUTE_REPLAY_CACHE.clear()
     _CAPITAL_PRICE_CACHE.clear()
     _RUNTIME_BREAKDOWN.clear()
+    if CAPITAL_CANDLE_DISK_CACHE_ENABLED:
+        print(f"[CandleCache] Disk cache enabled at {CAPITAL_CANDLE_CACHE_DIR}; stale candles refresh per timeframe.")
+    else:
+        print("[CandleCache] Disk cache disabled; candles are fetched from Capital.com each run.")
     _t = _runtime_start()
     init_tables()
+    preload_capital_epic_map()
     _runtime_stop("db_init", _t)
-    _t = _runtime_start()
-    refresh_missing_capital_constraints(limit=40)
-    validate_capital_epic_map_for_assets(set(scan_assets.keys()))
-    _runtime_stop("capital_constraints", _t)
-    if LOCK_HISTORICAL_SIGNAL_PLANS:
-        print("[Replay1mBackfill] Historical signal plans locked: entry/sl/tp are preserved; only outcomes are updated.")
-    _t = _runtime_start()
-    force_open_graded_setups()
-    _runtime_stop("force_open_fix", _t)
-
-    # 1. Resolve outcomes for everything already open BEFORE scanning for new setups.
-    # Important: outcome evaluation must NOT be limited to active_tfs. A 4h/1d
-    # trade can hit TP/SL while the scheduled run is only generating 15m signals.
-    # Therefore every run checks every open timeframe using Capital.com replay.
-    all_replay_tfs = set(TIMEFRAME_CONFIGS.keys())
-    evaluate_open_trades(assets=set(scan_assets.keys()), timeframes=all_replay_tfs)
-    _t = _runtime_start()
-    evaluate_shadow_trades(assets=set(scan_assets.keys()), timeframes=all_replay_tfs)
-    _runtime_stop("shadow_replay", _t)
-    if REPLAY_EXISTING_OUTCOMES:
+    if _engine_runs("maintenance", "capital", "replay"):
         _t = _runtime_start()
-        replay_existing_resolved_outcomes()
-        _runtime_stop("historical_resolved_replay", _t)
-    _t = _runtime_start()
-    sync_capital_actual_executions()
-    _runtime_stop("execution_audit_sync", _t)
+        refresh_missing_capital_constraints(limit=40)
+        validate_capital_epic_map_for_assets(set(scan_assets.keys()))
+        _runtime_stop("capital_constraints", _t)
+    else:
+        print(f"[Pipeline] {SCANNER_ENGINE.upper()} engine: broker constraint refresh skipped.")
+
+    if LOCK_HISTORICAL_SIGNAL_PLANS and _engine_runs("replay"):
+        print("[Replay1mBackfill] Historical signal plans locked: entry/sl/tp are preserved; only outcomes are updated.")
+
+    if _engine_runs("signal", "replay"):
+        _t = _runtime_start()
+        force_open_graded_setups()
+        _runtime_stop("force_open_fix", _t)
+
+    # Outcome replay is now isolated so signal-generation jobs do not spend minutes
+    # resolving old trades. In the legacy ALL engine this still runs for backward compatibility.
+    all_replay_tfs = set(TIMEFRAME_CONFIGS.keys())
+    if _engine_runs("replay") or (SCANNER_ENGINE == "signal" and REPLAY_IN_SIGNAL_ENGINE):
+        evaluate_open_trades(assets=set(scan_assets.keys()), timeframes=all_replay_tfs)
+        _t = _runtime_start()
+        evaluate_shadow_trades(assets=set(scan_assets.keys()), timeframes=all_replay_tfs)
+        _runtime_stop("shadow_replay", _t)
+        if REPLAY_EXISTING_OUTCOMES:
+            _t = _runtime_start()
+            replay_existing_resolved_outcomes()
+            _runtime_stop("historical_resolved_replay", _t)
+    else:
+        print(f"[Pipeline] {SCANNER_ENGINE.upper()} engine: open-trade replay skipped.")
+
+    if _engine_runs("capital") or (SCANNER_ENGINE == "signal" and CAPITAL_SYNC_IN_SIGNAL_ENGINE):
+        _t = _runtime_start()
+        sync_capital_actual_executions()
+        _runtime_stop("execution_audit_sync", _t)
+    else:
+        print(f"[Pipeline] {SCANNER_ENGINE.upper()} engine: Capital execution sync skipped.")
 
     journaled, alerted, shadowed = 0, 0, 0
     assets_scanned = 0
     asset_seconds: list[float] = []
 
     _scan_loop_start = _runtime_start()
-    for asset, ticker in scan_assets.items():
+    if not _engine_runs("signal"):
+        print(f"[Pipeline] {SCANNER_ENGINE.upper()} engine: signal generation loop skipped.")
+
+    def _scan_one_asset(asset: str, ticker: str) -> dict:
         asset_start = time.perf_counter()
-        asset_attempted = False
-        print(f"Scanning {asset} ({ticker}) across {len(active_tfs)} active timeframe(s)...")
+        results = []
+        errors = []
         for tf in active_tfs:
-            asset_attempted = True
-            result = scan_asset(asset, ticker, timeframe=tf)
+            try:
+                latest_candle = latest_candle_close_for_gate(asset, ticker, tf)
+                if latest_candle and processed_candle_exists(asset, tf, latest_candle):
+                    results.append((tf, {"skipped_duplicate": True, "candle_close": latest_candle}))
+                    continue
+                results.append((tf, scan_asset(asset, ticker, timeframe=tf)))
+            except Exception as exc:
+                errors.append(f"[{asset} {tf}] scan failed: {exc}")
+                results.append((tf, None))
+        return {
+            "asset": asset,
+            "ticker": ticker,
+            "seconds": time.perf_counter() - asset_start,
+            "results": results,
+            "errors": errors,
+        }
+
+    scan_jobs: list[dict] = []
+    if _engine_runs("signal"):
+        if SCANNER_SIGNAL_WORKERS > 1 and len(scan_assets) > 1:
+            print(f"[Performance] Parallel signal calculation enabled: {SCANNER_SIGNAL_WORKERS} worker(s). Order execution remains serial.")
+            futures = {}
+            with ThreadPoolExecutor(max_workers=SCANNER_SIGNAL_WORKERS) as pool:
+                for asset, ticker in scan_assets.items():
+                    futures[pool.submit(_scan_one_asset, asset, ticker)] = asset
+                by_asset = {}
+                for fut in as_completed(futures):
+                    try:
+                        item = fut.result()
+                    except Exception as exc:
+                        asset = futures.get(fut, "UNKNOWN")
+                        item = {"asset": asset, "ticker": scan_assets.get(asset, ""), "seconds": 0.0, "results": [], "errors": [f"[{asset}] worker failed: {exc}"]}
+                    by_asset[item["asset"]] = item
+            # Keep user-facing logs and DB writes deterministic even though calculation was parallel.
+            scan_jobs = [by_asset[a] for a in scan_assets.keys() if a in by_asset]
+        else:
+            scan_jobs = [_scan_one_asset(asset, ticker) for asset, ticker in scan_assets.items()]
+
+    for job in scan_jobs:
+        asset = job["asset"]
+        ticker = job["ticker"]
+        print(f"Scanning {asset} ({ticker}) across {len(active_tfs)} active timeframe(s)...")
+        for err in job.get("errors", []):
+            print(f"  {err}")
+        if job.get("results"):
+            assets_scanned += 1
+            asset_seconds.append(float(job.get("seconds") or 0.0))
+        for tf, result in job.get("results", []):
+            if isinstance(result, dict) and result.get("skipped_duplicate"):
+                print(f"  [{asset} {tf}] Candle already processed ({result.get('candle_close')}) — skipped before full analysis.")
+                continue
             if result is None:
                 continue
             if duplicate_setup_exists(asset, result.timeframe, result.signal, result.candle_close):
@@ -6706,7 +7108,10 @@ def run_scan() -> None:
             journaled += 1
             if saved:
                 print(f"  [{asset} {tf}] Stored as OPEN journal trade. Telegram is optional only.")
-                place_capital_auto_trade(result)
+                if CAPITAL_EXECUTE_IN_SIGNAL_ENGINE or SCANNER_ENGINE == "all":
+                    place_capital_auto_trade(result)
+                else:
+                    print(f"  [{asset} {tf}] Capital auto execution deferred to CAPITAL engine.")
 
             if not telegram_configured():
                 print(f"  [{asset} {tf}] Telegram not configured — optional alert skipped.")
@@ -6737,20 +7142,16 @@ def run_scan() -> None:
                     print(f"  [{asset} {tf}] Telegram optional alert failed: {info}")
             else:
                 print(f"  [{asset} {tf}] Telegram alert suppressed — {block_reason}")
-
-        if asset_attempted:
-            assets_scanned += 1
-            asset_seconds.append(time.perf_counter() - asset_start)
-
     _runtime_stop("signal_generation_loop", _scan_loop_start)
-    _t = _runtime_start()
-    force_open_graded_setups()
-    _runtime_stop("force_open_fix", _t)
+    if _engine_runs("signal", "replay"):
+        _t = _runtime_start()
+        force_open_graded_setups()
+        _runtime_stop("force_open_fix", _t)
     finished = datetime.now(timezone.utc)
     elapsed = (finished - started).total_seconds()
     print(f"\n{'='*70}")
     print(f"  Scan complete in {elapsed:.1f}s")
-    open_count = len(fetch_open_trades(assets=set(scan_assets.keys()), timeframes=set(active_tfs)))
+    open_count = len(fetch_open_trades(assets=set(scan_assets.keys()), timeframes=set(active_tfs))) if _engine_runs("signal", "replay") else 0
     print(f"  Journaled (A+/A/B/C): {journaled} | Open trades: {open_count} | Alerted: {alerted} | Shadowed (NO TRADE): {shadowed}")
     print(f"  Runtime: fastest asset {min(asset_seconds) if asset_seconds else 0:.1f}s | slowest {max(asset_seconds) if asset_seconds else 0:.1f}s | avg {float(np.mean(asset_seconds)) if asset_seconds else 0:.1f}s")
     if _RUNTIME_BREAKDOWN:
