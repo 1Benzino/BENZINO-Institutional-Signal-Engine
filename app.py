@@ -6773,22 +6773,42 @@ def apply_theme() -> None:
     .side-divider { margin: 18px 0 18px !important; }
     .benzino-refresh-wrap { margin: 2px 0 14px; }
     .benzino-side-title { color:#8BAAB8; font-size:12px; font-weight:950; letter-spacing:1.4px; margin:10px 0 10px; text-transform:uppercase; }
-    [data-testid="stSidebar"] div[role="radiogroup"] { gap: 6px; }
-    [data-testid="stSidebar"] label[data-baseweb="radio"] {
-        width: 100%;
-        padding: 9px 10px;
-        margin: 0 0 5px 0;
-        border-radius: 9px;
-        color: #C9D5E3 !important;
-        font-weight: 850;
-        transition: all .15s ease;
+    /* Custom tab-style sidebar navigation: no Streamlit radio controls. */
+    [data-testid="stSidebar"] [class*="st-key-sidebar_nav_"] {
+        margin: 0 0 6px 0 !important;
     }
-    [data-testid="stSidebar"] label[data-baseweb="radio"]:has(input:checked) {
-        background: linear-gradient(90deg, rgba(0,212,163,.20), rgba(16,38,58,.72));
-        border-left: 4px solid #00D4A3;
+    [data-testid="stSidebar"] [class*="st-key-sidebar_nav_"] button {
+        min-height: 42px !important;
+        justify-content: flex-start !important;
+        text-align: left !important;
+        padding: 9px 12px !important;
+        border-radius: 9px !important;
+        border: 1px solid transparent !important;
+        background: transparent !important;
+        color: #C9D5E3 !important;
+        font-weight: 850 !important;
+        box-shadow: none !important;
+        transition: background .15s ease, border-color .15s ease, color .15s ease !important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-sidebar_nav_"] button p {
+        width: 100% !important;
+        text-align: left !important;
+        color: inherit !important;
+        font-weight: 850 !important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-sidebar_nav_"] button:hover {
+        background: rgba(16,38,58,.72) !important;
+        border-color: #244363 !important;
         color: #E8EDF2 !important;
     }
-    [data-testid="stSidebar"] label[data-baseweb="radio"] > div:first-child { display:none !important; }
+    [data-testid="stSidebar"] [class*="st-key-sidebar_nav_"] button[kind="primary"],
+    [data-testid="stSidebar"] [class*="st-key-sidebar_nav_"] button[data-testid="stBaseButton-primary"] {
+        background: linear-gradient(90deg, rgba(0,212,163,.20), rgba(16,38,58,.72)) !important;
+        border: 0 !important;
+        border-left: 4px solid #00D4A3 !important;
+        color: #E8EDF2 !important;
+        padding-left: 10px !important;
+    }
     [data-testid="stSidebar"] [data-testid="stVerticalBlock"] > div:has(.benzino-version-pill) { margin-top: 18px !important; }
     .benzino-version-pill { border:1px solid #244363; border-radius:9px; padding:9px 12px; color:#C9D5E3; font-size:12px; text-align:center; background:#0B1A2B; }
     .benzino-page-topbar { margin-bottom: 22px; }
@@ -7216,12 +7236,34 @@ def sidebar_controls(username: str, settings: dict) -> str:
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("<div class='benzino-side-title'>Main Menu</div>", unsafe_allow_html=True)
-        page = st.radio(
-            "Main Menu",
-            ["Dashboard", "Asset Deep Dive", "Market News", "Workflow", "Research", "Settings"],
-            label_visibility="collapsed",
-            key="main_navigation",
-        )
+
+        nav_items = [
+            ("Dashboard", "⌂"),
+            ("Asset Deep Dive", "◈"),
+            ("Market News", "◫"),
+            ("Workflow", "⇄"),
+            ("Research", "⌁"),
+            ("Settings", "⚙"),
+        ]
+        valid_pages = {name for name, _ in nav_items}
+        current_page = str(st.session_state.get("main_navigation_page", "Dashboard"))
+        if current_page not in valid_pages:
+            current_page = "Dashboard"
+            st.session_state["main_navigation_page"] = current_page
+
+        st.markdown("<div class='benzino-tab-nav-anchor'></div>", unsafe_allow_html=True)
+        for page_name, icon in nav_items:
+            selected = page_name == current_page
+            if st.button(
+                f"{icon}  {page_name}",
+                key=f"sidebar_nav_{re.sub(r'[^a-z0-9]+', '_', page_name.lower()).strip('_')}",
+                width="stretch",
+                type="primary" if selected else "secondary",
+            ):
+                st.session_state["main_navigation_page"] = page_name
+                st.rerun()
+
+        page = str(st.session_state.get("main_navigation_page", "Dashboard"))
         st.markdown(f"<div class='benzino-version-pill'>{APP_VERSION}</div>", unsafe_allow_html=True)
     return page
 
