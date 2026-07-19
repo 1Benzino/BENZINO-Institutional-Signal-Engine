@@ -6790,8 +6790,17 @@ def apply_theme() -> None:
         box-shadow: none !important;
         transition: background .15s ease, border-color .15s ease, color .15s ease !important;
     }
+    [data-testid="stSidebar"] [class*="st-key-sidebar_nav_"] button,
+    [data-testid="stSidebar"] [class*="st-key-sidebar_nav_"] button > div,
+    [data-testid="stSidebar"] [class*="st-key-sidebar_nav_"] button [data-testid="stMarkdownContainer"] {
+        width: 100% !important;
+        justify-content: flex-start !important;
+        align-items: center !important;
+        text-align: left !important;
+    }
     [data-testid="stSidebar"] [class*="st-key-sidebar_nav_"] button p {
         width: 100% !important;
+        margin: 0 !important;
         text-align: left !important;
         color: inherit !important;
         font-weight: 850 !important;
